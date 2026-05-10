@@ -1,0 +1,21 @@
+[build-system]
+requires = ["setuptools>=64", "wheel"]
+build-backend = "setuptools.build_meta"
+
+[project]
+name = "mini-claude"
+version = "1.0.0"
+description = "Mini Claude Agent — modular AI agent runtime"
+requires-python = ">=3.10"
+dependencies = [
+    "anthropic>=0.25.0",
+    "openai>=1.0.0",
+    "pyyaml>=6.0",
+    "python-dotenv>=1.0.0",
+]
+
+[project.scripts]
+mini-claude = "cli.entrypoint:main"
+
+[tool.setuptools.packages.find]
+where = ["src"]

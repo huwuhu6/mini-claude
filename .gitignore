@@ -1,0 +1,17 @@
+__pycache__/
+*.pyc
+.venv/
+.traces/
+dist/
+build/
+*.egg-info/
+# .shadow/
+.env
+
+.claude
+.tasks
+.team
+s_full.py
+task_list.md
+/example
+/logs

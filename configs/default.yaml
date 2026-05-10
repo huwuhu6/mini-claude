@@ -1,0 +1,64 @@
+# Agent Configuration
+agent:
+  name: "mini-claude"
+  version: "1.0.0"
+
+# LLM Provider Configuration
+llm:
+  provider: "deepseek"  # Default provider
+  model: "deepseek-chat"
+  max_tokens: 8000
+  temperature: 0.7
+
+  # Deepseek configuration
+  deepseek:
+    api_key: "${DEEPSEEK_API_KEY}"
+    base_url: "https://api.deepseek.com"
+
+  # Anthropic configuration
+  anthropic:
+    api_key: "${ANTHROPIC_API_KEY}"
+    base_url: "${ANTHROPIC_BASE_URL}"
+
+# Feature Configuration
+features:
+  subagent: true
+  tasks: true
+  compression: true
+  background: true
+  team: true
+  skills: true
+
+# Task Management
+tasks:
+  directory: ".tasks"
+  auto_claim: true
+  poll_interval: 5
+
+# Team Configuration
+team:
+  directory: ".team"
+  idle_timeout: 60
+  auto_claim_tasks: true
+
+# Compression Settings
+compression:
+  token_threshold: 100000
+  max_transcripts: 100
+  microcompact_threshold: 3
+
+# Background Processing
+background:
+  max_concurrent: 5
+  default_timeout: 120
+  notification_queue_size: 1000
+
+# Skills Configuration
+skills:
+  directory: "skills"
+
+# Logging
+logging:
+  level: "INFO"
+  file: "logs/agent.log"
+  format: "%(asctime)s - %(name)s - %(levelname)s - %(message)s"
