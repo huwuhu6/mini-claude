@@ -138,6 +138,8 @@ class TraceManager:
         cwd: str = "",
         workspace_root: str = "",
         session_id: str = "",
+        # V3 Circuit Breaker
+        circuit_breaker_triggered: bool = False,
     ) -> None:
         """Record a single tool call into the current turn.
 
@@ -167,6 +169,7 @@ class TraceManager:
             recoverability=recoverability,
             strategy_fingerprint=strategy_fingerprint,
             escalated=escalated,
+            circuit_breaker_triggered=circuit_breaker_triggered,
             cwd=cwd,
             workspace_root=workspace_root,
             session_id=session_id,
@@ -199,6 +202,11 @@ class TraceManager:
             self.current_task.rollback_count += 1
             if self.current_task.final_status != "ROLLED_BACK":
                 self.current_task.final_status = "ROLLED_BACK"
+
+    def record_circuit_breaker(self) -> None:
+        """Record that the V3 circuit breaker was triggered."""
+        if self.current_task:
+            self.current_task.circuit_breaker_trigger_count += 1
 
     def record_tokens(self, tokens: int) -> None:
         """Accumulate token usage for the current turn."""

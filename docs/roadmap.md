@@ -43,6 +43,15 @@
 
 为什么优先：面试展示应该从稳定入口开始，而不是直接运行内部 Python 文件。
 
+### P0.4 修复异常熔断时的物理状态泄漏 ✅ [Done]
+
+类型：Bug fix + 评测可信度修复
+状态：Done（已解决）
+
+任务：重构推理出口，在主 Agent 循环捕获 RuntimeEscalationException 时强制抛出联动，物理擦除或重置当前工作区现场，确保异常退出与状态回滚的一致性。
+
+验证：task_001_db_port 在 `v3_circuit_breaker` 基线中正确返回 `FAIL (CIRCUIT_BROKEN)`，脏数据不再导致非预期通过。关联 ADR-012。
+
 ## 3. P1：形成可展示闭环
 
 ### P1.1 构建端到端 demo repo
@@ -123,6 +132,8 @@
 
 任务：标记 Stable / Experimental / Legacy。SubAgent、Teammate、MessageBus、PDF Skill 等能力不要混入主线。默认配置只开启稳定能力。
 
+### P2.5 扩展 CommandNormalizer 的正则清洗算子，增加对多语言工具链噪声的剥离支持
+
 ## 5. P3：可选增强
 
 ### P3.1 多 Agent 协作层产品化
@@ -142,3 +153,5 @@
 近期不要优先做：增加更多 provider、复杂 UI、深化 PDF 技能、扩大多 Agent 并发系统、添加大量新工具、追求“Claude Code clone”式功能覆盖。
 
 原因：当前项目的瓶颈不是功能少，而是需要把已有核心能力验证、收敛、讲清楚。
+
+扩展 CommandNormalizer 的正则清洗算子，增加对 npm test、go run、cargo 等跨语言 CLI 工具链的噪声剥离支持

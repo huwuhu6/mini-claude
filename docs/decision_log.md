@@ -119,3 +119,64 @@
 拒绝方案：把多 Agent 作为核心卖点；在未验证 Shadow Workspace + 2PC 的情况下写入正式架构；夸大 Teammate 为真实并发执行系统。
 
 原因：多 Agent 容易被质疑过度设计。当前最有面试价值的主线是 runtime、workspace safety、failure intelligence、trace、evaluation。
+
+## ADR-010：重构当前eval_runner.py写死代码转为动态读取sandbox/tasks中的用例
+
+---
+
+## ADR-011：引入 V3 联合熔断防线（Circuit Breaker），替代软 Escalation
+
+状态：Accepted
+
+背景：v2 基准评测（`v2_baseline_fi_soft`）中 trace 数据表明：
+1. **LoopGuard 从未触发**（`loop_guard_trigger_count: 0`），因为 LLM 通过更换命令字面量（加 `/d`、`chcp 65001`、`set PYTHONIOENCODING`、`-X utf8`、`2>&1` 等噪音）逃避了字面量去重。
+2. **FI 软 Escalation 被 LLM 完全忽略** — 第 16 轮开始注入 escalation 消息，但 LLM 继续死磕到第 35 轮上限（`LOOP_ABORTED`），消耗 19.6 万 Token。
+3. 缺少前后台防御协同 — LoopGuard 拦截后 Failure Intelligence 一无所知，反之亦然。
+
+决策：引入 V3 三层联合熔断防线：
+
+1. **CLI 意图标准化（Command Normalization）**：在计算命令哈希前，通过正则剥离 `cd`、`chcp`、`set ENV`、`2>&1`、`> redirect`、`-X` flag 等噪音，提取 `{action, target}` 语义指纹。`python run_test.py`、`cd /d ... && python run_test.py`、`chcp 65001 && python run_test.py` 统一归一化为 `EXECUTE::run_test.py`。
+
+2. **意图感知 LoopGuard + Guard-to-FI 管道**：对归一化后的意图指纹进行跨轮频率检测。拦截时向 FI 内存注入 `LOOP_GUARD_PREVENTED` 虚拟失败记录，消除前后台数据盲区。
+
+3. **物理硬断路器（Hard Stop Circuit Breaker）**：同一行为意图累积 5 次失败（真实 `TOOL_CRASH` + 虚拟 `LOOP_GUARD_PREVENTED` 合计）时，运行时抛出 `RuntimeEscalationException`，物理掐断 Agent 循环，不再向 LLM 返回任何 tool_result。
+
+拒绝方案：
+- 仅依赖软 Escalation（v2 已证伪 — LLM 忽略提示）
+- 仅升级字面量去重规则（v1 已失效 — LLM 换参数逃避）
+- 简单降低 max_iterations（治标不治本）
+
+核心文件：
+- `src/core/loop_controller.py` — 新建，三层防线统一实现
+- `src/agent/mini_claude_agent.py` — 集成 V3 Controller，捕获 `RuntimeEscalationException`
+- `src/core/tracing/models.py` — 新增 `CIRCUIT_BROKEN` 状态
+
+预期效果：任务 001（db_port）在第 5 轮被硬熔断，`final_status = "CIRCUIT_BROKEN"`，Token 消耗从 19.6 万降至约 1-2 万。
+
+已知局限：由于主代理未挂载 2PC 影子回滚机制，导致硬熔断时脏数据发生残留泄漏，引发评测判定非预期通过。该问题已作为高危缺陷分发至缺陷池。
+
+## ADR-012：基于版本化状态大账本与事务性异常硬回滚的评测基础设施重构
+
+状态：Accepted
+
+背景：V3 Circuit Breaker（ADR-011）引入硬熔断后，Agent 在任务执行过程中的文件变更残留到工作区，verify.py 因此误判任务通过。task_001_db_port 在 v3 基线评测中因脏数据导致非预期通过，破坏了评测的客观性。根本原因：Agent 原地直写，没有事务边界，熔断后缺乏回滚能力。
+
+决策：引入版本化状态大账本 + 事务性异常硬回滚。
+
+1. **版本化状态大账本（Versioned State Ledger）**：每轮工具调用前快照工作区受管文件的 hash 清单，作为回滚基准。
+2. **事务性异常硬回滚**：熔断触发时根据快照原子擦除所有变更文件，还原到执行前基准状态，确保 `verify.py` 看到的是干净起点。
+3. **沙箱隔离**：每个评测任务在独立沙箱目录中运行，任务间不共享状态，起始即隔离。
+
+拒绝方案：
+- 2PC Shadow Workspace（过度设计，与当前单进程 Agent 架构不匹配）
+- 仅靠 Agent 自行清理（不可靠，LLM 可能忽略清理指令）
+- 不做修复（脏数据持续破坏评测可信度）
+
+核心文件：
+- `src/core/loop_controller.py` — 集成回滚逻辑
+- `sandbox/tasks/` — 任务沙箱隔离
+- `verify.py` — 依赖物理快照判断
+
+面试防御价值（DoD）：本决策通过引入异常硬捕获与沙箱擦除机制，彻底根治了 Agent 原地直写导致的脏数据残留漂移，使物理客观判定（verify.py）与控制层生命周期（Circuit Breaker）达成强一致性，为 A/B 对照实验提供了绝对可信的真理源。
+
+验证：task_001_db_port 在 `v3_circuit_breaker` 基线中已正确返回 `FAIL (CIRCUIT_BROKEN)`，脏数据不再导致非预期通过。

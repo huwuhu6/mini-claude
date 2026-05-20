@@ -36,6 +36,7 @@ from core.subagent import SubAgentManager, SubAgentType, SubAgentResult
 from core.console import ConsoleCommandSystem, Command
 from core.compression import Compressor
 from core.loop_guard import LoopGuard, canonicalize_args
+from core.loop_controller import LoopController, RuntimeEscalationException, CommandNormalizer
 from core.tracing import TraceManager
 from core.failure_intelligence import FailureAnalyzer, FailureMemory, FailureEscalationPolicy, build_escalation_message
 from core.runtime_context import RuntimeContext
@@ -171,19 +172,27 @@ class MiniClaudeAgent:
         # Conversation state
         self.messages: List[Message] = []
         self._running = False
-        # Loop guard — industrial-grade infinite-loop detection
+
+        # Failure Intelligence Layer (must init before V3 Loop Controller)
+        self.failure_analyzer = FailureAnalyzer()
+        self.failure_memory = FailureMemory()
+        self.failure_policy = FailureEscalationPolicy()
+
+        # V3 Loop Controller — combined intent normalization + guard + circuit breaker
+        self.loop_controller = LoopController(
+            failure_memory=self.failure_memory,
+            strike_limit=5,
+        )
+        # Legacy loop guard kept for backward compatibility (trace schema)
         self.loop_guard = LoopGuard()
         # Runtime trace system — append-only, hook-based observability
         self.trace = TraceManager(trace_dir=self.workdir / ".traces")
         # Benchmark metrics — reset each _llm_tool_cycle call
         self.last_metrics: Dict[str, int] = {"turns": 0, "total_tokens": 0, "api_errors": 0}
         # Tracks consecutive identical command executions for soft prompting
-        self._cmd_history: List[tuple] = []  # [(signature, result_preview), ...]
+        # (Replaced by V3 intent-based LoopGuard in loop_controller.py)
+        self._cmd_history: List[tuple] = []
 
-        # Failure Intelligence Layer
-        self.failure_analyzer = FailureAnalyzer()
-        self.failure_memory = FailureMemory()
-        self.failure_policy = FailureEscalationPolicy()
 
         # Tracks current user prompt for trace recording
         self._current_user_prompt: str = ""
@@ -866,51 +875,88 @@ class MiniClaudeAgent:
                     if tname == "TodoWrite":
                         used_todo = True
 
-                    # ── Trace + Loop guard + Execute + Failure Intelligence ──
+                    # ── Trace + V3 Defense + Execute + Failure Intelligence ──
                     t_start = time.time()
                     args_hash = canonicalize_args(args)
-                    loop_msg = self.loop_guard.check(tname, args)
+                    v3_block_msg = None
                     failure_sig = None
 
-                    if loop_msg:
-                        result_text = loop_msg
-                        self.trace.record_reflection()
-                    else:
-                        result = self._execute_tool(tname, args)
-                        result_text = str(result)
+                    try:
+                        # ── V3 Layer 2+3: intent-based dedup → circuit breaker ──
+                        v3_block_msg = self.loop_controller.check(tname, args)
 
-                        # ── Failure Intelligence Analysis ──
-                        if self._is_tool_error(result_text):
-                            failure_sig = self.failure_analyzer.analyze(
-                                tool_name=tname,
-                                tool_args=args,
-                                result_text=result_text,
-                            )
-                            self.failure_memory.record(
-                                category=failure_sig.category.value,
-                                strategy_fp=failure_sig.strategy_fingerprint,
-                            )
-                            cat = failure_sig.category.value
-                            cat_count = self.failure_memory.get_category_count(cat)
-                            stg_div = self.failure_memory.get_strategy_diversity(cat)
-                            should_esc, esc_reason = self.failure_policy.should_escalate(
-                                failure_sig, cat_count, stg_div,
-                            )
-                            if should_esc:
-                                logger.warning(
-                                    f"FailureEscalation: {cat} x{cat_count}, "
-                                    f"strategies={stg_div}, reason={esc_reason}"
+                        if v3_block_msg:
+                            result_text = v3_block_msg
+                            # Compatibility: record in legacy guard as well
+                            self.loop_guard.record(tname, args)
+                        else:
+                            result = self._execute_tool(tname, args)
+                            result_text = str(result)
+
+                            # ── Failure Intelligence Analysis ──
+                            if self._is_tool_error(result_text):
+                                failure_sig = self.failure_analyzer.analyze(
+                                    tool_name=tname,
+                                    tool_args=args,
+                                    result_text=result_text,
                                 )
-                                result_text = build_escalation_message(failure_sig, esc_reason)
-                                failure_sig.escalated = True
+                                self.failure_memory.record(
+                                    category=failure_sig.category.value,
+                                    strategy_fp=failure_sig.strategy_fingerprint,
+                                )
 
-                    self.loop_guard.record(tname, args)
+                                # ── V3 Layer 3: circuit breaker registration ──
+                                self.loop_controller.register_failure(
+                                    tname, args, failure_sig.category.value,
+                                )
+
+                                cat = failure_sig.category.value
+                                cat_count = self.failure_memory.get_category_count(cat)
+                                stg_div = self.failure_memory.get_strategy_diversity(cat)
+                                should_esc, esc_reason = self.failure_policy.should_escalate(
+                                    failure_sig, cat_count, stg_div,
+                                )
+                                if should_esc:
+                                    logger.warning(
+                                        f"FailureEscalation: {cat} x{cat_count}, "
+                                        f"strategies={stg_div}, reason={esc_reason}"
+                                    )
+                                    result_text = build_escalation_message(failure_sig, esc_reason)
+                                    failure_sig.escalated = True
+
+                            self.loop_guard.record(tname, args)
+
+                    except RuntimeEscalationException as e:
+                        # ── V3 hard circuit breaker triggered ──
+                        logger.critical(
+                            f"[V3] 硬断路器触发，物理终止循环: {e}"
+                        )
+                        self.trace.record_circuit_breaker()
+                        self.trace.record_tool_call(
+                            tool_name=tname, args_hash=args_hash,
+                            success=False, loop_guard_blocked=False,
+                            error_message=str(e)[:200],
+                            result_preview=str(e)[:200],
+                            started_at=t_start, finished_at=time.time(),
+                            failure_category="CIRCUIT_BREAKER",
+                            recoverability="NON_RECOVERABLE",
+                            strategy_fingerprint="",
+                            escalated=False,
+                            circuit_breaker_triggered=True,
+                            cwd=str(self.runtime_context.cwd),
+                            workspace_root=str(self.runtime_context.workspace_root),
+                            session_id=self.runtime_context.shell_session.session_id,
+                        )
+                        # Hard terminate the loop
+                        self.trace.end_task("CIRCUIT_BROKEN")
+                        return str(e)
+
                     t_end = time.time()
 
-                    t_success = not loop_msg
+                    t_success = not v3_block_msg
                     self.trace.record_tool_call(
                         tool_name=tname, args_hash=args_hash,
-                        success=t_success, loop_guard_blocked=bool(loop_msg),
+                        success=t_success, loop_guard_blocked=bool(v3_block_msg),
                         error_message="" if t_success else result_text[:200],
                         result_preview=result_text[:200],
                         started_at=t_start, finished_at=t_end,
@@ -918,26 +964,11 @@ class MiniClaudeAgent:
                         recoverability=failure_sig.recoverability.value if failure_sig else "",
                         strategy_fingerprint=failure_sig.strategy_fingerprint if failure_sig else "",
                         escalated=failure_sig.escalated if failure_sig else False,
+                        circuit_breaker_triggered=False,
                         cwd=str(self.runtime_context.cwd),
                         workspace_root=str(self.runtime_context.workspace_root),
                         session_id=self.runtime_context.shell_session.session_id,
                     )
-
-                    # ── Soft prompt: detect repeated identical commands ──
-                    if tname == 'bash' and not loop_msg:
-                        sig = f"{tname}:{args_raw}"
-                        preview = result_text[:200]  # snapshot before hint appended
-                        if self._cmd_history and self._cmd_history[-1][0] != sig:
-                            self._cmd_history.clear()
-                        self._cmd_history.append((sig, preview))
-
-                        if len(self._cmd_history) >= 3:
-                            prev = [e[1] for e in self._cmd_history]
-                            if len(set(prev)) == 1 and '[系统提示]' not in result_text:
-                                result_text += (
-                                    "\n\n[系统提示] 你已连续执行相同命令多次，且输出没有变化。"
-                                    "如果这是轮询或重试操作请忽略；否则请考虑改变策略或使用不同参数。"
-                                )
 
                     # Log with clean format
                     result_preview = result_text[:200].replace('\n', ' ').strip()

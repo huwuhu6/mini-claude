@@ -20,6 +20,7 @@ class FailureCategory(Enum):
     DISK_FULL = "DISK_FULL"
     TOOL_CRASH = "TOOL_CRASH"
     TOOL_PARAM_ERROR = "TOOL_PARAM_ERROR"
+    LOOP_GUARD_PREVENTED = "LOOP_GUARD_PREVENTED"  # V3: virtual failure injected by LoopGuard
     UNKNOWN = "UNKNOWN"
 
 

@@ -18,6 +18,7 @@ class TaskFinalStatus(Enum):
     FAILED = "FAILED"
     LOOP_ABORTED = "LOOP_ABORTED"
     ROLLED_BACK = "ROLLED_BACK"
+    CIRCUIT_BROKEN = "CIRCUIT_BROKEN"  # V3: hard circuit breaker terminated
 
 
 @dataclass
@@ -37,6 +38,8 @@ class ToolTrace:
     recoverability: str = ""
     strategy_fingerprint: str = ""
     escalated: bool = False
+    # V3 Circuit Breaker
+    circuit_breaker_triggered: bool = False
     # Runtime Context fields
     cwd: str = ""
     workspace_root: str = ""
@@ -57,6 +60,7 @@ class ToolTrace:
             'recoverability': self.recoverability,
             'strategy_fingerprint': self.strategy_fingerprint,
             'escalated': self.escalated,
+            'circuit_breaker_triggered': self.circuit_breaker_triggered,
             'cwd': self.cwd,
             'workspace_root': self.workspace_root,
             'session_id': self.session_id,
@@ -103,6 +107,7 @@ class TaskTrace:
     rollback_count: int = 0
     loop_guard_trigger_count: int = 0
     reflection_count: int = 0
+    circuit_breaker_trigger_count: int = 0
     final_status: str = ""
     user_prompt: str = ""
     workspace_root: str = ""
@@ -121,6 +126,7 @@ class TaskTrace:
             'rollback_count': self.rollback_count,
             'loop_guard_trigger_count': self.loop_guard_trigger_count,
             'reflection_count': self.reflection_count,
+            'circuit_breaker_trigger_count': self.circuit_breaker_trigger_count,
             'final_status': self.final_status,
             'user_prompt': self.user_prompt,
             'workspace_root': self.workspace_root,
