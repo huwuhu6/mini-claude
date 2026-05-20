@@ -2,8 +2,8 @@
 Loop Controller V3 — Combined Circuit Breaker Defense with Intent Normalization.
 
 Three-layer defense pipeline:
-  1. CommandNormalizer — strips CLI noise (cd, chcp, set ENV, redirects, -X flags)
-     to extract canonical {action, target} intent fingerprints.
+  1. CommandNormalizer — token-based CLI normalizer (shlex.split) that strips
+     shell noise and extracts canonical {action, target} intent fingerprints.
   2. Intent-Aware LoopGuard — compares normalized intents instead of raw command
      strings, injects LOOP_GUARD_PREVENTED virtual failures into FailureMemory.
   3. Hard Circuit Breaker — when the same intent accumulates 5 failures
@@ -13,7 +13,7 @@ Three-layer defense pipeline:
 Usage:
     controller = LoopController(failure_memory=memory)
 
-    block_msg = controller.check_and_record("bash", {"command": "python run_test.py"})
+    block_msg = controller.check("bash", {"command": "python run_test.py"})
     if block_msg:
         # Tool was intercepted — return block_msg as result
         ...
@@ -22,11 +22,11 @@ Usage:
     controller.register_failure("bash", {"command": "..."}, "TOOL_CRASH")
 """
 from __future__ import annotations
-import re
+import shlex
 import json
 import logging
 from dataclasses import dataclass
-from typing import Dict, List, Optional, Any, Tuple
+from typing import Dict, List, Optional, Any
 
 logger = logging.getLogger(__name__)
 
@@ -64,68 +64,36 @@ class NormalizedIntent:
 
 
 class CommandNormalizer:
-    """Strips CLI environment noise from bash commands.
+    """Token-based CLI normalizer using shlex.split.
 
-    Noise sources removed (in order):
-      - `chcp 65001 > nul &&` / `chcp 65001 &&`
-      - `set VAR=value &&`
-      - `cd /d X:/path &&`
-      - `cd X:/path &&`
-      - `python -X utf8` / `py -X utf8`
-      - `2>&1`
-      - `> file` redirects
-      - `| type file` pipe noise
+    Transforms shell command strings into canonical {action, target} intent
+    fingerprints by tokenizing with shlex.split rather than applying regex
+    noise patterns. This catches CLI evasion variants (chcp + cd + set + -X
+    + redirects) that regex cannot generalize.
+
+    Pipeline:
+      1. Tokenize with shlex.split, then split on &&/; into segments.
+      2. Find the action-bearing segment (skip env-prefix segments).
+      3. Strip trailing shell redirect tokens (2>&1, > file, | type).
+      4. Classify action from executable name.
+      5. Extract target (first non-flag argument).
     """
 
-    _NOISE_PATTERNS = [
-        # chcp code-page switching
-        re.compile(r'chcp\s+\d+\s*(?:>\s*nul\s*)?&&?\s*'),
-        # set ENV var
-        re.compile(r'set\s+\w+=\w+\s*&&?\s*'),
-        # cd /d X:\path  (use \S+ for path to avoid Python 3.14 regex char-class issues)
-        re.compile(r'cd\s+/d\s+\S+\s*&&?\s*'),
-        # cd X:\path
-        re.compile(r'cd\s+\S+\s*&&?\s*'),
-        # pushd X:\path
-        re.compile(r'pushd\s+\S+\s*&&?\s*'),
-        # python -X flag (e.g. -X utf8)
-        re.compile(r'(?:python|py)\s+-X\s+\w+\s+'),
-        # stderr redirect
-        re.compile(r'\s+2>&1'),
-        # stdout redirect (> file, > nul, etc.)
-        re.compile(r'\s+>\s*\S+(?:\s+2>&1)?'),
-        # pipe to type (Windows: cmd1 | type cmd2)
-        re.compile(r'\s*\|\s*type\s+\S+'),
-    ]
+    # Commands that only set up environment — skip when found as segment head
+    _ENV_PREFIX_COMMANDS = frozenset({'chcp', 'cd', 'pushd', 'set'})
 
-    _ACTION_PATTERNS: List[Tuple[str, re.Pattern]] = [
-        ("INSTALL_PACKAGE", re.compile(
-            r'(?:pip|pip3|npm|conda|brew|apt(?:-get)?|choco|yum)\s+install\s+'
-        )),
-        ("PACKAGE_QUERY", re.compile(
-            r'(?:pip|pip3)\s+(?:list|show)\s*'
-        )),
-        ("NETWORK_DOWNLOAD", re.compile(
-            r'(?:curl|wget)\s+'
-        )),
-        ("EXECUTE", re.compile(
-            r'(?:python|py|python3|node|ruby|perl|bash)\s+'
-        )),
-        ("COMPILE", re.compile(
-            r'(?:gcc|g\+\+|make|cmake|clang|rustc|go\s+build)\s+'
-        )),
-        ("VCS", re.compile(
-            r'(?:^|\s)git\s+'
-        )),
-    ]
+    # Shell redirect operators used at command tail
+    _REDIRECT_OPS = frozenset({'>', '>>', '<', '2>', '2>>', '|'})
 
-    # File-based tool action mapping
+    # File-based tool action mapping (non-bash tools)
     _FILE_TOOL_ACTIONS = {
-        "read_file": "READ",
-        "read_file_lines": "READ",
-        "write_file": "WRITE",
-        "edit_file": "EDIT",
+        "read_file":        "READ",
+        "read_file_lines":  "READ",
+        "write_file":       "WRITE",
+        "edit_file":        "EDIT",
     }
+
+    # ── Public entry point ─────────────────────────────────────────────
 
     @classmethod
     def normalize(cls, tool_name: str, args: Dict[str, Any]) -> NormalizedIntent:
@@ -142,49 +110,175 @@ class CommandNormalizer:
         if not cmd:
             return NormalizedIntent(action="UNKNOWN", target="", tool=tool_name)
 
-        # Step 1: Strip noise
-        cleaned = cmd
-        for pat in cls._NOISE_PATTERNS:
-            cleaned = pat.sub("", cleaned)
-        cleaned = cleaned.strip()
+        # Step 1: Tokenize and split on &&/;
+        try:
+            all_tokens = shlex.split(cmd, posix=False)
+        except ValueError:
+            # Malformed quoting — fallback to raw prefix
+            return NormalizedIntent(action="UNKNOWN", target=cmd[:40], tool=tool_name)
+        segments = cls._split_compound(all_tokens)
 
-        if not cleaned:
-            cleaned = cmd.strip()[:80]  # fallback to raw prefix
+        # Step 2: Find the action-bearing segment
+        action_tokens = cls._find_action_segment(segments)
+        if not action_tokens:
+            return NormalizedIntent(action="UNKNOWN", target="", tool=tool_name)
 
-        # Step 2: Classify action
-        action = "EXECUTE"
-        for act, pattern in cls._ACTION_PATTERNS:
-            if pattern.search(cleaned):
-                action = act
-                break
+        # Step 3: Strip trailing redirect tokens
+        clean = cls._strip_redirect_tail(action_tokens)
+        if not clean:
+            return NormalizedIntent(action="UNKNOWN", target="", tool=tool_name)
 
-        # Step 3: Extract target
-        target = cls._extract_target(action, cleaned)
+        # Step 4: Classify action from executable
+        executable = clean[0].lower()
+        first_arg = clean[1] if len(clean) > 1 else None
+        action = cls._classify_action(executable, first_arg)
+
+        # Step 5: Extract target
+        target = cls._extract_target(action, clean)
 
         return NormalizedIntent(action=action, target=target, tool=tool_name)
 
+    # ── Pipeline helpers ───────────────────────────────────────────────
+
     @classmethod
-    def _extract_target(cls, action: str, cleaned: str) -> str:
-        """Extract the key target (file/package) from a cleaned command."""
-        if action == "INSTALL_PACKAGE":
-            m = re.search(
-                r'(?:pip|pip3|npm|conda|brew|apt(?:-get)?|choco|yum)\s+install\s+(\S+)',
-                cleaned
-            )
-            return m.group(1) if m else cleaned[:60]
+    def _split_compound(cls, tokens: List[str]) -> List[List[str]]:
+        """Split a flat token list on ``&&`` and ``;`` into segments."""
+        segments: List[List[str]] = []
+        current: List[str] = []
+        for tok in tokens:
+            if tok in ('&&', ';'):
+                if current:
+                    segments.append(current)
+                    current = []
+            else:
+                current.append(tok)
+        if current:
+            segments.append(current)
+        return segments
 
-        if action in ("EXECUTE", "COMPILE"):
-            m = re.search(
-                r'(?:python|py|python3|node|ruby|perl|bash|gcc|g\+\+|rustc)\s+(\S+)',
-                cleaned
-            )
-            return m.group(1) if m else cleaned[:60]
+    @classmethod
+    def _find_action_segment(cls, segments: List[List[str]]) -> List[str]:
+        """Return the first segment whose first token is not an env prefix."""
+        for seg in segments:
+            if seg and seg[0].lower() not in cls._ENV_PREFIX_COMMANDS:
+                return seg
+        return []
 
-        if action in ("VCS",):
-            m = re.search(r'git\s+(\S+)', cleaned)
-            return f"git {m.group(1)}" if m else cleaned[:60]
+    @classmethod
+    def _strip_redirect_tail(cls, tokens: List[str]) -> List[str]:
+        """Remove trailing shell redirect operators and their targets."""
+        result = list(tokens)
+        while result:
+            # Two-token: redirect_op filename
+            if len(result) >= 2 and result[-2].lower() in cls._REDIRECT_OPS:
+                result.pop()
+                result.pop()
+                continue
+            # Two-token: ... 2>&1 (special redirect operator)
+            if len(result) >= 2 and result[-2] == '2>&1':
+                result.pop()
+                result.pop()
+                continue
+            # Single-token: 2>&1, >file, <file, >nul
+            last = result[-1]
+            if last == '2>&1' or last.startswith('>') or last.startswith('<'):
+                result.pop()
+                continue
+            # Pipe tail: | type nul (Windows idiom)
+            if len(result) >= 3 and result[-3] == '|' and result[-2].lower() == 'type':
+                result.pop()
+                result.pop()
+                result.pop()
+                continue
+            break
+        return result
 
-        return cleaned[:60]
+    @classmethod
+    def _classify_action(cls, executable: str, first_arg: Optional[str]) -> str:
+        """Classify action from executable name and first argument."""
+        # Package installers
+        if executable in ('pip', 'pip3'):
+            if first_arg in ('list', 'show'):
+                return 'PACKAGE_QUERY'
+            return 'INSTALL_PACKAGE'
+        if executable in ('npm', 'npx'):
+            if first_arg == 'install':
+                return 'INSTALL_PACKAGE'
+            return 'EXECUTE'
+        if executable == 'conda':
+            if first_arg == 'install':
+                return 'INSTALL_PACKAGE'
+            return 'EXECUTE'
+        if executable in ('brew', 'choco', 'apt-get', 'apt', 'yum'):
+            if first_arg == 'install':
+                return 'INSTALL_PACKAGE'
+            return 'EXECUTE'
+        # Network
+        if executable in ('curl', 'wget'):
+            return 'NETWORK_DOWNLOAD'
+        # Runtimes / interpreters
+        if executable in ('python', 'py', 'python3', 'node', 'ruby', 'perl', 'bash'):
+            return 'EXECUTE'
+        # Compilers
+        if executable in ('gcc', 'g++', 'clang', 'rustc'):
+            return 'COMPILE'
+        if executable == 'go':
+            if first_arg in ('build',):
+                return 'COMPILE'
+            return 'EXECUTE'
+        if executable in ('make', 'cmake'):
+            return 'COMPILE'
+        # VCS
+        if executable == 'git':
+            return 'VCS'
+        # Default
+        return 'EXECUTE'
+
+    @classmethod
+    def _extract_target(cls, action: str, tokens: List[str]) -> str:
+        """Extract the key target (file/package/subcommand) from cleaned tokens."""
+        if len(tokens) <= 1:
+            return tokens[0] if tokens else ""
+
+        executable = tokens[0].lower()
+
+        if action == 'VCS':
+            # git status → "git status", git log → "git log"
+            if len(tokens) > 1 and not tokens[1].startswith('-'):
+                return f"git {tokens[1]}"
+            return "git"
+
+        if action == 'INSTALL_PACKAGE':
+            # pip install pygame → "pygame"
+            for i, tok in enumerate(tokens):
+                if tok == 'install' and i + 1 < len(tokens):
+                    if not tokens[i + 1].startswith('-'):
+                        return tokens[i + 1]
+            return "install"
+
+        if action == 'PACKAGE_QUERY':
+            for tok in tokens:
+                if tok in ('list', 'show'):
+                    return tok
+            return "query"
+
+        # EXECUTE / COMPILE / NETWORK_DOWNLOAD / default
+        # Walk past executable and all flags to find the target argument
+        i = 1
+        while i < len(tokens):
+            tok = tokens[i]
+            if tok == '-m' and i + 1 < len(tokens):
+                # python -m pytest → module name is the target
+                return tokens[i + 1]
+            if tok.startswith('-'):
+                # Flag: skip it and its value (if the value is not itself a flag)
+                i += 1
+                if i < len(tokens) and not tokens[i].startswith('-'):
+                    i += 1
+                continue
+            return tok
+        # Fallback to the first argument if no non-flag found
+        return tokens[1] if len(tokens) > 1 else tokens[0]
 
 
 # ──────────────────────────────────────────────────────────────────────

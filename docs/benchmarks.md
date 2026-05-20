@@ -6,5 +6,5 @@
 
 | 任务 | 状态 | Token | 轮次 | Agent 终态 | 耗时 |
 |------|------|-------|------|------------|------|
-| task_001_db_port | ❌ FAIL | 38080 | 13 | CIRCUIT_BROKEN | 28.1s |
+| task_001_db_port | ❌ FAIL | 38909 | 14 | CIRCUIT_BROKEN | 30.27s |
 

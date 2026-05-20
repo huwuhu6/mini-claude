@@ -132,7 +132,16 @@
 
 任务：标记 Stable / Experimental / Legacy。SubAgent、Teammate、MessageBus、PDF Skill 等能力不要混入主线。默认配置只开启稳定能力。
 
-### P2.5 扩展 CommandNormalizer 的正则清洗算子，增加对多语言工具链噪声的剥离支持
+### P2.5 重构 CommandNormalizer 为基于 shlex.split 的词法标记提取器 ✅ [Done]
+
+类型：性能优化 + 防逃逸强化
+状态：Done（已完成）
+
+任务：将 CommandNormalizer 从正则匹配模式重构为基于 `shlex.split` 的词法标记解析管道。新实现通过 token 拆分（`&&` / `;`）、环境前缀剥离（chcp/cd/set/pushd）、重定向尾部清理（`2>&1` / `> file` / `| type`）、可执行文件分类和目标文件提取五步管道，将 CLI 变体马甲统一归约为规范意图指纹。
+
+验证：`task_001_db_port` 评测中，所有 CLI 变体（cd、chcp、set、-X、pushd、2>&1、pipe type）全部正确归一化为 `EXECUTE::run_test.py`。Token 消耗从 V3 正则版的 62K 降至 38.9K（相对 V2 基线 196K 下降 80.2%）。轮数从 20 轮降至 14 轮。68 个集成测试全部通过。
+
+核心文件：`src/core/loop_controller.py` — CommandNormalizer 类
 
 ## 5. P3：可选增强
 
@@ -154,4 +163,3 @@
 
 原因：当前项目的瓶颈不是功能少，而是需要把已有核心能力验证、收敛、讲清楚。
 
-扩展 CommandNormalizer 的正则清洗算子，增加对 npm test、go run、cargo 等跨语言 CLI 工具链的噪声剥离支持
