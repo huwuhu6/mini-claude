@@ -1,490 +1,251 @@
 #!/usr/bin/env python3
 """
-eval_runner.py — Automated benchmark for MiniClaudeAgent.
+eval_runner.py — WF-2 沙箱评测运行器（真实 Agent Loop）
 
-Runs a set of benchmark tasks against the agent, collects metrics
-(turns, tokens, errors, duration), and prints a Markdown report.
-Results are also appended to logs/eval_results.csv.
+自动扫描 sandbox/tasks/ 目录加载评测任务，为每个任务创建隔离影子工作区，
+实例化真实 MiniClaudeAgent 执行 problem.md 中的任务，
+运行 verify.py 子进程客观判定 Pass/Fail。
 """
 
 from __future__ import annotations
+import os
 import sys
 import time
-import csv
+import shutil
+import subprocess
 from pathlib import Path
 from datetime import datetime
-from dataclasses import dataclass, field
-from typing import Dict, Any, Callable, Optional, List
-from unittest import mock
+from typing import Any
 
-# ── Ensure stdout uses UTF-8 on Windows ────────────────────────
+# ── 确保 stdout 使用 UTF-8（Windows 编码脱敏）───────────────
 if hasattr(sys.stdout, "reconfigure"):
     sys.stdout.reconfigure(encoding="utf-8", errors="replace")
 
-# ── Ensure src package is importable ──────────────────────────
+# ── 确保 src 包可导入 ──────────────────────────────────────
 _PROJECT_ROOT = Path(__file__).resolve().parent
 _src = str(_PROJECT_ROOT / "src")
 if _src not in sys.path:
     sys.path.insert(0, _src)
 
 from agent.mini_claude_agent import MiniClaudeAgent
-from core.tools.base_tools import BaseTools
-from core.evaluation import TraceAnalyzer
+
+# ── 评测归档目录（保持 tasks/ 只读）────────────────────────
+_ARCHIVE_DIR = (
+    _PROJECT_ROOT / "sandbox" / "eval_results" / "v2_baseline_fi_soft"
+).resolve()
 
 
 # ═══════════════════════════════════════════════════════════════
-# EvalTask Dataclass
+# 现场打捞（写入归档目录，不污染 tasks/ 只读用例）
 # ═══════════════════════════════════════════════════════════════
 
-@dataclass
-class EvalTask:
-    id: str
-    name: str
-    prompt: str
-    verify: Callable[[Path, str], bool]
-    cleanup: Callable[[Path], Any]
-    setup:      Optional[Callable[[Path], Any]] = None
-    max_turns:  int = 0   # 0 = no limit; >0 = hard cap, exceeded → FAIL
-    min_turns:  int = 0   # 0 = no minimum
-    compression_threshold: int = 0   # 0 = no override
-    fault_inject: Optional[Callable[[], Any]] = None
-    # ^ Returns a context-manager that patches tools for fault injection.
-    #   The runner enters the context before agent.chat() and exits after.
-    prompts: Optional[List[str]] = None
-    # ^ Multi-turn: if set, the runner calls agent.chat() once per string
-    #   on the SAME agent instance.  ``prompt`` is ignored in this mode.
-    #   The ``verify`` callback receives the LAST response.
-    post_agent_init: Optional[Callable[[Any], None]] = None
-    # ^ Called immediately after agent creation, receives the agent instance.
-    #   Use for per-task configuration that needs the live agent object
-    #   (e.g. lowering subagent iteration caps for fast-fail tests).
+def _salvage_trace(workspace_root: Path, archive_dir: Path, task_id: str) -> bool:
+    """将 .workspace/.traces/ 中最新的 trace 命名归档。"""
+    trace_dir = (workspace_root / ".traces").resolve()
+    if not trace_dir.is_dir():
+        return False
+    trace_files = sorted(
+        trace_dir.glob("task_*.json"),
+        key=lambda p: p.stat().st_mtime,
+    )
+    if not trace_files:
+        return False
+    archive_dir.mkdir(parents=True, exist_ok=True)
+    dest = archive_dir / f"{task_id}_v2_trace.json"
+    shutil.copy2(trace_files[-1], dest)
+    return True
 
 
-# ═══════════════════════════════════════════════════════════════
-# Fault-Injection Helpers (Task F)
-# ═══════════════════════════════════════════════════════════════
-
-def _patch_subagent_for_fast_fail(agent) -> None:
-    """Monkey-patch subagent_manager.run to inject fail_after=3 for Task I."""
-    _original_run = agent.subagent_manager.run
-
-    def _fast_fail_run(prompt, agent_type=None, workdir=None,
-                       max_iterations=30, **kw):
-        return _original_run(
-            prompt, agent_type=agent_type or "general-purpose",
-            workdir=workdir, max_iterations=max_iterations,
-            fail_after_tool_calls=1,
-        )
-
-    agent.subagent_manager.run = _fast_fail_run
-
-
-def _task_f_fault_inject():
-    """Context manager: first read_file call crashes, subsequent calls recover."""
-    _original_read = BaseTools.read_file
-    _fault_counter = [0]
-
-    def _injected(self_, path, limit=None):
-        _fault_counter[0] += 1
-        if _fault_counter[0] == 1:
-            raise Exception(
-                "CRITICAL SYSTEM FAILURE: Disk read timeout "
-                "(Error 0x8007045D)"
-            )
-        return _original_read(self_, path, limit)
-
-    return mock.patch.object(BaseTools, 'read_file', _injected)
+def _salvage_transcripts(workspace_root: Path, archive_dir: Path, task_id: str) -> bool:
+    """将 .workspace/.transcripts/ 完整复制到归档目录。"""
+    src = (workspace_root / ".transcripts").resolve()
+    if not src.is_dir():
+        return False
+    archive_dir.mkdir(parents=True, exist_ok=True)
+    dst = archive_dir / f"{task_id}_v2_transcripts"
+    if dst.exists():
+        shutil.rmtree(dst)
+    shutil.copytree(src, dst)
+    return True
 
 
 # ═══════════════════════════════════════════════════════════════
-# Benchmark Task Definitions
+# 运行器
 # ═══════════════════════════════════════════════════════════════
 
-BENCHMARK_TASKS: List[EvalTask] = [
-    EvalTask(
-        id="A",
-        name="File IO",
-        prompt=(
-            '在当前目录创建一个名为 "eval_test.txt" 的文件，'
-            "内容为 'hello benchmark'。"
-        ),
-        verify=lambda wd, _r: (
-            (wd / "eval_test.txt").exists()
-            and "hello benchmark" in (wd / "eval_test.txt").read_text()
-        ),
-        cleanup=lambda wd: (wd / "eval_test.txt").unlink(missing_ok=True),
-        max_turns=4,
-    ),
-    EvalTask(
-        id="B",
-        name="环境探针",
-        prompt=(
-            "读取操作系统的环境变量，找出 PATH 变量包含多少个路径，"
-            "将数字写入 'path_count.txt'。"
-        ),
-        verify=lambda wd, _r: (
-            (wd / "path_count.txt").exists()
-            and (wd / "path_count.txt").read_text().strip().isdigit()
-        ),
-        cleanup=lambda wd: (wd / "path_count.txt").unlink(missing_ok=True),
-        max_turns=6,
-    ),
-    EvalTask(
-        id="C",
-        name="容错测试",
-        prompt=(
-            "读取一个不存在的文件 'ghost.md'，处理报错"
-            "并输出一段话说明文件找不到。"
-        ),
-        verify=lambda wd, resp: (
-            any(kw in resp.lower() for kw in
-                ("找不到", "not found", "不存在", "does not exist",
-                 "no such file", "无法", "错误", "error"))
-        ),
-        cleanup=lambda wd: None,
-        max_turns=3,
-    ),
-    EvalTask(
-        id="D",
-        name="长上下文记忆与压缩容错",
-        prompt=(
-            "你的初始密钥是 [SECRET_TOKEN_XYZ_998]。"
-            "接下来，请连续调用 4 次 bash 工具，分别 echo 数字 1 到 4（每次一行）。"
-            "完成这 4 次无意义的调用后，请使用 write_file 工具，"
-            "将你最初得到的密钥写入到 memory_test.txt 文件中。"
-        ),
-        verify=lambda wd, _r: (
-            (wd / "memory_test.txt").exists()
-            and "[SECRET_TOKEN_XYZ_998]" in (wd / "memory_test.txt").read_text()
-        ),
-        cleanup=lambda wd: (wd / "memory_test.txt").unlink(missing_ok=True),
-        compression_threshold=300,
-        max_turns=10,
-    ),
-    EvalTask(
-        id="E",
-        name="子代理委托测试",
-        prompt=(
-            "请创建一个子代理（使用 task 工具），让子代理去执行 bash 命令 "
-            "'echo SUBAGENT_ALIVE > sub_test.txt'。主代理请等待子代理完成。"
-        ),
-        verify=lambda wd, _r: (
-            (wd / "sub_test.txt").exists()
-            and "SUBAGENT_ALIVE" in (wd / "sub_test.txt").read_text()
-        ),
-        cleanup=lambda wd: (wd / "sub_test.txt").unlink(missing_ok=True),
-        max_turns=6,
-    ),
-    EvalTask(
-        id="F",
-        name="底层异常与重试容错测试",
-        prompt=(
-            "请读取当前目录下的 target.txt 文件。如果遇到任何系统报错，"
-            "不要放弃，请在一句话内分析报错原因并立即重试读取。"
-            "成功读取后，将内容写入 recovered.txt。"
-        ),
-        verify=lambda wd, _r: (
-            (wd / "recovered.txt").exists()
-            and (wd / "target.txt").exists()
-            and (wd / "recovered.txt").read_text()
-            == (wd / "target.txt").read_text()
-        ),
-        cleanup=lambda wd: (
-            (wd / "target.txt").unlink(missing_ok=True),
-            (wd / "recovered.txt").unlink(missing_ok=True),
-        ),
-        setup=lambda wd: (wd / "target.txt").write_text(
-            "FAULT_INJECTION_TARGET_42"
-        ),
-        min_turns=3,
-        max_turns=8,
-        fault_inject=_task_f_fault_inject,
-    ),
-
-    # ── Task G: Multi-turn dialogue degradation ─────────────
-    EvalTask(
-        id="G",
-        name="多轮对话退化测试",
-        prompt="",  # unused — prompts list takes precedence
-        verify=lambda wd, _r: (
-            (wd / "recall.txt").exists()
-            and "42" in (wd / "recall.txt").read_text()
-        ),
-        cleanup=lambda wd: (wd / "recall.txt").unlink(missing_ok=True),
-        max_turns=12,
-        prompts=[
-            "请记住数字 42，这个数字非常重要。只需回复'已记住'。",
-            "用 bash 工具执行 echo 1 到 5，每次 echo 一个数字。",
-            "把你最初记住的数字写入 recall.txt 文件。",
-        ],
-    ),
-
-    # ── Task H: Parameter hallucination self-healing ─────────
-    EvalTask(
-        id="H",
-        name="参数幻觉自愈测试",
-        prompt=(
-            "请读取 real.txt 的内容。"
-            "如果工具报错说文件不存在或参数不对，请分析错误原因，纠正后重试。"
-        ),
-        verify=lambda wd, resp: (
-            "secret42" in resp
-            or "secret42" in (wd / "real_file.txt").read_text()
-            if (wd / "real_file.txt").exists()
-            else False
-        ),
-        cleanup=lambda wd: (wd / "real_file.txt").unlink(missing_ok=True),
-        setup=lambda wd: (wd / "real_file.txt").write_text("secret42"),
-        max_turns=5,
-    ),
-
-    # ── Task I: Rollback state leak test ─────────────────────
-    EvalTask(
-        id="I",
-        name="回滚状态防泄露测试",
-        prompt=(
-            "使用 task 工具创建一个子代理（agent_type='general-purpose'）。"
-            "子代理必须严格按顺序执行："
-            "第1步，使用 write_file 创建 data.jsonl，写入 'dirty_data_entry'。"
-            "第2步，使用 bash 尝试执行 rm -rf /（此命令将被沙箱拦截）。"
-            "主代理请等待子代理完成。"
-        ),
-        verify=lambda wd, _resp: not (wd / "data.jsonl").exists(),
-        cleanup=lambda wd: (wd / "data.jsonl").unlink(missing_ok=True),
-        max_turns=15,
-        # Force the subagent to fail after 1 tool call so the shadow
-        # workspace triggers ROLLBACK (not COMMIT).
-        post_agent_init=_patch_subagent_for_fast_fail,
-    ),
-
-    # ── Task J: Loop Guard & Forced Reflection test ───────────
-    EvalTask(
-        id="J",
-        name="死循环打破与反思测试",
-        prompt=(
-            "在当前目录下有一个 compile.py 脚本。"
-            "请使用 bash 工具运行它，直到成功为止。"
-            "如果运行失败，请仔细分析错误信息，找出让脚本成功运行的方法。"
-        ),
-        verify=lambda wd, resp: (
-            (wd / "build_ok.txt").exists()
-            and "BUILD SUCCESS" in (wd / "build_ok.txt").read_text()
-        ),
-        cleanup=lambda wd: (
-            (wd / "compile.py").unlink(missing_ok=True),
-            (wd / "build_ok.txt").unlink(missing_ok=True),
-        ),
-        setup=lambda wd: (wd / "compile.py").write_text(
-            'import sys\n'
-            'if "--force-override" not in sys.argv:\n'
-            '    print("Error: Missing dependency. Try again.", file=sys.stderr)\n'
-            '    sys.exit(1)\n'
-            'from pathlib import Path\n'
-            'Path("build_ok.txt").write_text("BUILD SUCCESS")\n'
-            'print("BUILD SUCCESS")\n'
-        ),
-        max_turns=8,
-        min_turns=2,  # must at least try, hit loop guard, then reflect
-    ),
-]
-
-
-# ═══════════════════════════════════════════════════════════════
-# Runner
-# ═══════════════════════════════════════════════════════════════
-
-def run_benchmark(workdir: Optional[Path] = None) -> list[dict[str, Any]]:
-    """Execute all benchmark tasks and return a list of result dicts."""
-    workdir = workdir or _PROJECT_ROOT
+def run_benchmark() -> list[dict[str, Any]]:
+    """扫描 sandbox/tasks/，逐个执行评测任务。"""
+    tasks_dir = (_PROJECT_ROOT / "sandbox" / "tasks").resolve()
+    workspace_root = (_PROJECT_ROOT / "sandbox" / "runner" / ".workspace").resolve()
     results: list[dict[str, Any]] = []
 
-    for task in BENCHMARK_TASKS:
-        print(f"\n{'─' * 50}")
-        print(f"  Task {task.id} [{task.name}]: {task.prompt[:60]}...")
-        print(f"{'─' * 50}")
+    if not tasks_dir.is_dir():
+        print(f"错误：任务目录不存在：{tasks_dir}")
+        return results
 
-        # ── Task setup ──────────────────────────────────────
-        if task.setup:
-            task.setup(workdir)
-            print("  (setup: prerequisite files created)")
+    task_dirs = sorted([d for d in tasks_dir.iterdir() if d.is_dir()])
 
-        # ── Launch agent ────────────────────────────────────
-        agent = MiniClaudeAgent(workdir=workdir)
+    for task_dir in task_dirs:
+        problem_path = task_dir / "problem.md"
+        verify_path = task_dir / "verify.py"
+        baseline_dir = task_dir / "baseline"
 
-        if task.compression_threshold:
-            agent.compressor.token_threshold = task.compression_threshold
-            print(f"  (compression threshold: {task.compression_threshold} tokens)")
+        if not problem_path.exists() or not verify_path.exists():
+            print(f"  跳过 {task_dir.name}：缺少 problem.md 或 verify.py")
+            continue
 
-        if task.post_agent_init:
-            task.post_agent_init(agent)
+        task_id = task_dir.name
+        t_total_start = time.perf_counter()
 
-        response = ""
-        t_start = time.perf_counter()
+        print(f"\n{'═' * 55}")
+        print(f"  ▏任务 [{task_id}]")
+        print(f"{'═' * 55}")
 
-        # ── Snapshot existing trace files before execution ──
-        trace_dir = workdir / ".traces"
-        before_traces: set = set()
-        if trace_dir.is_dir():
-            before_traces = {str(p) for p in trace_dir.glob("task_*.json")}
+        # ── Setup：清空工作区 + 复制 baseline ─────────────
+        if workspace_root.exists():
+            shutil.rmtree(workspace_root)
+        workspace_root.mkdir(parents=True, exist_ok=True)
+        print(f"  ● 工作区已就绪：{workspace_root}")
 
-        # ── Execute (with optional fault injection) ─────────
-        executor = task.fault_inject if task.fault_inject else _null_context
-        with executor():
-            try:
-                if task.prompts:
-                    # Multi-turn: same agent, sequential prompts
-                    for p in task.prompts[:-1]:
-                        agent.chat(p)
-                    response = agent.chat(task.prompts[-1]) or ""
-                else:
-                    response = agent.chat(task.prompt) or ""
-                success = task.verify(workdir, response)
-            except Exception as exc:
-                response = f"[Agent crash: {exc}]"
-                success = False
+        if baseline_dir.exists():
+            for item in baseline_dir.iterdir():
+                dst = workspace_root / item.name
+                if item.is_file():
+                    shutil.copy2(item, dst)
+                elif item.is_dir():
+                    shutil.copytree(item, dst)
+            print("  ● baseline 文件已复制")
 
-        t_end = time.perf_counter()
+        # ── 运行真实 Agent ────────────────────────────────
+        t_agent_start = time.perf_counter()
+        agent = None
+        try:
+            prompt = problem_path.read_text(encoding="utf-8").strip()
+            print(
+                f"  ● 加载问题：{prompt[:80]}"
+                f"{'…' if len(prompt) > 80 else ''}"
+            )
+            print(f"  ▷ 正在启动 Agent Loop（workspace={workspace_root.name}）…")
 
-        # ── Detect new trace from this execution ────────────
-        trace_metrics: dict = {}
-        if trace_dir.is_dir():
-            new_traces = [
-                p for p in trace_dir.glob("task_*.json")
-                if str(p) not in before_traces
-            ]
-            if new_traces:
-                latest_trace = max(new_traces, key=lambda p: p.stat().st_mtime)
-                analyzer = TraceAnalyzer(workdir)
-                if analyzer.load_trace(latest_trace):
-                    trace_metrics = analyzer.compute_metrics()
+            agent = MiniClaudeAgent(
+                workspace_root=workspace_root,
+                workspace_confirmed=True,
+            )
+            response = agent.chat(prompt) or ""
+            resp_preview = response.strip()[:120].replace("\n", " ")
+            print(f"  ✔ Agent 返回（{len(response)} chars）：{resp_preview}…")
+        except Exception as exc:
+            print(f"  ✘ Agent 异常：{exc}")
+        finally:
+            if agent:
+                try:
+                    agent.shutdown()
+                except Exception as exc:
+                    print(f"  ⚠ shutdown 异常：{exc}")
+        t_agent_end = time.perf_counter()
+        agent_duration = round(t_agent_end - t_agent_start, 2)
+        print(f"  ◇ Agent 耗时：{agent_duration}s")
 
-        # ── Collect metrics ─────────────────────────────────
-        m = agent.last_metrics or {}
+        # ── Trace 现场打捞（写入归档，不污染用例目录） ─────
+        salvaged_trace = _salvage_trace(workspace_root, _ARCHIVE_DIR, task_id)
+        if salvaged_trace:
+            print(f"  ● trace 已归档 → {_ARCHIVE_DIR / f'{task_id}_v2_trace.json'}")
+        else:
+            print("  ⚠ trace 未生成（.traces/ 为空或不存在）")
+
+        salvaged_transcripts = _salvage_transcripts(workspace_root, _ARCHIVE_DIR, task_id)
+        if salvaged_transcripts:
+            print(f"  ● transcripts 已归档 → {_ARCHIVE_DIR / f'{task_id}_v2_transcripts/'}")
+
+        # ── 执行 verify.py（独立子进程客观判定） ──────────
+        t_verify_start = time.perf_counter()
+        _env = {**os.environ, "PYTHONUTF8": "1"}
+        try:
+            verify_result = subprocess.run(
+                ["python", str(verify_path.resolve())],
+                cwd=str(workspace_root),
+                capture_output=True,
+                env=_env,
+                timeout=60,
+            )
+            stdout_output = verify_result.stdout.decode(
+                "utf-8", errors="replace"
+            )
+            stderr_output = verify_result.stderr.decode(
+                "utf-8", errors="replace"
+            )
+            if stdout_output.strip():
+                print(f"  → verify 输出：\n{stdout_output}")
+            if stderr_output.strip():
+                print(f"  → verify 错误：\n{stderr_output}")
+            success = verify_result.returncode == 0
+        except subprocess.TimeoutExpired:
+            success = False
+            print("  ✘ verify 执行超时")
+        except Exception as exc:
+            success = False
+            print(f"  ✘ verify 异常：{exc}")
+        t_verify_end = time.perf_counter()
+        verify_duration = round(t_verify_end - t_verify_start, 2)
+
+        # ── Teardown：清空工作区 ──────────────────────────
+        if workspace_root.exists():
+            shutil.rmtree(workspace_root)
+            print("  ● 工作区已清理")
+
+        t_total_end = time.perf_counter()
         result = {
-            "timestamp":    datetime.now().strftime("%Y-%m-%d %H:%M:%S"),
-            "task_id":      task.id,
-            "task_name":    task.name,
-            "success":      success,
-            "turns":        m.get("turns", 0),
-            "total_tokens": m.get("total_tokens", 0),
-            "api_errors":   m.get("api_errors", 0),
-            "duration_s":   round(t_end - t_start, 2),
-            # Trace-derived process-quality metrics
-            "duplicate_ratio":      trace_metrics.get("duplicate_tool_ratio"),
-            "degradation_score":    trace_metrics.get("degradation_score"),
-            "reflections":          trace_metrics.get("reflection_count"),
-            "rollback":             trace_metrics.get("rollback_occurred"),
+            "timestamp":           datetime.now().strftime("%Y-%m-%d %H:%M:%S"),
+            "task_id":             task_id,
+            "success":             success,
+            "trace_salvaged":      salvaged_trace,
+            "agent_duration_s":    agent_duration,
+            "verify_duration_s":   verify_duration,
+            "total_duration_s":    round(t_total_end - t_total_start, 2),
         }
-
-        # ── Enforce hard turn caps ──────────────────────────
-        if task.max_turns and result["turns"] > task.max_turns:
-            result["success"] = False
-            print(f"  (MAX_TURNS exceeded: {result['turns']} > {task.max_turns})")
-
-        if task.min_turns and result["turns"] < task.min_turns:
-            result["success"] = False
-            print(f"  (MIN_TURNS not met: {result['turns']} < {task.min_turns})")
-
         results.append(result)
 
-        # ── Cleanup + shutdown ──────────────────────────────
-        try:
-            task.cleanup(workdir)
-        except Exception:
-            pass
-        try:
-            agent.shutdown()
-        except Exception:
-            pass
-
-        # Live feedback
-        status = "[PASS]" if result["success"] else "[FAIL]"
-        dup_str = _fmt(result.get("duplicate_ratio"))
-        deg_str = _fmt(result.get("degradation_score"), fmt_float=True)
-        print(f"  {status} | turns={result['turns']} | "
-              f"dup={dup_str} | degrad={deg_str} | "
-              f"tokens={result['total_tokens']} | "
-              f"errors={result['api_errors']} | "
-              f"duration={result['duration_s']}s")
+        status = "[PASS]" if success else "[FAIL]"
+        trace_mark = "✔" if salvaged_trace else "✘"
+        print(
+            f"  {status} | agent={agent_duration}s | "
+            f"verify={verify_duration}s | trace={trace_mark}"
+        )
 
     return results
 
 
 # ═══════════════════════════════════════════════════════════════
-# Null context-manager (no-op for normal tasks)
+# 报告输出
 # ═══════════════════════════════════════════════════════════════
 
-from contextlib import contextmanager
-
-@contextmanager
-def _null_context():
-    yield
-
-
-# ═══════════════════════════════════════════════════════════════
-# Report Output
-# ═══════════════════════════════════════════════════════════════
-
-def _fmt(val, fmt_float=False):
-    """Format a metric cell: None → '—', bool → Y/N, float → formatted."""
-    if val is None:
-        return "—"
-    if isinstance(val, bool):
-        return "Y" if val else "N"
-    if isinstance(val, float):
-        if fmt_float:
-            return f"{val:.1f}"
-        return f"{val:.4f}"
-    return str(val)
-
-
-def print_markdown_table(results: list[dict[str, Any]]):
-    """Print a Markdown-formatted results table to stdout."""
-    print("\n## Benchmark Results (Trace-Driven Evaluation)\n")
-    print("| Task | Pass | Turns | Dup Ratio | Degrad(0-100) | Refl | Rollback | Duration |")
-    print("|------|------|-------|-----------|---------------|------|----------|----------|")
+def print_report(results: list[dict[str, Any]]) -> None:
+    """打印 Markdown 格式评测报告。"""
+    print("\n## WF-2 沙箱评测结果\n")
+    print("| 任务 | 结果 | Trace | Agent(s) | Verify(s) | 总耗时 |")
+    print("|------|------|-------|----------|-----------|--------|")
     for r in results:
-        check = "Y" if r["success"] else "N"
-        dup = _fmt(r.get("duplicate_ratio"))
-        deg = _fmt(r.get("degradation_score"), fmt_float=True)
-        refl = _fmt(r.get("reflections"))
-        roll = _fmt(r.get("rollback"))
-        print(f"| {r['task_id']} {r['task_name']} | {check} | "
-              f"{r['turns']} | {dup} | {deg} | {refl} | {roll} | "
-              f"{r['duration_s']} |")
+        check = "✅ PASS" if r["success"] else "❌ FAIL"
+        trace_mark = "✔" if r.get("trace_salvaged") else "✘"
+        print(
+            f"| {r['task_id']} | {check} | {trace_mark} | "
+            f"{r['agent_duration_s']} | {r['verify_duration_s']} | "
+            f"{r['total_duration_s']}s |"
+        )
 
     passed = sum(1 for r in results if r["success"])
     total = len(results)
-    avg_dur = sum(r["duration_s"] for r in results) / max(total, 1)
-    avg_deg = [r.get("degradation_score") for r in results
-               if r.get("degradation_score") is not None]
-    avg_deg_str = f"{sum(avg_deg)/len(avg_deg):.1f}" if avg_deg else "—"
-    print(f"\n**{passed}/{total} tasks passed** — "
-          f"avg duration: {avg_dur:.2f}s | "
-          f"avg degradation: {avg_deg_str}\n")
-
-
-def append_csv(results: list[dict[str, Any]], csv_path: Path):
-    """Append results to a CSV file (create with header if new)."""
-    csv_path.parent.mkdir(parents=True, exist_ok=True)
-    write_header = not csv_path.exists()
-    with open(csv_path, "a", newline="", encoding="utf-8") as f:
-        writer = csv.DictWriter(f, fieldnames=results[0].keys())
-        if write_header:
-            writer.writeheader()
-        writer.writerows(results)
-    print(f"Results appended to {csv_path}")
+    traced = sum(1 for r in results if r.get("trace_salvaged"))
+    print(f"\n**{passed}/{total} 任务通过，{traced}/{total} trace 已打捞**\n")
 
 
 # ═══════════════════════════════════════════════════════════════
-# Main
+# 入口
 # ═══════════════════════════════════════════════════════════════
 
 if __name__ == "__main__":
     results = run_benchmark()
     if not results:
-        print("No results — benchmark did not produce any output.")
+        print("没有可执行的任务。请检查 sandbox/tasks/ 目录。")
         sys.exit(1)
-
-    print_markdown_table(results)
-    append_csv(results, _PROJECT_ROOT / "logs" / "eval_results.csv")
+    print_report(results)

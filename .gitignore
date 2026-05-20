@@ -15,8 +15,9 @@ s_full.py
 task_list.md
 /example
 /logs
+/sandbox
 
-# Personal docs
-docs/04-interview/
+# Personal / legacy docs
+docs/legacy/
 docs/chat-logs/
 docs/pre-workflow-records/

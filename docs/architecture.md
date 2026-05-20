@@ -33,6 +33,109 @@ CLI / User
           -> SkillsLoader
 ```
 
+## 2.1 项目文件树
+
+```text
+mini-claude/
+├── pyproject.toml              # src-layout 打包配置，console_scripts = mini-claude
+├── CLAUDE.md                   # Claude Code 项目指引（精简版）
+├── eval_runner.py              # 基准评测运行器（10 个任务）
+├── README.md                   # 项目 README
+├── ARCHITECTURE_SNAPSHOT.md    # 旧架构快照（已过时，待清理）
+├── INTERVIEW_CHEAT_SHEET.md    # 面试速查表
+│
+├── configs/
+│   └── default.yaml            # 默认配置（LLM 选择、功能开关等）
+│
+├── docs/                       # 项目文档
+│   ├── architecture.md         # ← 本文档
+│   ├── decision_log.md         # 架构决策记录（ADR）
+│   ├── roadmap.md              # 优先级路线图
+│   ├── testing_plan.md         # 测试与评测策略
+│   ├── benchmarks.md           # 评测对照账本
+│   ├── evolution/
+│   │   └── tool_deduplication.md  # 防重复调用演进史
+│   ├── chat-logs/              # Claude Code 聊天记录（gitignored）
+│   ├── pre-workflow-records/   # 早期模型对话摘要（gitignored）
+│   └── legacy/                 # 归档文档（gitignored）
+│
+├── src/
+│   ├── cli/                    # 【CLI 与 Workspace 层】
+│   │   ├── entrypoint.py       #   mini-claude [path] [-y] 入口
+│   │   ├── confirmation.py     #   工作区确认提示
+│   │   └── authority.py        #   WorkspaceAuthority 权限模型
+│   │
+│   ├── agent/                  # 【Agent 编排层】
+│   │   ├── mini_claude_agent.py  # 主 Agent 类（~1280 行）
+│   │   └── minimal_agent.py    #   精简 Agent
+│   │
+│   ├── core/                   # 【核心系统】
+│   │   ├── runtime_context/    #   Runtime 上下文
+│   │   │   ├── workspace.py    #     RuntimeContext 聚合
+│   │   │   ├── shell_session.py#     持久化 cwd 跟踪
+│   │   │   ├── path_resolver.py#     路径解析
+│   │   │   └── command_policy.py#    命令安全策略
+│   │   ├── tools/
+│   │   │   └── base_tools.py   #   文件读写编辑 + bash 工具
+│   │   ├── tracing/            #   三层次追踪
+│   │   │   ├── models.py       #     TaskTrace/TurnTrace/ToolTrace
+│   │   │   ├── manager.py      #     TraceManager 编排
+│   │   │   └── writer.py       #     JSON 持久化
+│   │   ├── failure_intelligence/ # 故障智能分析
+│   │   │   ├── models.py       #     FailureCategory、FailureSignature
+│   │   │   ├── signatures.py   #     规则引擎（11 分类）
+│   │   │   ├── analyzer.py     #     FailureAnalyzer 门面
+│   │   │   ├── memory.py       #     按 task_id 隔离的失败记忆
+│   │   │   └── policy.py       #     升级策略（3 条规则）
+│   │   ├── evaluation/         #   追踪驱动评测
+│   │   │   ├── metrics.py      #     6 个质量指标
+│   │   │   └── analyzer.py     #     TraceAnalyzer
+│   │   ├── loop_guard.py       #   死循环检测
+│   │   ├── subagent.py         #   SubAgent 管理
+│   │   ├── background.py       #   后台任务处理器
+│   │   ├── compression.py      #   上下文压缩
+│   │   ├── console.py          #   控制台命令系统
+│   │   ├── teammate_manager.py #   队友管理
+│   │   ├── messaging/
+│   │   │   └── bus.py          #   消息总线
+│   │   └── features/
+│   │       └── manager.py      #   功能开关管理
+│   │
+│   ├── models/                 # 【数据模型】
+│   │   ├── config.py           #   配置模型
+│   │   ├── task.py             #   任务模型
+│   │   ├── teammate.py         #   队友模型
+│   │   └── todo.py             #   TODO 模型
+│   │
+│   ├── providers/              # 【LLM Provider 层】
+│   │   ├── base.py             #   抽象基类
+│   │   ├── manager.py          #   Provider 管理
+│   │   ├── deepseek.py         #   DeepSeek 实现
+│   │   └── anthropic.py        #   Anthropic 实现
+│   │
+│   └── skills/
+│       └── loader.py           #   技能加载器
+│
+├── tests/
+│   └── integration/            # 集成测试（68 个）
+│       ├── test_all_modules.py
+│       ├── test_failure_intelligence.py
+│       └── test_runtime_context.py
+│
+├── skills/
+│   └── pdf/                    # PDF 技能模块（实验性）
+│
+├── scripts/
+│   └── test_llm.py             # LLM 测试脚本（孤立）
+│
+├── s_full.py                   # 原始单体实现（待清理）
+├── sandbox/                    # 沙箱测试数据
+├── logs/                       # 运行时日志
+├── .team/                      # 队友状态文件（运行时）
+├── .tasks/                     # 持久化任务文件（运行时）
+└── .traces/                    # 追踪 JSON 输出（运行时）
+```
+
 ## 3. 分层架构
 
 ### 3.1 CLI 与 Workspace 层
@@ -231,3 +334,45 @@ bash tool input
 ```
 
 这比罗列功能更有说服力，因为它直接回答 Coding Agent 的核心工程问题。
+
+---
+
+## 附录: 审计快照（2026-05 归档）
+
+> 以下内容来自模块化重构完成时的静态审计，已归档至本附录。详细原始数据见 `03-audit/` 档案（已移入 legacy）。
+
+### 已知问题
+
+| 功能/模块 | 问题 | 优先级 |
+| --- | --- | --- |
+| ShellSession.reset() | `_original_root` 未保存初始根目录，reset 后 cwd 不变 | P0 |
+| eval_runner.py CSV 输出 | `logs/eval_results.csv` 追加未验证 `logs/` 存在 | P1 |
+| src/core/__init__.py 导出 | evaluation 等子包未统一重新导出 | P2 |
+| Rollback State Leak fault injection | mock.patch 较脆弱 | P1 |
+| 跨平台路径 | BaseTools.safe_path() 在 POSIX 上行为可能不同 | P1 |
+| CLI entrypoint 测试 | argparse、非 TTY 守卫、确认逻辑无 pytest 覆盖 | P0 |
+| WorkspaceAuthority 测试 | 只有手动验证脚本，无 pytest | P0 |
+
+### 未验证功能
+
+CLI fresh install 可直接运行、WorkspaceAuthority 真正拦截外部路径、BaseTools + Authority 委托链完整、Trace 持久化完整记录生命周期、Failure Intelligence 在真实失败中被调用、Eval Runner 10 基准任务稳定运行、SubAgent 接入主循环等——均需添加端到端验证。
+
+### 测试状态
+
+68 个集成测试，分布在 3 个文件。运行：`py -m pytest tests/integration/ -v`
+
+### 入口点
+
+| 入口 | 命令 | 说明 |
+| --- | --- | --- |
+| CLI（推荐） | mini-claude [path] [-y] | cli.entrypoint:main |
+| 传统 REPL | py s_full.py | 原始单体（待清理） |
+| 模块直接运行 | py -m src.cli.entrypoint . --yes | 开发用 |
+| 评测运行器 | py eval_runner.py | 10 基准任务 |
+| 测试 | py -m pytest tests/integration/ | 68 测试 |
+
+### 主要风险
+
+1. **安全模型未验证**：WorkspaceAuthority、safe_path()、CLI 工作区确认缺少测试，削弱核心卖点可信度。
+2. **入口路径过多**：CLI、s_full.py、模块直跑、评测入口并存，需明确唯一推荐入口。
+3. **缺少演示闭环**：需构建从"用户任务"到"Agent 读文件→执行命令→失败分类→调整策略→写 trace→生成指标"的可演示链路。
