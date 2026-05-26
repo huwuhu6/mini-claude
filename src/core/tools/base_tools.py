@@ -251,14 +251,36 @@ class BaseTools:
             logger.error(f"写入文件 {path} 出错: {e}")
             return ToolResult(f"错误: {str(e)}", success=False)
 
-    def edit_file(self, path: str, old_text: str, new_text: str) -> ToolResult:
+    @staticmethod
+    def _normalize_text(text: str) -> str:
+        """Normalize text for fuzzy search fallback:
+        1. Normalize line endings (\\r\\n → \\n, \\r → \\n)
+        2. Strip trailing whitespace from each line
         """
-        Replace exact text in file.
+        text = text.replace('\r\n', '\n').replace('\r', '\n')
+        lines = text.split('\n')
+        lines = [line.rstrip() for line in lines]
+        return '\n'.join(lines)
+
+    def edit_file(self, path: str, edits: list) -> ToolResult:
+        """
+        Apply multiple search/replace edits atomically using a shadow buffer.
+
+        Two-phase commit:
+          1. Verify ALL edits against the in-memory shadow buffer first.
+          2. Only on full success write to disk once.
+
+        Each edit goes through two matching levels:
+          - Level 1 — strict exact match on the raw buffer text
+          - Level 2 — normalised match (unified line endings, trailing
+                      whitespace stripped) as fallback
+
+        If ANY edit fails both levels the entire operation is rolled back
+        and the file is left untouched.
 
         Args:
             path: File path
-            old_text: Text to replace
-            new_text: Replacement text
+            edits: List of {"search": str, "replace": str} dicts
 
         Returns:
             ToolResult with status
@@ -269,20 +291,60 @@ class BaseTools:
             if not file_path.exists():
                 return ToolResult(f"错误: 文件不存在: {path}", success=False)
 
+            # ── Phase 1: Load shadow buffer ──────────────────────────
             with open(file_path, 'r', encoding='utf-8') as f:
-                content = f.read()
+                working_content = f.read()
 
-            if old_text not in content:
-                return ToolResult(f"错误: 在 {path} 中未找到指定文本", success=False)
+            normalized_content = self._normalize_text(working_content)
 
-            new_content = content.replace(old_text, new_text, 1)
+            for i, edit in enumerate(edits):
+                if not isinstance(edit, dict):
+                    return ToolResult(
+                        f"错误: 第 {i+1} 处编辑格式无效，应为 object",
+                        success=False,
+                    )
+                search = edit.get('search')
+                replace = edit.get('replace')
+                if search is None or replace is None:
+                    return ToolResult(
+                        f"错误: 第 {i+1} 处编辑缺少 'search' 或 'replace' 字段",
+                        success=False,
+                    )
 
+                # ── Level 1: strict exact match ──────────────────────
+                if search in working_content:
+                    working_content = working_content.replace(search, replace, 1)
+                    normalized_content = self._normalize_text(working_content)
+                    continue
+
+                # ── Level 2: normalised fallback ─────────────────────
+                normalized_search = self._normalize_text(search)
+                if normalized_search in normalized_content:
+                    working_content = normalized_content.replace(
+                        normalized_search, replace, 1,
+                    )
+                    normalized_content = self._normalize_text(working_content)
+                    logger.info(
+                        f"第 {i+1} 处修改通过归一化匹配 "
+                        f"(消除换行符/行尾空格差异)"
+                    )
+                    continue
+
+                # ── Rollback: neither level matched ──────────────────
+                return ToolResult(
+                    f"【Harness 事务拦截】第 {i+1} 处修改匹配失败。\n"
+                    f"无法定位您的 'search' 片段，请重新使用 read_file "
+                    f"核对该段代码的精准缩进与换行符。\n"
+                    f"当前文件已自动整体回滚，未做任何修改。",
+                    success=False,
+                )
+
+            # ── Phase 2: Commit — single disk write ──────────────────
             with open(file_path, 'w', encoding='utf-8') as f:
-                f.write(new_content)
+                f.write(working_content)
 
-            logger.info(f"已编辑文件: {path}")
-
-            return ToolResult(f"成功编辑 {path}")
+            logger.info(f"已编辑文件: {path} ({len(edits)} 处修改)")
+            return ToolResult(f"成功编辑 {path}，共完成 {len(edits)} 处修改")
 
         except Exception as e:
             logger.error(f"编辑文件 {path} 出错: {e}")

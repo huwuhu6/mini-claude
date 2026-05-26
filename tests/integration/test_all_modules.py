@@ -81,8 +81,8 @@ def test_base_tools():
         result = tools.read_file("test.txt")
         _test_result("read_file", result.success and "Hello, World!" in result.content)
 
-        # Test 3: Edit file
-        result = tools.edit_file("test.txt", "Hello", "Hi")
+        # Test 3: Edit file (batch atomic edits)
+        result = tools.edit_file("test.txt", [{"search": "Hello", "replace": "Hi"}])
         _test_result("edit_file", result.success)
         result = tools.read_file("test.txt")
         _test_result("edit_file content", "Hi, World!" in result.content)

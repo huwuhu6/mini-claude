@@ -127,7 +127,7 @@ class MinimalAgent:
             'bash': lambda args: self.tools.run_bash(args['command']),
             'read_file': lambda args: self.tools.read_file(args['path'], args.get('limit')),
             'write_file': lambda args: self.tools.write_file(args['path'], args['content']),
-            'edit_file': lambda args: self.tools.edit_file(args['path'], args['old_text'], args['new_text']),
+            'edit_file': lambda args: self.tools.edit_file(args['path'], args['edits']),
         }
 
     def execute_tool(self, tool_name: str, arguments: Dict[str, Any]) -> str:

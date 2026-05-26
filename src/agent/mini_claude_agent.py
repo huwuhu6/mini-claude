@@ -453,15 +453,25 @@ class MiniClaudeAgent:
             },
             {
                 'name': 'edit_file',
-                'description': 'Replace exact text in a file.',
+                'description': 'Apply multiple precise text replacements in a single file atomically. Use this for batch edits — all replacements commit together or none at all.',
                 'input_schema': {
                     'type': 'object',
                     'properties': {
                         'path': {'type': 'string', 'description': 'Path to the file'},
-                        'old_text': {'type': 'string', 'description': 'Text to replace'},
-                        'new_text': {'type': 'string', 'description': 'Replacement text'},
+                        'edits': {
+                            'type': 'array',
+                            'items': {
+                                'type': 'object',
+                                'properties': {
+                                    'search': {'type': 'string', 'description': 'Exact text fragment to find (single occurrence)'},
+                                    'replace': {'type': 'string', 'description': 'Replacement text'},
+                                },
+                                'required': ['search', 'replace'],
+                            },
+                            'description': 'Array of search/replace pairs. Applied in order, atomically. If ANY search fails, ALL edits roll back.',
+                        },
                     },
-                    'required': ['path', 'old_text', 'new_text'],
+                    'required': ['path', 'edits'],
                 },
             },
             {
@@ -532,8 +542,8 @@ class MiniClaudeAgent:
         result = self.tools.write_file(path, content)
         return result.content
 
-    def _handle_edit_file(self, path: str, old_text: str, new_text: str) -> str:
-        result = self.tools.edit_file(path, old_text, new_text)
+    def _handle_edit_file(self, path: str, edits: list) -> str:
+        result = self.tools.edit_file(path, edits)
         return result.content
 
     def _handle_add_workdir(self, path: str) -> str:

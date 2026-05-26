@@ -125,7 +125,7 @@ class SubAgent:
             'bash':       lambda a: self.tools.run_bash(a['command']),
             'read_file':  lambda a: self.tools.read_file(a['path'], a.get('limit')),
             'write_file': lambda a: self.tools.write_file(a['path'], a['content']),
-            'edit_file':  lambda a: self.tools.edit_file(a['path'], a['old_text'], a['new_text']),
+            'edit_file':  lambda a: self.tools.edit_file(a['path'], a['edits']),
         }
         handler = handlers.get(tool_name)
         if not handler:
