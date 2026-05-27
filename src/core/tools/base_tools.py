@@ -182,7 +182,10 @@ class BaseTools:
     def read_file(self, path: str, start_line: int = None,
                   end_line: int = None) -> ToolResult:
         """
-        Read file contents with line-number-prefixed window chunking.
+        Read a window of file content with anchor-comment delimiters.
+
+        Pure code output (no per-line prefix) to maximise Prompt Cache
+        stability — line numbers shift after edits, destroying cache hits.
 
         Args:
             path: File path
@@ -192,8 +195,7 @@ class BaseTools:
                       Defaults to total line count when omitted.
 
         Returns:
-            ToolResult with every line prefixed by its absolute line number.
-            A metadata header shows the file path, line range, and total lines.
+            ToolResult with an anchor header/footer and clean code body.
 
         Raises:
             ValueError: If start_line > end_line (propagated via ToolResult).
@@ -227,14 +229,12 @@ class BaseTools:
             # Slice the line list (convert 1-based → 0-based indexing)
             chunk = lines[start - 1:end]
 
-            # Build output with absolute line-number prefix
-            output_parts = [
-                f"--- 文件: {path} (第 {start} 行至第 {end} 行，总计 {total_lines} 行) ---",
-            ]
-            for i, line_content in enumerate(chunk, start=start):
-                output_parts.append(f"{i:4d} | {line_content}")
-
-            output = '\n'.join(output_parts)
+            # Build anchor-delimited output (no per-line prefix)
+            output = (
+                f"--- FILE: {path} (LINES: {start}-{end} of {total_lines}) ---\n"
+                + '\n'.join(chunk)
+                + f"\n--- END FILE: {path} ---"
+            )
 
             logger.debug(
                 f"读取文件: {path} [{start}-{end}/{total_lines} 行] "
@@ -257,12 +257,11 @@ class BaseTools:
                         success=False,
                     )
                 chunk = lines[start - 1:end]
-                output_parts = [
-                    f"--- 文件: {path} (第 {start} 行至第 {end} 行，总计 {total_lines} 行) ---",
-                ]
-                for i, line_content in enumerate(chunk, start=start):
-                    output_parts.append(f"{i:4d} | {line_content}")
-                return ToolResult('\n'.join(output_parts))
+                return ToolResult(
+                    f"--- FILE: {path} (LINES: {start}-{end} of {total_lines}) ---\n"
+                    + '\n'.join(chunk)
+                    + f"\n--- END FILE: {path} ---"
+                )
             except Exception as e:
                 return ToolResult(f"读取文件时出错（编码问题）: {str(e)}", success=False)
         except Exception as e:
