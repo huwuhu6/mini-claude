@@ -100,14 +100,19 @@
 
 ## 4. P2：提升真实 Coding Agent 能力
 
-### P2.1 改进 `read_file` 和 `edit_file`
+### P2.1 改进 `read_file` 和 `edit_file` ✅
 
 面试价值：中高  
 类型：Tool runtime upgrade
 
-任务：`read_file` 支持 offset/limit；`edit_file` 对 old_text mismatch 返回更可恢复的错误；增加 nearby context；评估 range edit；后续考虑 symbol navigation 或 semantic patch。
+已完成（关联 ADR-013）：
+- **`edit_file` 批量事务化**：`edits: [{search, replace}]` 数组，原子落盘，二级符号归一化兜底
+- 跨文件重构 Token 降 52%（289k → 137k），状态从 LOOP_ABORTED → SUCCESS
 
-验收标准：长文件阅读不需要 python 脚本绕路；edit 失败后 Agent 能基于错误信息恢复；长文件任务轮数下降；测试覆盖大文件场景。
+待完成：
+- `read_file` 支持 offset/limit
+- `edit_file` 错误消息缺乏指导性
+- 评估 range edit 或 symbol navigation
 
 ### P2.2 收敛入口和清理仓库
 
@@ -142,6 +147,19 @@
 验证：`task_001_db_port` 评测中，所有 CLI 变体（cd、chcp、set、-X、pushd、2>&1、pipe type）全部正确归一化为 `EXECUTE::run_test.py`。Token 消耗从 V3 正则版的 62K 降至 38.9K（相对 V2 基线 196K 下降 80.2%）。轮数从 20 轮降至 14 轮。68 个集成测试全部通过。
 
 核心文件：`src/core/loop_controller.py` — CommandNormalizer 类
+
+### P2.6 防死循环控制层精细化
+
+面试价值：中高  
+类型：控制层调优
+
+任务：
+- 解决 `python -c` 批处理等合理高频调用被 LoopGuard 误伤的问题
+- 确定拦截阈值的系统依据（N=2 vs N=3）
+- 增强拦截/熔断时的错误消息，给出可操作建议
+- 引入白名单/豁免机制，允许模型注册预期内的重复行为
+
+验收标准：跨文件重构不再因 edit_file 编辑行为触发 LoopGuard；`python -c` 连续调用不被误拦截；拦截消息包含具体替代建议。
 
 ## 5. P3：可选增强
 

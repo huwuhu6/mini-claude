@@ -180,3 +180,38 @@
 面试防御价值（DoD）：本决策通过引入异常硬捕获与沙箱擦除机制，彻底根治了 Agent 原地直写导致的脏数据残留漂移，使物理客观判定（verify.py）与控制层生命周期（Circuit Breaker）达成强一致性，为 A/B 对照实验提供了绝对可信的真理源。
 
 验证：task_001_db_port 在 `v3_circuit_breaker` 基线中已正确返回 `FAIL (CIRCUIT_BROKEN)`，脏数据不再导致非预期通过。
+
+## ADR-013：`edit_file` 批量事务化升级 —— 从单次编辑到原子 edits 数组
+
+状态：Accepted
+
+背景：旧 `edit_file` 仅支持单次 `{old_text, new_text}` 替换。跨文件重构任务（如重命名函数参数并同步所有调用点）需要 LLM 多次串行调用 edit_file，每次调用都可能因缩进/换行符 mismatch 失败。多次串行调用还触发了 LoopGuard 的防死循环误伤，导致 Agent 被物理拦截。task_006_cross_file_drift 在 v4 基线中消耗 289k Token、35 轮，最终 LOOP_ABORTED。
+
+决策：对 `edit_file` 进行三方面升级：
+
+1. **Schema 重构**：`old_text`/`new_text` 替换为 `edits: [{search, replace}]` 数组。`path` 不变。
+2. **原子事务机制**：内存影子缓冲区逐项验证 → 全部成功后统一落盘。任一 `search` 匹配失败即熔断回滚，不写入磁盘。引入**二级符号归一化兜底**（统一换行符为 `\n`、剥离行尾空格），消除跨平台匹配差异。
+3. **工具分布优化**：批量 edits 将原本 7 次串行 edit_file 调用压缩为 2 次批量操作，从源头消除 LoopGuard 误伤条件。
+
+拒绝方案：
+- 保持单次 old_text/new_text 不变（loop guard 误伤持续存在）
+- 引入完整 range/symbol edit（复杂度高，与当前匹配式编辑不兼容）
+- 降低 LoopGuard 阈值补偿（治标不治本）
+
+核心文件：
+- `src/core/tools/base_tools.py` — `edit_file` 函数重构
+
+预期效果：task_006_cross_file_drift 总 Token 降低 ≥50%，最终状态从 LOOP_ABORTED 变为 SUCCESS。
+
+实际效果（v5_enhanced_edit_file）：
+| 指标 | v4（单次编辑） | v5（批量事务） |
+|------|--------------|---------------|
+| 最终状态 | LOOP_ABORTED | SUCCESS |
+| 总 Token | 289,110 | 137,567 (🔻52.4%) |
+| 总轮次 | 35 | 20 (🔻42.9%) |
+| edit_file 调用 | 7 次单次 | 2 次批量 |
+| LoopGuard 触发 | 4（含编辑误伤） | 2（仅 bash） |
+
+面试防御价值（DoD）：本决策通过 edits 数组 + 影子缓冲区事务 + 符号归一化二级兜底，彻底根治了串行单次编辑带来的防死循环误伤与匹配脆弱性，使跨文件重构能在 2 次批量操作中完成原子落盘，Token 成本直降 52%、最终状态从 LOOP_ABORTED 翻转为 SUCCESS。规避了先降 LoopGuard 阈值再叠加豁免名单的补救式投入。
+
+遗留问题：防死循环粒度过粗（仍误伤 `python -c` 批处理）、拦截阈值未收敛（N=2 vs N=3）、错误消息无指导性、缺乏白名单/豁免机制。

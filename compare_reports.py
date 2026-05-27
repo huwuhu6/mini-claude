@@ -5,8 +5,8 @@ compare_reports.py — 多版本评测指标对账报告生成器
 用法:
   py compare_reports.py                                          # 全量对比
   py compare_reports.py -v baseline,v4_throw                     # 筛选版本
-  py compare_reports.py -c task_001_db_port                      # 筛选用例
-  py compare_reports.py -v baseline,v4 -c task_001 -d            # 组合 + 明细模式
+  py compare_reports.py -t task_001_db_port                      # 筛选用例
+  py compare_reports.py -v baseline,v4 -t task_001 -d            # 组合 + 明细模式
   py compare_reports.py --output report.md                       # 自定义输出
 
 报告路径: sandbox/eval_results/eval_summary.md（默认）
@@ -26,6 +26,7 @@ if hasattr(sys.stdout, "reconfigure"):
 
 BASE_DIR = Path(__file__).resolve().parent
 EVAL_ROOT = BASE_DIR / "sandbox" / "eval_results"
+TASKS_ROOT = BASE_DIR / "sandbox" / "tasks"
 DEFAULT_OUTPUT = EVAL_ROOT / "eval_summary.md"
 
 # 需要从 trace 中读取的指标字段（优先读增强字段，回退到原生字段）
@@ -185,6 +186,35 @@ def _load_all_metrics(
             metrics = _load_trace_metrics(tf)
             matrix.setdefault(case_id, {})[ver_name] = metrics
     return matrix
+
+
+# ═══════════════════════════════════════════════════════════════
+# 任务描述加载
+# ═══════════════════════════════════════════════════════════════
+
+def _load_task_descriptions() -> dict[str, str]:
+    """从每个 task 的 config.json 读取 description，返回 {dir_name: description}。
+
+    以目录名（而非 config.json 中的 case_id 字段）为键，因为 trace 文件名
+    使用目录名作为 case_id。
+    """
+    descs: dict[str, str] = {}
+    if not TASKS_ROOT.is_dir():
+        return descs
+    for d in sorted(TASKS_ROOT.iterdir()):
+        if not d.is_dir():
+            continue
+        cfg = d / "config.json"
+        if not cfg.exists():
+            continue
+        try:
+            data = json.loads(cfg.read_text(encoding="utf-8"))
+            desc = data.get("description", "")
+            if desc:
+                descs[d.name] = desc
+        except Exception:
+            pass
+    return descs
 
 
 # ═══════════════════════════════════════════════════════════════
@@ -435,20 +465,23 @@ def _render_global_board(
 def _render_summary_table(
     versions: list[tuple[str, Path]],
     matrix: dict[str, dict[str, dict[str, Any]]],
+    descriptions: dict[str, str] | None = None,
 ) -> list[str]:
     """多版本精简对比表。
 
     单元格格式：✅ Nt · Nktok · N%hit · Ncmp · Ns
     """
+    descs = descriptions or {}
     ver_names = [v[0] for v in versions]
 
-    header = "| 测试用例 | " + " | ".join(ver_names) + " |"
-    sep = "|---------|" + "|".join("-----------" for _ in ver_names) + "|"
+    header = "| 测试用例 | 能力描述 | " + " | ".join(ver_names) + " |"
+    sep = "|---------|---------|" + "|".join("-----------" for _ in ver_names) + "|"
     lines = [header, sep]
 
     for case_id in sorted(matrix.keys()):
         case_data = matrix[case_id]
-        row = [f"**{case_id}**"]
+        desc = descs.get(case_id, "")
+        row = [f"**{case_id}**", desc]
         for ver_name in ver_names:
             row.append(_fmt_cell(case_data.get(ver_name, {})))
         lines.append("| " + " | ".join(row) + " |")
@@ -460,12 +493,14 @@ def _render_summary_table(
 def _render_detail_tables(
     versions: list[tuple[str, Path]],
     matrix: dict[str, dict[str, dict[str, Any]]],
+    descriptions: dict[str, str] | None = None,
 ) -> list[str]:
     """细粒度明细对比表。
 
     每个用例独立小节，指标各行，版本各列。
     Δ 列仅在 2 版本比较时展示。
     """
+    descs = descriptions or {}
     ver_names = [v[0] for v in versions]
     show_delta = len(versions) == 2
     lines = []
@@ -473,6 +508,9 @@ def _render_detail_tables(
     for case_id in sorted(matrix.keys()):
         case_data = matrix[case_id]
         lines.append(f"\n### {case_id}\n")
+        desc = descs.get(case_id, "")
+        if desc:
+            lines.append(f"> *{desc}*\n")
 
         # 表头
         headers = ["指标"] + ver_names
@@ -518,6 +556,7 @@ def _render_report(
     versions: list[tuple[str, Path]],
     matrix: dict[str, dict[str, dict[str, Any]]],
     detail: bool = False,
+    descriptions: dict[str, str] | None = None,
 ) -> str:
     """组装完整 Markdown 报告。"""
     lines: list[str] = [
@@ -537,7 +576,7 @@ def _render_report(
     lines.append("## 多版本精简对比\n")
     lines.append("> ✅ Nt · Nktok · N%hit · Ncmp · Ns    |    ❌ STATUS · Nt · Nktok · Ncmp\n")
     lines.append("> 字段缺失显示 `-`；Token 数 ≥ 10000 自动缩写为 k 单位\n")
-    lines.extend(_render_summary_table(versions, matrix))
+    lines.extend(_render_summary_table(versions, matrix, descriptions))
 
     if detail:
         lines.append("## 细粒度明细对比\n")
@@ -546,7 +585,7 @@ def _render_report(
             lines.append("> Δ 列：相比基准版本的差值（🔺上升 / 🔻下降 / 持平）\n")
         else:
             lines.append("> （3+ 版本对比时不展示 Δ 列）\n")
-        lines.extend(_render_detail_tables(versions, matrix))
+        lines.extend(_render_detail_tables(versions, matrix, descriptions))
 
     return "\n".join(lines)
 
@@ -563,7 +602,7 @@ def main() -> None:
                         help=f"输出路径（默认: {DEFAULT_OUTPUT}）")
     parser.add_argument("--versions", "-v", type=str, default=None,
                         help="筛选版本（逗号分隔，如 baseline,v4_throw）。默认全部")
-    parser.add_argument("--cases", "-c", type=str, default=None,
+    parser.add_argument("--tasks", "-t", type=str, default=None,
                         help="筛选用例（逗号分隔，如 task_001,task_002）。默认全部")
     parser.add_argument("--detail", "-d", action="store_true",
                         help="开启细粒度明细对比表（2 版本时自动含 Δ 列）")
@@ -594,8 +633,8 @@ def main() -> None:
     matrix = _load_all_metrics(versions)
 
     # ── 用例过滤 ──────────────────────────────────────────
-    if args.cases:
-        case_filter = {c.strip() for c in args.cases.split(",")}
+    if args.tasks:
+        case_filter = {c.strip() for c in args.tasks.split(",")}
         matrix = {cid: data for cid, data in matrix.items() if cid in case_filter}
         missed = case_filter - set(matrix.keys())
         if missed:
@@ -607,7 +646,8 @@ def main() -> None:
     total_cases = len(matrix)
     print(f"  📋 共 {total_cases} 个用例")
 
-    report = _render_report(versions, matrix, detail=args.detail)
+    descriptions = _load_task_descriptions()
+    report = _render_report(versions, matrix, detail=args.detail, descriptions=descriptions)
     output_path = Path(args.output)
     output_path.parent.mkdir(parents=True, exist_ok=True)
     output_path.write_text(report, encoding="utf-8")
