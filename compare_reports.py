@@ -15,6 +15,7 @@ compare_reports.py — 多版本评测指标对账报告生成器
 from __future__ import annotations
 import argparse
 import json
+import re
 import sys
 import time
 from pathlib import Path
@@ -44,6 +45,7 @@ _METRIC_FIELDS = (
     "circuit_breaker_trigger_count",
     "loop_guard_trigger_count",
     "reflection_count",
+    "rollback_count",
 )
 
 
@@ -175,16 +177,84 @@ def _load_trace_metrics(trace_path: Path) -> dict[str, Any]:
     return result
 
 
+_TRACE_RE = re.compile(r"^trace_(.+?)(?:_r(\d+))?\.json$")
+
+
+def _parse_trace_filename(tf: Path) -> tuple[str, int]:
+    """解析 trace 文件名，返回 (case_id, run_index)。
+
+    trace_task_001.json       → ("task_001", 0)
+    trace_task_001_r01.json   → ("task_001", 1)
+    trace_task_001_r02.json   → ("task_001", 2)
+    """
+    m = _TRACE_RE.match(tf.name)
+    if not m:
+        # 回退到旧逻辑
+        name = tf.stem.replace("trace_", "", 1)
+        return name, 0
+    case_id = m.group(1)
+    run_str = m.group(2)
+    return case_id, int(run_str) if run_str else 0
+
+
+def _aggregate_metrics(all_metrics: list[dict]) -> dict[str, Any]:
+    """将多次运行的指标聚合成一条记录，含均值 + 范围。"""
+    if not all_metrics:
+        return {}
+    if len(all_metrics) == 1:
+        return all_metrics[0]
+
+    result: dict[str, Any] = {}
+
+    # 收集所有字段
+    fields: set[str] = set()
+    for m in all_metrics:
+        fields.update(m.keys())
+
+    for field in fields:
+        vals = [m.get(field) for m in all_metrics if m.get(field) is not None]
+        if not vals:
+            continue
+
+        if all(isinstance(v, (int, float)) for v in vals):
+            result[field] = sum(vals) / len(vals)
+            result[f"_{field}_min"] = min(vals)
+            result[f"_{field}_max"] = max(vals)
+            result[f"_{field}_raw"] = vals
+        else:
+            # 非数值：取众数
+            from collections import Counter
+            counter = Counter(str(v) for v in vals)
+            result[field] = counter.most_common(1)[0][0]
+
+    result["_run_count"] = len(all_metrics)
+    result["_pass_count"] = sum(
+        1 for m in all_metrics if m.get("eval_result") == "SUCCESS"
+    )
+    return result
+
+
 def _load_all_metrics(
     versions: list[tuple[str, Path]],
 ) -> dict[str, dict[str, dict[str, Any]]]:
-    """返回 {case_id: {version: metrics_dict}}。"""
-    matrix: dict[str, dict[str, dict[str, Any]]] = {}
+    """返回 {case_id: {version: metrics_dict}}。
+
+    自动检测多运行 trace（文件名含 _rNN 后缀），同 case+version 的多条
+    trace 会聚合成一条聚合记录（含均值 + 范围）。
+    """
+    # 先按 (version, case_id) 分组，收集所有 run
+    raw_groups: dict[tuple[str, str], list[dict]] = {}
     for ver_name, ver_dir in versions:
         for tf in sorted(ver_dir.glob("trace_*.json")):
-            case_id = tf.name.replace(".json", "").replace("trace_", "", 1)
+            case_id, _ = _parse_trace_filename(tf)
             metrics = _load_trace_metrics(tf)
-            matrix.setdefault(case_id, {})[ver_name] = metrics
+            raw_groups.setdefault((ver_name, case_id), []).append(metrics)
+
+    # 聚合
+    matrix: dict[str, dict[str, dict[str, Any]]] = {}
+    for (ver_name, case_id), metrics_list in raw_groups.items():
+        matrix.setdefault(case_id, {})[ver_name] = _aggregate_metrics(metrics_list)
+
     return matrix
 
 
@@ -259,16 +329,15 @@ def _delta_val(a: Any, b: Any, key: str = "") -> str:
     if key in ("tool_call_precision", "loop_guard_blocking_rate"):
         return f"{'+' if diff > 0 else ''}{diff*100:.1f}pp"
 
-    # 普通数值 + 百分比变化
-    prefix = "+" if diff > 0 else ""
+    # 普通数值 + 百分比变化（格式说明符自带 +/- 前缀）
     if abs(diff) >= 10000:
-        diff_str = f"{prefix}{diff:+,.0f}"
+        diff_str = f"{diff:+,.0f}"
     elif abs(diff) >= 10:
-        diff_str = f"{prefix}{diff:+.0f}"
+        diff_str = f"{diff:+.0f}"
     elif abs(diff) >= 1:
-        diff_str = f"{prefix}{diff:+.1f}"
+        diff_str = f"{diff:+.1f}"
     else:
-        diff_str = f"{prefix}{diff:+.2f}"
+        diff_str = f"{diff:+.2f}"
 
     if va != 0 and abs(diff / va) > 0.01:
         pct = abs(diff) / va * 100
@@ -285,40 +354,65 @@ def _fmt_cell(metrics: dict[str, Any]) -> str:
     """格式化为精简对比单元格。
 
     用 · 做视觉分隔，信息按语义分组。
+    多运行时自动显示通过率。
     """
     if not metrics:
         return "-"
 
+    # 多运行：通过率前缀
+    run_count = metrics.get("_run_count", 0)
+    if run_count > 1:
+        pass_count = metrics.get("_pass_count", 0)
+        if pass_count == run_count:
+            emoji = "✅"
+        elif pass_count == 0:
+            emoji = "❌"
+        else:
+            emoji = "⚠"
+        rate_prefix = f"{emoji} {pass_count}/{run_count} · "
+    else:
+        rate_prefix = ""
+
     result = metrics.get("eval_result", "—")
-    turns = _s(metrics.get("total_turns"))
+
+    turns_raw = metrics.get("total_turns")
+    if isinstance(turns_raw, float):
+        turns = f"{turns_raw:.1f}" if turns_raw != int(turns_raw) else str(int(turns_raw))
+    else:
+        turns = _s(turns_raw)
+
     tokens = _fmt_tokens(metrics.get("total_tokens"))
-    comp = _s(metrics.get("compression_count"))
+
+    comp_raw = metrics.get("compression_count")
+    if isinstance(comp_raw, float):
+        comp = f"{comp_raw:.1f}" if comp_raw != int(comp_raw) else str(int(comp_raw))
+    else:
+        comp = _s(comp_raw)
+
     precision = metrics.get("tool_call_precision")
 
     if result == "SUCCESS":
         prec_str = f" {precision:.0%}hit" if precision is not None else " -hit"
         lat = metrics.get("total_latency_seconds")
         lat_str = f" · {lat}s" if lat is not None else ""
-        return f"✅ {turns}t · {tokens}tok{prec_str} · {comp}cmp{lat_str}"
+        return f"{rate_prefix}{turns}t · {tokens}tok{prec_str} · {comp}cmp{lat_str}"
     elif result == "FAILED":
         status = metrics.get("final_status", "FAILED")
         blocking = metrics.get("loop_guard_blocking_rate", 0)
         block_str = f" {blocking:.0%}blk" if blocking and blocking > 0 else ""
-        return f"❌ {status} · {turns}t · {tokens}tok · {comp}cmp{block_str}"
+        return f"{rate_prefix}❌ {status} · {turns}t · {tokens}tok · {comp}cmp{block_str}"
     else:
-        return f"⏭ {result}"
+        return f"{rate_prefix}⏭ {result}"
 
 
 # ═══════════════════════════════════════════════════════════════
 # 明细行格式化
 # ═══════════════════════════════════════════════════════════════
 
-def _fmt_detail_value(metrics: dict[str, Any], key: str) -> str:
-    """根据指标 key 格式化明细值。"""
-    val = metrics.get(key)
+def _fmt_raw_value(val: Any, key: str) -> str:
+    """根据指标 key 格式化原始数值（无范围信息）。"""
     if val is None:
         return "-"
-
     if key == "total_tokens":
         return f"{int(val):,}"
     if key in ("total_latency_seconds",):
@@ -331,7 +425,33 @@ def _fmt_detail_value(metrics: dict[str, Any], key: str) -> str:
         return f"{val:.1f}ms"
     if key == "loop_guard_blocking_rate":
         return f"{val:.1%}"
+    if isinstance(val, float):
+        if val == int(val):
+            return str(int(val))
+        return f"{val:.1f}"
     return str(val)
+
+
+def _fmt_detail_value(metrics: dict[str, Any], key: str) -> str:
+    """根据指标 key 格式化明细值，多运行时显示 avg (min~max)。"""
+    val = metrics.get(key)
+    if val is None:
+        return "-"
+
+    formatted = _fmt_raw_value(val, key)
+
+    # 多运行：检测是否有 min/max 范围
+    min_key = f"_{key}_min"
+    max_key = f"_{key}_max"
+    if min_key in metrics and max_key in metrics:
+        min_val = metrics[min_key]
+        max_val = metrics[max_key]
+        if min_val != max_val:
+            min_str = _fmt_raw_value(min_val, key)
+            max_str = _fmt_raw_value(max_val, key)
+            return f"{formatted} ({min_str}~{max_str})"
+
+    return formatted
 
 
 # 明细表的指标行定义：(显示名, 字段key)
@@ -349,6 +469,7 @@ _DETAIL_METRICS = [
     ("循环守卫触发",  "loop_guard_trigger_count"),
     ("熔断次数",      "circuit_breaker_trigger_count"),
     ("自愈收敛速度",  "self_healing_convergence_speed"),
+    ("回滚次数",      "rollback_count"),
     ("压缩次数",      "compression_count"),
     ("工具分布",      "_tool_distribution"),
 ]
@@ -361,6 +482,7 @@ _NUMERIC_KEYS = {
     "_avg_tokens_per_turn", "_avg_tool_latency_ms",
     "loop_guard_trigger_count", "circuit_breaker_trigger_count",
     "self_healing_convergence_speed", "compression_count",
+    "rollback_count",
 }
 
 # 不参与 Δ 计算的字段（非数值且字符串对比无意义）
@@ -394,9 +516,23 @@ def _render_global_board(
                 case_metrics[cid] = cdata[ver_name]
 
         total = len(case_metrics)
-        passed = sum(1 for m in case_metrics.values() if m.get("eval_result") == "SUCCESS")
+
+        # 多运行：使用运行级通过率（聚合 _pass_count / _run_count）
+        total_runs = 0
+        total_passes = 0
+        for m in case_metrics.values():
+            rc = m.get("_run_count", 0)
+            if rc > 1:
+                total_runs += rc
+                total_passes += m.get("_pass_count", 0)
+            else:
+                total_runs += 1
+                if m.get("eval_result") == "SUCCESS":
+                    total_passes += 1
+
         token_total = sum((m.get("total_tokens") or 0) for m in case_metrics.values())
-        turn_total = sum((m.get("total_turns") or 0) for m in case_metrics.values())
+        turn_total_raw = sum((m.get("total_turns") or 0) for m in case_metrics.values())
+        turn_total = f"{turn_total_raw:.1f}" if isinstance(turn_total_raw, float) else str(turn_total_raw)
 
         # 命中率范围：min-avg-max
         prec_vals = [
@@ -437,7 +573,7 @@ def _render_global_board(
         ]
         avg_lat = f"{sum(lat_vals)/len(lat_vals):.1f}s" if lat_vals else "-"
 
-        rate_str = f"{passed}/{total}"
+        rate_str = f"{total_passes}/{total_runs}"
         token_str = _fmt_tokens(token_total)
 
         if ver_name == versions[0][0]:
@@ -511,6 +647,17 @@ def _render_detail_tables(
         desc = descs.get(case_id, "")
         if desc:
             lines.append(f"> *{desc}*\n")
+
+        # 多运行统计
+        multi_run_parts = []
+        for vn in ver_names:
+            m = case_data.get(vn, {})
+            rc = m.get("_run_count", 0)
+            if rc > 1:
+                pc = m.get("_pass_count", 0)
+                multi_run_parts.append(f"{vn}: {pc}/{rc}")
+        if multi_run_parts:
+            lines.append(f"> 运行统计: {' | '.join(multi_run_parts)}\n")
 
         # 表头
         headers = ["指标"] + ver_names

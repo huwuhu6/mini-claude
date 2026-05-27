@@ -227,7 +227,7 @@ def _run_agent(prompt: str) -> tuple[Optional[Path], float]:
 # 单 Case 运行器
 # ═══════════════════════════════════════════════════════════════
 
-def run_case(case_dir: Path, version: str) -> dict[str, Any]:
+def run_case(case_dir: Path, version: str, run_idx: int = 1, total_runs: int = 1) -> dict[str, Any]:
     """运行单个评测 case，返回结果字典。"""
     case_id = case_dir.name
     config_file = case_dir / "config.json"
@@ -242,7 +242,8 @@ def run_case(case_dir: Path, version: str) -> dict[str, Any]:
     verify_script_name: Optional[str] = config.get("verify_script_file")
 
     print(f"\n{'=' * 60}")
-    print(f"  🚀 Case: {case_id}")
+    run_label = f" (Run {run_idx}/{total_runs})" if total_runs > 1 else ""
+    print(f"  🚀 Case: {case_id}{run_label}")
     print(f"{'=' * 60}")
 
     t_start = time.perf_counter()
@@ -324,7 +325,10 @@ def run_case(case_dir: Path, version: str) -> dict[str, Any]:
             # ── 数据归档: trace ───────────────────────────
             report_dir = OUTPUT_ROOT / version
             report_dir.mkdir(parents=True, exist_ok=True)
-            dest = report_dir / f"trace_{case_id}.json"
+            if total_runs > 1:
+                dest = report_dir / f"trace_{case_id}_r{run_idx:02d}.json"
+            else:
+                dest = report_dir / f"trace_{case_id}.json"
             dest.write_text(
                 json.dumps(trace_data, indent=2, ensure_ascii=False),
                 encoding="utf-8",
@@ -399,6 +403,10 @@ def main() -> None:
         "--task", "-t", type=str, default=None,
         help="只运行指定任务（逗号分隔多个，如 task_001,task_002）。不指定则运行全部。",
     )
+    parser.add_argument(
+        "--runs", "-r", type=int, default=1,
+        help="每个任务运行次数（默认: 1）。多运行时 trace 文件会标注运行序号",
+    )
     args = parser.parse_args()
     version = args.version
     task_filter: set[str] | None = None if not args.task else {t.strip() for t in args.task.split(",")}
@@ -433,24 +441,27 @@ def main() -> None:
         print(f"  🔧 任务过滤: {', '.join(sorted(task_filter))} → 匹配 {len(case_dirs)} 个")
 
     print(f"  📋 扫描到 {len(case_dirs)} 个 case\n")
+    if args.runs > 1:
+        print(f"  🔧 每任务运行 {args.runs} 次\n")
 
     results: list[dict[str, Any]] = []
     for case_dir in case_dirs:
-        try:
-            result = run_case(case_dir, version)
-            results.append(result)
-        except Exception as exc:
-            print(f"  ❌ Case [{case_dir.name}] 崩溃: {exc}")
-            gc.collect()
-            time.sleep(0.5)
-            _hard_rmtree(SHADOW_WORKSPACE)
-            print("  🧹 shadow_workspace 已紧急清理")
-            results.append({
-                "case_id": case_dir.name,
-                "verify_status": "CRASHED",
-                "agent_duration_s": 0.0,
-                "total_latency_s": 0.0,
-            })
+        for run_idx in range(1, args.runs + 1):
+            try:
+                result = run_case(case_dir, version, run_idx=run_idx, total_runs=args.runs)
+                results.append(result)
+            except Exception as exc:
+                print(f"  ❌ Case [{case_dir.name}] 崩溃: {exc}")
+                gc.collect()
+                time.sleep(0.5)
+                _hard_rmtree(SHADOW_WORKSPACE)
+                print("  🧹 shadow_workspace 已紧急清理")
+                results.append({
+                    "case_id": case_dir.name,
+                    "verify_status": "CRASHED",
+                    "agent_duration_s": 0.0,
+                    "total_latency_s": 0.0,
+                })
 
     print_summary(results, version)
 
