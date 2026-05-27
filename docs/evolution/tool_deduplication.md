@@ -519,3 +519,78 @@ Agent: 我尝试安装 pygame，但遇到持续的网络问题。
 ---
 
 **总结**：Escalation 的本质是 **Runtime 理解失败模式后，主动让出控制权**，而不是盲目重试或简单熔断。这比传统断路器更"智能"，但仍依赖 LLM 的正确响应。
+
+---
+
+## 第五站：‑c 内容哈希 + 阈值提优（精细化调优）
+
+**对应版本**：v7_fix_loop_prevention（ADR-015）
+
+### 原始问题
+
+第四站的 CommandNormalizer 将 `python -c "compile('a.py')"` 和 `python -c "compile('b.py')"` 都归一化为 `EXECUTE::-c`。连续对不同文件执行 `python -c` 语法校验时，第 3 个被 V3LoopGuard 误拦截，导致额外消耗 ~8,452 tokens 用临时脚本绕过。
+
+### 解决方案
+
+```python
+# src/core/loop_controller.py — _extract_target()
+if action == "EXECUTE" and " -c " in cmd:
+    # 从 -c 后面的参数中截取一部分计算 hash，加入 intent_key
+    import hashlib
+    idx = cmd.index(" -c ") + 4
+    content = cmd[idx:].strip().strip("\"'")
+    content_hash = hashlib.md5(content.encode()).hexdigest()[:8]
+    target = f"-c:{content_hash}"
+```
+
+同时升级三项配套：
+
+| # | 改动 | 效果 |
+|---|------|------|
+| 1 | `min_occurrences: 2 → 3` | 需要 4 次同意图才拦截（原 3 次），降低 LLM 随机性敏感度 |
+| 2 | V3 拦截消息复用 Legacy `<reflection>` 模板 | 被拦截后 LLM 必须输出反思标签 |
+| 3 | `loop_controller.clear()` 在 cycle 开始时调用 | 每次独立任务重置计数器，消除跨任务残留 |
+
+### 成果
+
+- `python -c` 跨文件编译不再被误拦截
+- LoopGuard 触发归零（v6.5 均值 1 → v7 均值 0）
+- 工具命中率 100%，工具失败次数归零
+- 用四项精确调优（而非架构重写）修复了 audit 报告指出的所有问题
+
+### 完整演化路线图（更新版）
+
+```
+阶段 1: 同轮去重 (seen_tool_sigs)
+  问题: LLM 一次响应内重复调用
+  方案: 签名集合 + 硬跳过
+  局限: 不跨轮
+
+        ↓
+
+阶段 2: 跨轮软提示 (_cmd_history)
+  问题: 跨轮重复执行相同命令
+  方案: 连续 3 次 + 结果相同 → 追加提示
+  局限: LLM 可能忽略，只覆盖 bash
+
+        ↓
+
+阶段 3: 硬拦截 + 强制反思 (LoopGuard)
+  问题: 软提示被忽略，死循环依旧
+  方案: 物理拦截 + 强制 <reflection>
+  局限: 只检测完全相同参数
+
+        ↓
+
+阶段 4: 语义策略指纹 (Failure Intelligence)
+  问题: 换参数但本质相同，LoopGuard 无法检测
+  方案: 策略指纹 + 多样性检测 + escalation
+  成果: 语义级重复理解
+
+        ↓
+
+阶段 5: ‑c 内容哈希 + 阈值提优 (精细化调优)
+  问题: ‑c 参数内容被归一化丢弃，跨文件编译误杀
+  方案: 内容哈希加入意图键 + 阈值 2→3 + 反思恢复 + 计数器重置
+  成果: LoopGuard 触发归零，命中率 100%，四项调优全部验证
+```

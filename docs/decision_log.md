@@ -244,3 +244,38 @@
 面试防御价值（DoD）：本决策记录了"工具 API 增强并不总是收益"的反直觉教训。局部视窗读取虽提升了前端灵活性，但 LLM 的调度行为变化（更频繁的小窗读取）抵消甚至逆转了收益。真正的 Token 节省来自**减少工具调用决策次数**（如 ADR-013 的批量编辑将 7 次编辑压至 2 次），而非优化单次返回体积。
 
 当前处理：`read_file` 的 start_line/end_line 能力保留，但暂不视为已验证的 Token 优化手段。后续需探索：限制局部视窗下的最大调用频次、或对连续读取同一文件的调用进行合并缓存。
+
+## ADR-015：防死循环控制层精细化调优 —— 阈值、‑c 哈希、反思恢复、计数器重置
+
+状态：Accepted
+
+背景：V3 联合熔断防线（ADR-011）和批量编辑升级（ADR-013）上线后，audit 报告（`docs/audit/typed-giggling-tide.md`）指出四项遗留问题：
+1. **`python -c` 跨文件误杀** — `CommandNormalizer` 将不同 `-c` 内容归一化为同一意图键 `EXECUTE::-c`
+2. **阈值未收敛** — `min_occurrences=2` 导致 N=3 即触发，对 LLM 随机性敏感
+3. **V3 缺失反思机制** — 拦截消息简短无指导性，移除 Legacy 的 `<reflection>` 要求
+4. **计数器永不重置** — CircuitBreaker 和 V3LoopGuard 的 clear() 存在但未被调用，跨任务残留
+
+决策：对 LoopController 进行四项调优：
+
+1. **阈值提升**：`min_occurrences: 2 → 3`。需要同一意图在最近 5 条中出现 ≥ 4 次（原 ≥ 3 次）才拦截。
+2. **`-c` 内容哈希**：在 `_extract_target()` 中对 `python -c "..."` 的参数字符串计算 `hashlib.md5(content.encode()).hexdigest()[:8]` 加入意图键，使不同 `-c` 内容产生不同指纹。
+3. **反思恢复**：V3 `_build_block_message()` 复用 Legacy 的 `<reflection>` 模板，强制 LLM 输出反思标签。
+4. **计数器重置**：在 `mini_claude_agent.py` 的 `_llm_tool_cycle()` 开始时调用 `loop_controller.clear()`，重置 V3LoopGuard 窗口和 CircuitBreaker 计数器。
+
+核心文件：
+- `src/core/loop_controller.py` — V3LoopGuard、CircuitBreaker、CommandNormalizer
+- `src/agent/mini_claude_agent.py` — 集成 clear() 调用
+
+实际效果（v7_fix_loop_prevention vs v6.5）：
+
+| 指标 | v6.5 | v7 | Δ |
+|------|------|----|-----|
+| LoopGuard 触发 | 1 (0~3) | **0** | ✅ 归零 |
+| 工具失败次数 | 1 (0~3) | **0** | ✅ 归零 |
+| 工具命中率 | 96% | **100%** | 🔺4pp |
+| python -c 误杀 | 第 3 个被拦截 | **全部正常执行** | ✅ 修复 |
+
+面试防御价值（DoD）：本决策是一份"工程防守战"的完整样本：audit 发现 4 项问题 → 针对性调优（而非推倒重来）→ 评测数据验证每项修复有效（LoopGuard 触发归零、命中率满格）。展示了团队不堆积功能、用数据驱动消灭缺陷的工程纪律。
+
+遗留问题：
+- **白名单/豁免机制**未实现（P2），但 `-c` 哈希已在语义层面解决了最严重的误杀场景

@@ -24,6 +24,7 @@ Usage:
 from __future__ import annotations
 import shlex
 import json
+import hashlib
 import logging
 from dataclasses import dataclass
 from typing import Dict, List, Optional, Any
@@ -270,6 +271,14 @@ class CommandNormalizer:
             if tok == '-m' and i + 1 < len(tokens):
                 # python -m pytest → module name is the target
                 return tokens[i + 1]
+            if tok == '-c' and i + 1 < len(tokens):
+                # python -c "code" → hash of -c content to distinguish
+                # genuinely different inline commands (e.g. compiling
+                # different files). Same content = same hash = same intent.
+                code_hash = hashlib.md5(
+                    tokens[i + 1].encode()
+                ).hexdigest()[:8]
+                return f"-c:{code_hash}"
             if tok.startswith('-'):
                 # Flag: skip it and its value (if the value is not itself a flag)
                 i += 1
@@ -298,7 +307,7 @@ class V3LoopGuard:
     def __init__(
         self,
         max_recent: int = 5,
-        min_occurrences: int = 2,
+        min_occurrences: int = 3,
         circuit_breaker: Optional[CircuitBreaker] = None,
     ):
         self.max_recent = max_recent
@@ -325,7 +334,7 @@ class V3LoopGuard:
         if len(self.recent_intents) > self.max_recent * 5:
             self.recent_intents = self.recent_intents[-self.max_recent:]
 
-        if len(self.recent_intents) < 2:
+        if len(self.recent_intents) < self.min_occurrences:
             return None
 
         # ── Check: frequency in sliding window ──
@@ -356,7 +365,14 @@ class V3LoopGuard:
             f"  目标: {intent.target}\n"
             f"\n"
             f"该调用已被系统物理拦截——工具未被执行。\n"
-            f"请勿盲目重试！\n"
+            f"\n"
+            f"你必须在下一次回复中最先输出一个 <reflection> 标签，\n"
+            f"在其中深刻分析：\n"
+            f"  1. 为什么之前的尝试反复失败？\n"
+            f"  2. 当前策略的根本问题是什么？\n"
+            f"  3. 有哪些与之前完全不同的替代方案？\n"
+            f"\n"
+            f"完成反思后，请提出一个与之前所有尝试本质上不同的新策略。\n"
             f"━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━"
         )
 

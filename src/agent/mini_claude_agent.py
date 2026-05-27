@@ -809,6 +809,7 @@ class MiniClaudeAgent:
         )
         self.runtime_context.current_task_id = tid
         self.failure_memory.set_task(tid)
+        self.loop_controller.clear()
 
         for iteration in range(max_iterations):
             try:

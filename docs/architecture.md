@@ -210,11 +210,15 @@ mini-claude/
 
 ### 3.8 LoopGuard 层
 
-相关模块：`src/core/loop_guard.py`。
+相关模块：`src/core/loop_controller.py`（V3LoopGuard）、`src/core/loop_guard.py`（Legacy，当前死代码）。
 
 职责：检测连续重复工具调用；检测高频重复调用；注入强制反思或阻断信息。
 
-当前状态：repo 审计显示 LoopGuard 已实现。历史总结提到 args_hash、forced meta-reflection、合法重试被误杀等问题；具体当前状态需验证。
+当前状态：V3LoopGuard 已替代 Legacy 版本成为主防御。基于 `CommandNormalizer` 的语义意图指纹（`{tool}:{action}:{target}`）进行跨轮频率检测，并已修复以下已知问题：
+- `min_occurrences` 从 2 提升至 3，降低误杀率
+- `python -c` 内容哈希加入意图键，跨文件编译不再误拦截
+- V3 拦截消息已恢复强制 `<reflection>` 反思要求
+- `loop_controller.clear()` 在每次 `_llm_tool_cycle` 开始时调用，重置跨任务计数器
 
 定位：LoopGuard 关注行为重复；Failure Intelligence 关注失败语义。两者互补。
 
