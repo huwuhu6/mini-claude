@@ -125,6 +125,81 @@ def test_base_tools():
 
 
 # ═══════════════════════════════════════════════════════════════
+# Test: Search Code
+# ═══════════════════════════════════════════════════════════════
+def test_search_code():
+    _test_section("Search Code")
+
+    from core.tools.base_tools import BaseTools
+
+    with tempfile.TemporaryDirectory() as tmpdir:
+        tools = BaseTools(Path(tmpdir))
+
+        # Create test files
+        (Path(tmpdir) / "test.py").write_text(
+            "user_id = 42\nname = 'test'\nuser_ids = [1, 2, 3]\n"
+        )
+        (Path(tmpdir) / "other.py").write_text("def foo():\n    pass\n")
+
+        # Test 1: Basic search
+        result = tools.search_code(paths=["."], patterns=["user_id"])
+        _test_result(
+            "search_code basic",
+            result.success
+            and "user_id" in result.content
+            and "test.py" in result.content,
+        )
+
+        # Test 2: No match
+        result = tools.search_code(paths=["."], patterns=["XYZZZZ_NOTFOUND"])
+        _test_result("search_code no match", "未找到匹配" in result.content)
+
+        # Test 3: Multiple patterns (OR)
+        result = tools.search_code(paths=["."], patterns=["user_id", "user_ids"])
+        _test_result(
+            "search_code multi pattern",
+            result.success
+            and result.content.count("user_id") >= 1
+            and result.content.count("user_ids") >= 1,
+        )
+
+        # Test 4: Max matches truncation
+        many_lines = "\n".join(f"x_{i} = {i}" for i in range(100))
+        (Path(tmpdir) / "large.py").write_text(many_lines)
+        result = tools.search_code(
+            paths=["."], patterns=[r"x_\d+"], max_matches=5,
+        )
+        _test_result("search_code truncation", "已截断" in result.content)
+
+        # Test 5: Ignored directory (.git should be skipped)
+        ignored_dir = Path(tmpdir) / ".git"
+        ignored_dir.mkdir()
+        (ignored_dir / "secret.py").write_text("user_id = 999")
+        result = tools.search_code(paths=["."], patterns=["user_id"])
+        _test_result("search_code ignore .git", "secret.py" not in result.content)
+
+        # Test 6: Case sensitivity
+        result = tools.search_code(
+            paths=["test.py"], patterns=["USER"], case_sensitive=True,
+        )
+        _test_result("search_code case sensitive", "未找到匹配" in result.content)
+
+        # Test 7: Context lines (> marker)
+        result = tools.search_code(
+            paths=["test.py"], patterns=["name"], context_lines=1,
+        )
+        _test_result("search_code context marker", ">" in result.content)
+
+        # Test 8: Error on invalid regex
+        result = tools.search_code(paths=["."], patterns=["[invalid"])
+        _test_result("search_code invalid regex", not result.success)
+
+        # Test 9: Glob pattern
+        result = tools.search_code(paths=["*.py"], patterns=["name"])
+        _test_result("search_code glob", result.success and "test.py" in result.content)
+
+
+# ═══════════════════════════════════════════════════════════════
 # Test: Feature Management
 # ═══════════════════════════════════════════════════════════════
 def test_feature_management():
@@ -566,6 +641,7 @@ def main():
     tests = [
         test_config_system,
         test_base_tools,
+        test_search_code,
         test_feature_management,
         test_task_management,
         test_message_bus,

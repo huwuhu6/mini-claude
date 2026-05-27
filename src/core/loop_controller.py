@@ -94,6 +94,81 @@ class CommandNormalizer:
         "edit_file":        "EDIT",
     }
 
+    # ── Non-bash target extraction helpers ─────────────────────────────
+
+    @classmethod
+    def _extract_non_bash_target(cls, tool_name: str, args: Dict[str, Any]) -> str:
+        """Build a disambiguated target string for non-bash tool calls.
+
+        Pipeline:
+          1. Extract base target from ``path`` (singular) or ``paths``
+             (plural — sorted + hashed to distinguish different sets).
+          2. Append tool-specific suffixes (line range, patterns, etc.).
+        """
+        if not isinstance(args, dict):
+            return tool_name
+
+        target = cls._extract_base_path(args)
+
+        # Tool-specific disambiguation
+        if tool_name == "read_file":
+            target = cls._suffix_line_range(target, args)
+        elif tool_name in ("search_code", "count_occurrences"):
+            target = cls._suffix_patterns(target, args)
+        elif tool_name == "verify_symbol_rename":
+            target = cls._suffix_old_symbols(target, args)
+
+        return target or tool_name
+
+    @classmethod
+    def _extract_base_path(cls, args: Dict[str, Any]) -> str:
+        """Extract base target from ``path`` (singular) or ``paths`` (plural).
+
+        - ``path`` → filename extracted from the path string.
+        - ``paths`` → ``paths:<md5-of-sorted-tuple>`` to distinguish sets.
+        """
+        path = args.get("path")
+        if path and isinstance(path, str):
+            return path.replace("\\", "/").rstrip("/").split("/")[-1]
+        paths = args.get("paths")
+        if paths and isinstance(paths, (list, tuple)) and len(paths) > 0:
+            sorted_tuple = tuple(sorted(str(p) for p in paths))
+            h = hashlib.md5(str(sorted_tuple).encode()).hexdigest()[:8]
+            return f"paths:{h}"
+        return ""
+
+    @classmethod
+    def _suffix_line_range(cls, target: str, args: Dict[str, Any]) -> str:
+        """Append ``:L{start}[-{end}]`` for read_file with line range."""
+        start_line = args.get("start_line")
+        if start_line is not None:
+            suffix = f":L{int(start_line)}"
+            end_line = args.get("end_line")
+            if end_line is not None:
+                suffix += f"-{int(end_line)}"
+            return target + suffix
+        return target
+
+    @classmethod
+    def _suffix_patterns(cls, target: str, args: Dict[str, Any]) -> str:
+        """Append ``:P:<hash>`` for tools with a patterns parameter."""
+        patterns = args.get("patterns")
+        if patterns and isinstance(patterns, (list, tuple)) and len(patterns) > 0:
+            sorted_tuple = tuple(sorted(str(p) for p in patterns))
+            h = hashlib.md5(str(sorted_tuple).encode()).hexdigest()[:8]
+            return f"{target}:P:{h}"
+        return target
+
+    @classmethod
+    def _suffix_old_symbols(cls, target: str, args: Dict[str, Any]) -> str:
+        """Append ``:S:<hash>`` for verify_symbol_rename."""
+        old_symbols = args.get("old_symbols")
+        if old_symbols and isinstance(old_symbols, (list, tuple)) and len(old_symbols) > 0:
+            sorted_tuple = tuple(sorted(str(s) for s in old_symbols))
+            h = hashlib.md5(str(sorted_tuple).encode()).hexdigest()[:8]
+            return f"{target}:S:{h}"
+        return target
+
     # ── Public entry point ─────────────────────────────────────────────
 
     @classmethod
@@ -102,9 +177,10 @@ class CommandNormalizer:
         # ── Non-bash tools (file ops, etc.) ──────────────────
         if tool_name != "bash":
             action = cls._FILE_TOOL_ACTIONS.get(tool_name, tool_name.upper())
-            path = args.get("path", "") if isinstance(args, dict) else ""
-            target = path.replace("\\", "/").rstrip("/").split("/")[-1] if path else tool_name
-            return NormalizedIntent(action=action, target=target, tool=tool_name)
+            target = cls._extract_non_bash_target(tool_name, args)
+            intent = NormalizedIntent(action=action, target=target, tool=tool_name)
+            logger.debug(f"[CommandNormalizer] {tool_name} → {intent.to_key()}")
+            return intent
 
         # ── Bash command normalization ───────────────────────
         cmd = args.get("command", "") if isinstance(args, dict) else str(args)
@@ -357,9 +433,13 @@ class V3LoopGuard:
         return None
 
     def _build_block_message(self, intent: NormalizedIntent) -> str:
+        recent_keys = [i.to_key() for i in self.recent_intents[-self.max_recent:]]
         return (
             f"⛔ [系统安全拦截 — 防死循环保护]\n"
             f"━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━\n"
+            f"意图键: {intent.to_key()}\n"
+            f"最近窗口 ({len(recent_keys)}): {', '.join(recent_keys)}\n"
+            f"\n"
             f"检测到你正在重复相同的操作：\n"
             f"  操作: {intent.action}\n"
             f"  目标: {intent.target}\n"

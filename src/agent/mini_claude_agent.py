@@ -6,6 +6,7 @@ import logging
 import os
 import sys
 import json
+import re
 import uuid
 import time
 import shutil
@@ -102,6 +103,10 @@ class MiniClaudeAgent:
             "load_skill": self._handle_load_skill_dispatch,
             "task": self._handle_task,
             "TodoWrite": self._handle_todo_write,
+            "search_code": self._handle_search_code,
+            "count_occurrences": self._handle_count_occurrences,
+            "syntax_check": self._handle_syntax_check,
+            "verify_symbol_rename": self._handle_verify_symbol_rename,
         }
 
         # In-memory todo tracker (s_full.py s03 Nag system)
@@ -314,25 +319,62 @@ class MiniClaudeAgent:
             if desc:
                 skills_text = f"\nAvailable skill modules (use load_skill to access):\n{desc}"
         self.system_prompt = (
-            f"You are {self.config.agent.name} v{self.config.agent.version}, "
-            f"an AI assistant with tools and team capabilities.\n"
-            f"Enabled features: {', '.join(features) if features else 'base'}.\n"
-            f"Working directory: {self.workdir}"
-            f"{skills_text}\n"
-            "You can use tools to read/write files, run commands, and manage tasks.\n"
-            "\n"
-            "CRITICAL RULES FOR WINDOWS ENVIRONMENT:\n"
-            "1. NO INLINE SCRIPTS: Never use inline scripts like `python -c \"...\"` "
-            "or `node -e \"...\"` in the bash tool. Windows CMD cannot handle nested "
-            "quotes and newlines properly.\n"
-            "2. SCRIPT WORKFLOW: If you need to run complex logic or multi-line code, "
-            "you MUST first use `write_file` to save the code to a temporary file "
-            "(e.g., script.py), and then use `bash` to execute that file "
-            "(e.g., `python script.py`).\n"
-            "3. VERIFY RESULTS STRICTLY: Do not assume a task is complete just because "
-            "a file exists or an exit code is 0. Verify the content or check the latest "
-            "modification timestamp to ensure your action actually succeeded."
-        )
+        f"You are {self.config.agent.name} v{self.config.agent.version}, "
+        f"an AI assistant with tools and team capabilities.\n"
+        f"Enabled features: {', '.join(features) if features else 'base'}.\n"
+        f"Working directory: {self.workdir}"
+        f"{skills_text}\n"
+        "You can use tools to read/write files, run commands, and manage tasks.\n"
+        "\n"
+        "CRITICAL RULES FOR WINDOWS ENVIRONMENT:\n"
+        "1. NO INLINE SCRIPTS: Never use inline scripts like `python -c \"...\"` "
+        "or `node -e \"...\"` in the bash tool. Windows CMD cannot handle nested "
+        "quotes and newlines properly.\n"
+        "2. SCRIPT WORKFLOW: If you need to run complex logic or multi-line code, "
+        "you MUST first use `write_file` to save the code to a temporary file "
+        "(e.g., script.py), and then use `bash` to execute that file "
+        "(e.g., `python script.py`).\n"
+        "3. VERIFY RESULTS STRICTLY: Do not assume a task is complete just because "
+        "a file exists or an exit code is 0. Verify the content or check the latest "
+        "modification timestamp to ensure your action actually succeeded.\n"
+        "4. USE SEARCH_CODE FOR FILE SEARCHING: When you need to search for patterns "
+        "in code or files, always use the `search_code` tool. Do NOT call grep, "
+        "findstr, or Select-String via the bash tool for file content searching.\n"
+        "\n"
+        "5. VERIFICATION STRATEGY (MUST FOLLOW - NEW):\n"
+        "\n"
+        "   A. Determine verification type based on task:\n"
+        "      - Parameter rename / code style change → STATIC verification only\n"
+        "      - Logic change / bug fix → STATIC + possibly FUNCTIONAL verification\n"
+        "      - New feature → FUNCTIONAL verification (run code)\n"
+        "\n"
+        "   B. Always start with static verification:\n"
+        "      - For rename/refactor: use `verify_symbol_rename` (AST-based,\n"
+        "        ignores comments/docstrings).  Fall back to `count_occurrences`\n"
+        "        if search needs to cover non-Python files.\n"
+        "      - For structural correctness: use `syntax_check` after edits.\n"
+        "      - For general pattern search: use `search_code`.\n"
+        "      - If result is \"No matches found\" or success, verification is COMPLETE.\n"
+        "        Do NOT write any script. Task done.\n"
+        "      - If matches found, fix those locations first, then re-run verification.\n"
+        "\n"
+        "   C. Only write functional test scripts when:\n"
+        "      - User explicitly asks for \"run tests\" or \"verify functionality\", OR\n"
+        "      - Task cannot be verified statically (e.g., need to check runtime behavior).\n"
+        "      - In such cases, keep script under 30 lines and do not include assertions\n"
+        "        that depend on specific test data (e.g., 'user_1' that may not exist).\n"
+        "        Prefer using `inspect.signature` over running functions.\n"
+        "\n"
+        "   D. Success condition for refactoring tasks:\n"
+        "      - All target files modified as requested.\n"
+        "      - `count_occurrences` returns 0 for all removed patterns.\n"
+        "      - `syntax_check` passes for all modified files.\n"
+        "      - No functional test script needed unless requested.\n"
+        "\n"
+        "   Violation prevention: If you are about to write a script that exceeds 30 lines\n"
+        "   or contains calls to API functions (like `api_get_user`), pause and consider\n"
+        "   whether static verification would suffice.\n"
+    )
 
     def _register_commands(self):
         """Register console commands."""
@@ -503,6 +545,110 @@ class MiniClaudeAgent:
                 },
             },
             {
+                'name': 'search_code',
+                'description': '在指定文件或目录中搜索正则表达式模式。跨平台纯 Python 实现，自动忽略 .git/__pycache__/node_modules 等目录。优先使用此工具进行代码搜索，而不是编写 Python 脚本或调用 grep/findstr。',
+                'input_schema': {
+                    'type': 'object',
+                    'properties': {
+                        'paths': {
+                            'type': 'array',
+                            'items': {'type': 'string'},
+                            'description': '文件或目录路径列表，支持通配符（*、**）。例如 ["*.py", "src/"]',
+                        },
+                        'patterns': {
+                            'type': 'array',
+                            'items': {'type': 'string'},
+                            'description': '要搜索的正则表达式列表（OR关系）。例如 ["user_id", "user_ids"]',
+                        },
+                        'context_lines': {
+                            'type': 'integer',
+                            'description': '显示匹配行前后各 N 行上下文（类似 grep -C）。默认 0',
+                        },
+                        'case_sensitive': {
+                            'type': 'boolean',
+                            'description': '是否区分大小写。默认 false',
+                        },
+                        'max_matches': {
+                            'type': 'integer',
+                            'description': '最大匹配行数，超过则截断并提示。默认 50',
+                        },
+                        'include_filename': {
+                            'type': 'boolean',
+                            'description': '是否在输出中包含文件名。默认 true',
+                        },
+                        'include_line_number': {
+                            'type': 'boolean',
+                            'description': '是否在输出中包含行号。默认 true',
+                        },
+                    },
+                    'required': ['paths', 'patterns'],
+                },
+            },
+            {
+                'name': 'count_occurrences',
+                'description': '统计正则表达式模式在多个文件中的出现次数。返回每个 pattern 的总匹配数和文件级分布。比 search_code 更轻量，适合验证 rename/refactor 的完成度。',
+                'input_schema': {
+                    'type': 'object',
+                    'properties': {
+                        'paths': {
+                            'type': 'array',
+                            'items': {'type': 'string'},
+                            'description': '文件或目录路径列表，支持通配符',
+                        },
+                        'patterns': {
+                            'type': 'array',
+                            'items': {'type': 'string'},
+                            'description': '要统计的正则表达式列表（OR关系）',
+                        },
+                        'case_sensitive': {
+                            'type': 'boolean',
+                            'description': '是否区分大小写。默认 false',
+                        },
+                    },
+                    'required': ['paths', 'patterns'],
+                },
+            },
+            {
+                'name': 'syntax_check',
+                'description': '快速检查 Python 源文件是否存在语法错误。使用 ast.parse 进行轻量结构验证。用于 rename/refactor 后确认文件仍可被正确解析。',
+                'input_schema': {
+                    'type': 'object',
+                    'properties': {
+                        'paths': {
+                            'type': 'array',
+                            'items': {'type': 'string'},
+                            'description': '要检查的 Python 文件或目录路径列表',
+                        },
+                    },
+                    'required': ['paths'],
+                },
+            },
+            {
+                'name': 'verify_symbol_rename',
+                'description': '验证符号重命名/重构是否结构性完成。使用 AST 进行语义分析，自动忽略注释、docstring、字符串字面量。同时执行语法验证。对于简单 rename 任务，优先使用此工具而非生成 verify.py。',
+                'input_schema': {
+                    'type': 'object',
+                    'properties': {
+                        'old_symbols': {
+                            'type': 'array',
+                            'items': {'type': 'string'},
+                            'description': '不应再作为标识符出现的旧符号列表',
+                        },
+                        'new_symbols': {
+                            'type': 'array',
+                            'items': {'type': 'string'},
+                            'description': '预期出现的新符号列表（正向确认）',
+                        },
+                        'paths': {
+                            'type': 'array',
+                            'items': {'type': 'string'},
+                            'description': '要检查的 Python 文件或目录路径列表',
+                        },
+                    },
+                    'required': ['old_symbols', 'new_symbols', 'paths'],
+                },
+            },
+            {
                 'name': 'TodoWrite',
                 'description': 'Update the task tracking list. Use this to plan and track your progress through complex multi-step tasks. Max 20 items, only one in_progress at a time.',
                 'input_schema': {
@@ -532,6 +678,17 @@ class MiniClaudeAgent:
     # ── Tool Handler Methods (bound once in __init__.tool_dispatcher) ──
 
     def _handle_bash(self, command: str) -> str:
+        # Block direct grep/findstr/Select-String — redirect to search_code
+        cmd_stripped = command.strip().lower()
+        for blocked in ('grep ', 'findstr ', 'select-string '):
+            if cmd_stripped.startswith(blocked):
+                return (
+                    "[Tip: 请使用 search_code 工具进行文件内容搜索，"
+                    "而非 bash 命令中的 grep/findstr。\n"
+                    f"search_code 是跨平台纯 Python 实现，"
+                    f"且具有路径安全保护。\n"
+                    f"被拦截的命令: {command[:200]}]"
+                )
         result = self.runtime_context.shell_session.execute(command)
         return result["content"]
 
@@ -651,6 +808,46 @@ class MiniClaudeAgent:
     def _handle_todo_write(self, items: list) -> str:
         """Update the in-memory todo list and return its rendered state."""
         return self.todo.update(items)
+
+    def _handle_search_code(self, paths: list, patterns: list,
+                             context_lines: int = 0,
+                             case_sensitive: bool = False,
+                             max_matches: int = 50,
+                             include_filename: bool = True,
+                             include_line_number: bool = True) -> str:
+        """Handle search_code tool calls — delegate to BaseTools."""
+        result = self.tools.search_code(
+            paths=paths, patterns=patterns,
+            context_lines=context_lines,
+            case_sensitive=case_sensitive,
+            max_matches=max_matches,
+            include_filename=include_filename,
+            include_line_number=include_line_number,
+        )
+        return result.content
+
+    def _handle_count_occurrences(self, paths: list, patterns: list,
+                                   case_sensitive: bool = False) -> str:
+        """Handle count_occurrences tool calls — delegate to BaseTools."""
+        result = self.tools.count_occurrences(
+            paths=paths, patterns=patterns,
+            case_sensitive=case_sensitive,
+        )
+        return result.content
+
+    def _handle_syntax_check(self, paths: list) -> str:
+        """Handle syntax_check tool calls — delegate to BaseTools."""
+        result = self.tools.syntax_check(paths=paths)
+        return result.content
+
+    def _handle_verify_symbol_rename(self, old_symbols: list,
+                                      new_symbols: list,
+                                      paths: list) -> str:
+        """Handle verify_symbol_rename tool calls — delegate to BaseTools."""
+        result = self.tools.verify_symbol_rename(
+            old_symbols=old_symbols, new_symbols=new_symbols, paths=paths,
+        )
+        return result.content
 
     def _load_skill_internal(self, name: str) -> ToolResult:
         """Load skill content and format it for the LLM."""
@@ -775,7 +972,7 @@ class MiniClaudeAgent:
 
     # ── Core LLM + Tool Cycle ──────────────────────────────────────
 
-    def _llm_tool_cycle(self, max_iterations: int = 35) -> str:
+    def _llm_tool_cycle(self, max_iterations: int =50) -> str:
         """Core LLM + tool execution cycle, looping tools back to LLM (s_full.py s02 pattern).
 
         Args:

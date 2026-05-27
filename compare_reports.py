@@ -503,8 +503,8 @@ def _render_global_board(
     """
     lines = [
         "## 全局核心指标演进看板\n",
-        "| 版本 | 综合通过率 | 全量 Token | 全量轮次 | 命中率范围 | 压缩次数 | 平均耗时 | 相比基线成本 | 用例数 |",
-        "|------|-----------|-----------|---------|-----------|---------|---------|-------------|-------|",
+        "| 版本 | 综合通过率 | 全量 Token | 平均 Token | 全量轮次 | 命中率范围 | 压缩次数 | 平均耗时 | 相比基线成本 | 用例数 |",
+        "|------|-----------|---------|---------|---------|-----------|---------|---------|-------------|-------|",
     ]
 
     baseline_total: int | None = None
@@ -575,12 +575,16 @@ def _render_global_board(
 
         rate_str = f"{total_passes}/{total_runs}"
         token_str = _fmt_tokens(token_total)
+        avg_token = token_total / total if total > 0 else None
+        avg_token_str = _fmt_tokens(avg_token) if avg_token is not None else "-"
 
         if ver_name == versions[0][0]:
-            baseline_total = token_total
+            baseline_avg = avg_token
             cost_str = "— (基线)"
-        elif baseline_total is not None and baseline_total > 0:
-            pct = (token_total - baseline_total) / baseline_total * 100
+        elif total == 0 or baseline_avg is None or baseline_avg <= 0:
+            cost_str = "—"
+        elif avg_token is not None:
+            pct = (avg_token - baseline_avg) / baseline_avg * 100
             if pct < 0:
                 cost_str = f"🔻 {abs(pct):.1f}%"
             elif pct > 0:
@@ -591,7 +595,7 @@ def _render_global_board(
             cost_str = "—"
 
         lines.append(
-            f"| **{ver_name}** | {rate_str} | {token_str} | {turn_total} | {prec_range} | {comp_range} | {avg_lat} | {cost_str} | {total} |"
+            f"| **{ver_name}** | {rate_str} | {token_str} | {avg_token_str} | {turn_total} | {prec_range} | {comp_range} | {avg_lat} | {cost_str} | {total} |"
         )
 
     lines.append("")
