@@ -429,12 +429,13 @@ class MiniClaudeAgent:
             },
             {
                 'name': 'read_file',
-                'description': 'Read file contents with optional line limit.',
+                'description': '读取文件的指定行范围（视窗读取）。对长文件请务必使用 start_line/end_line 限定行号范围，以节省 Token 并提升聚焦度。不传参则读取全文。行号从 1 开始计数。',
                 'input_schema': {
                     'type': 'object',
                     'properties': {
-                        'path': {'type': 'string', 'description': 'Path to the file'},
-                        'limit': {'type': 'integer', 'description': 'Maximum lines to read'},
+                        'path': {'type': 'string', 'description': '文件路径'},
+                        'start_line': {'type': 'integer', 'description': '起始行号（包含），从 1 开始。不传则从头读取'},
+                        'end_line': {'type': 'integer', 'description': '结束行号（包含）。不传则读到文件末尾'},
                     },
                     'required': ['path'],
                 },
@@ -534,8 +535,8 @@ class MiniClaudeAgent:
         result = self.runtime_context.shell_session.execute(command)
         return result["content"]
 
-    def _handle_read_file(self, path: str, limit: int = None) -> str:
-        result = self.tools.read_file(path, limit)
+    def _handle_read_file(self, path: str, start_line: int = None, end_line: int = None) -> str:
+        result = self.tools.read_file(path, start_line, end_line)
         return result.content
 
     def _handle_write_file(self, path: str, content: str) -> str:

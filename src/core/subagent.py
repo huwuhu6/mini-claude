@@ -123,7 +123,7 @@ class SubAgent:
         """Execute a tool and return result string (dict dispatch)."""
         handlers = {
             'bash':       lambda a: self.tools.run_bash(a['command']),
-            'read_file':  lambda a: self.tools.read_file(a['path'], a.get('limit')),
+            'read_file':  lambda a: self.tools.read_file(a['path'], a.get('start_line'), a.get('end_line')),
             'write_file': lambda a: self.tools.write_file(a['path'], a['content']),
             'edit_file':  lambda a: self.tools.edit_file(a['path'], a['edits']),
         }

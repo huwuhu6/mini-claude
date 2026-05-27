@@ -87,6 +87,17 @@ def test_base_tools():
         result = tools.read_file("test.txt")
         _test_result("edit_file content", "Hi, World!" in result.content)
 
+        # Test 3b: Read file with line range window
+        tools.write_file("multi_line.txt", "line1\nline2\nline3\nline4\nline5\n")
+        result = tools.read_file("multi_line.txt", start_line=2, end_line=4)
+        _test_result("read_file window", (
+            result.success
+            and "line2" in result.content
+            and "line4" in result.content
+            and "line1" not in result.content
+            and "line5" not in result.content
+        ))
+
         # Test 4: Safe path - within workspace
         result = tools.read_file("test.txt")
         _test_result("safe path (valid)", result.success)

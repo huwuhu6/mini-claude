@@ -179,16 +179,24 @@ class BaseTools:
             logger.error(f"执行命令出错: {e}")
             return ToolResult(f"错误: {str(e)}", success=False)
 
-    def read_file(self, path: str, limit: Optional[int] = None) -> ToolResult:
+    def read_file(self, path: str, start_line: int = None,
+                  end_line: int = None) -> ToolResult:
         """
-        Read file contents with optional limit.
+        Read file contents with line-number-prefixed window chunking.
 
         Args:
             path: File path
-            limit: Maximum number of lines to read
+            start_line: First line number to include (1-based, inclusive).
+                        Defaults to 1 when omitted.
+            end_line: Last line number to include (1-based, inclusive).
+                      Defaults to total line count when omitted.
 
         Returns:
-            ToolResult with file contents
+            ToolResult with every line prefixed by its absolute line number.
+            A metadata header shows the file path, line range, and total lines.
+
+        Raises:
+            ValueError: If start_line > end_line (propagated via ToolResult).
         """
         try:
             file_path = self.safe_path(path)
@@ -200,24 +208,61 @@ class BaseTools:
                 return ToolResult(f"错误: 路径不是文件: {path}", success=False)
 
             with open(file_path, 'r', encoding='utf-8') as f:
-                lines = f.readlines()
+                lines = f.read().splitlines(keepends=False)
 
-            if limit and limit < len(lines):
-                lines = lines[:limit]
-                remaining = len(lines) - limit
-                lines.append(f"\n... (剩余 {remaining} 行)")
+            total_lines = len(lines)
 
-            content = ''.join(lines)
+            # Resolve slice boundaries (1-based inclusive)
+            start = 1 if start_line is None else max(1, int(start_line))
+            end = total_lines if end_line is None else min(total_lines, int(end_line))
 
-            logger.debug(f"读取文件: {path} ({len(content)} 个字符)")
+            # Validation: start must not exceed end
+            if start > end:
+                return ToolResult(
+                    f"错误: start_line ({start}) > end_line ({end})，"
+                    f"行号范围非法。请检查传入的参数。",
+                    success=False,
+                )
 
-            return ToolResult(content)
+            # Slice the line list (convert 1-based → 0-based indexing)
+            chunk = lines[start - 1:end]
+
+            # Build output with absolute line-number prefix
+            output_parts = [
+                f"--- 文件: {path} (第 {start} 行至第 {end} 行，总计 {total_lines} 行) ---",
+            ]
+            for i, line_content in enumerate(chunk, start=start):
+                output_parts.append(f"{i:4d} | {line_content}")
+
+            output = '\n'.join(output_parts)
+
+            logger.debug(
+                f"读取文件: {path} [{start}-{end}/{total_lines} 行] "
+                f"({len(output)} 个字符)"
+            )
+
+            return ToolResult(output)
 
         except UnicodeDecodeError:
             try:
                 with open(file_path, 'r', encoding='latin-1') as f:
                     content = f.read()
-                return ToolResult(content)
+                lines = content.splitlines(keepends=False)
+                total_lines = len(lines)
+                start = 1 if start_line is None else max(1, int(start_line))
+                end = total_lines if end_line is None else min(total_lines, int(end_line))
+                if start > end:
+                    return ToolResult(
+                        f"错误: start_line ({start}) > end_line ({end})，行号范围非法。",
+                        success=False,
+                    )
+                chunk = lines[start - 1:end]
+                output_parts = [
+                    f"--- 文件: {path} (第 {start} 行至第 {end} 行，总计 {total_lines} 行) ---",
+                ]
+                for i, line_content in enumerate(chunk, start=start):
+                    output_parts.append(f"{i:4d} | {line_content}")
+                return ToolResult('\n'.join(output_parts))
             except Exception as e:
                 return ToolResult(f"读取文件时出错（编码问题）: {str(e)}", success=False)
         except Exception as e:

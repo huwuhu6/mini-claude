@@ -105,12 +105,12 @@
 面试价值：中高  
 类型：Tool runtime upgrade
 
-已完成（关联 ADR-013）：
-- **`edit_file` 批量事务化**：`edits: [{search, replace}]` 数组，原子落盘，二级符号归一化兜底
-- 跨文件重构 Token 降 52%（289k → 137k），状态从 LOOP_ABORTED → SUCCESS
+已完成：
+- **`edit_file` 批量事务化**（关联 ADR-013）：`edits: [{search, replace}]` 数组，原子落盘，二级符号归一化兜底。Token 降 52%（289k → 137k），状态从 LOOP_ABORTED → SUCCESS
+- **`read_file` 局部视窗**（关联 ADR-014）：支持 `start_line`/`end_line`，行号前缀 + 元数据头
 
 待完成：
-- `read_file` 支持 offset/limit
+- `read_file` 局部视窗的 Token 收益未验证（v6 基线 Token 反弹 118%），需探索调用频次限制或连续读取合并缓存
 - `edit_file` 错误消息缺乏指导性
 - 评估 range edit 或 symbol navigation
 
