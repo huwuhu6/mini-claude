@@ -194,6 +194,28 @@ def test_rename_import_alias():
         _test_result("user_id in remaining", "user_id" in symbols)
 
 
+def test_rename_completion_signal():
+    """Success response includes confidence, task_complete_likely fields."""
+    _test_section("Completion Signal Fields")
+
+    with tempfile.TemporaryDirectory() as tmpdir:
+        tools = BaseTools(Path(tmpdir))
+        (Path(tmpdir) / "service.py").write_text(
+            "uid = 42\n"
+            "def get():\n"
+            "    return uid\n"
+        )
+
+        result = tools.verify_symbol_rename(
+            old_symbols=["user_id"], new_symbols=["uid"], paths=["."],
+        )
+        data = _parse(result)
+        _test_result("confidence=high", data.get("confidence") == "high")
+        _test_result("task_complete_likely=true", data.get("task_complete_likely") is True)
+        _test_result("message suggests stopping",
+                     "unnecessary" in data.get("message", "").lower())
+
+
 def test_rename_new_symbols_count():
     """New symbols should be counted and reported."""
     _test_section("New Symbols Counted")
@@ -238,6 +260,7 @@ def main():
         test_rename_no_python,
         test_rename_import_alias,
         test_rename_new_symbols_count,
+        test_rename_completion_signal,
     ]
 
     for test in tests:

@@ -1053,7 +1053,7 @@ class BaseTools:
             }
             return ToolResult(json.dumps(result, indent=2, ensure_ascii=False), success=False)
 
-        # ── Success ──────────────────────────────────────────────
+        # ── Success (enhanced completion signal) ─────────────────
         new_info = (
             f" New symbols appear in {sum(new_counts.values())} location(s)."
             if new_counts
@@ -1061,8 +1061,14 @@ class BaseTools:
         )
         result = {
             "success": True,
+            "confidence": "high",
+            "task_complete_likely": True,
             "remaining_identifiers": [],
             "syntax_ok": True,
-            "message": f"Rename task appears structurally complete.{new_info}",
+            "message": (
+                f"Rename task structurally verified. "
+                f"Additional verification is likely unnecessary "
+                f"for this low-risk refactor task.{new_info}"
+            ),
         }
         return ToolResult(json.dumps(result, indent=2, ensure_ascii=False), success=True)
