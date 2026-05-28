@@ -350,6 +350,124 @@ def test_scope_code_only_mixed():
         _test_result("ignored_matches.string_literal>0", data.get("ignored_matches", {}).get("string_literal", 0) > 0)
 
 
+def test_targeted_verification_clean():
+    """targeted: target function clean, other function has old symbol → success."""
+    _test_section("Targeted Clean — Other Func Dirty")
+
+    with tempfile.TemporaryDirectory() as tmpdir:
+        tools = BaseTools(Path(tmpdir))
+        (Path(tmpdir) / "service.py").write_text(
+            "def get_user_service(user):\n"     # <-- target: clean
+            "    return user.uid\n"
+            "\n"
+            "def user_exists(user_id):\n"        # <-- non-target: old symbol
+            "    return user_id is not None\n"
+        )
+
+        result = tools.verify_symbol_rename(
+            old_symbols=["user_id"], new_symbols=["uid"],
+            paths=["."],
+            targets=[{"file": "service.py", "function": "get_user_service",
+                       "old": "user_id", "new": "uid"}],
+        )
+        data = _parse(result)
+        _test_result("success=true (target clean)", data["success"] is True)
+        _test_result("meaningful_remaining empty", len(data.get("meaningful_remaining", [])) == 0)
+        _test_result("targets_verified set", data.get("targets_verified") == 1)
+
+
+def test_targeted_verification_dirty():
+    """targeted: target function still has old symbol → failure."""
+    _test_section("Targeted Dirty")
+
+    with tempfile.TemporaryDirectory() as tmpdir:
+        tools = BaseTools(Path(tmpdir))
+        (Path(tmpdir) / "service.py").write_text(
+            "def get_user_service(user):\n"
+            "    return user.user_id\n"          # <-- target: old symbol remains
+        )
+
+        result = tools.verify_symbol_rename(
+            old_symbols=["user_id"], new_symbols=["uid"],
+            paths=["."],
+            targets=[{"file": "service.py", "function": "get_user_service",
+                       "old": "user_id", "new": "uid"}],
+        )
+        data = _parse(result)
+        _test_result("success=false (target dirty)", data["success"] is False)
+        _test_result("meaningful_remaining non-empty", len(data.get("meaningful_remaining", [])) > 0)
+
+
+def test_targeted_function_not_found():
+    """targeted: function not found → success (assume already renamed)."""
+    _test_section("Targeted Func Not Found")
+
+    with tempfile.TemporaryDirectory() as tmpdir:
+        tools = BaseTools(Path(tmpdir))
+        (Path(tmpdir) / "service.py").write_text(
+            "def get_user_service(user):\n"
+            "    return user.uid\n"
+        )
+
+        result = tools.verify_symbol_rename(
+            old_symbols=["user_id"], new_symbols=["uid"],
+            paths=["."],
+            targets=[{"file": "service.py", "function": "nonexistent_func",
+                       "old": "user_id", "new": "uid"}],
+        )
+        data = _parse(result)
+        _test_result("success=true (func not found)", data["success"] is True)
+
+
+def test_targeted_multiple_targets():
+    """targeted: multiple targets, one clean one dirty → failure."""
+    _test_section("Multiple Targets — Mixed")
+
+    with tempfile.TemporaryDirectory() as tmpdir:
+        tools = BaseTools(Path(tmpdir))
+        (Path(tmpdir) / "service.py").write_text(
+            "def get_user_a(user):\n"
+            "    return user.uid\n"
+            "\n"
+            "def get_user_b(user):\n"
+            "    return user.user_id\n"
+        )
+
+        result = tools.verify_symbol_rename(
+            old_symbols=["user_id"], new_symbols=["uid"],
+            paths=["."],
+            targets=[
+                {"file": "service.py", "function": "get_user_a",
+                 "old": "user_id", "new": "uid"},
+                {"file": "service.py", "function": "get_user_b",
+                 "old": "user_id", "new": "uid"},
+            ],
+        )
+        data = _parse(result)
+        _test_result("success=false (one dirty)", data["success"] is False)
+        _test_result("targets_verified", data.get("targets_verified") == 2)
+
+
+def test_targeted_no_targets_fallback():
+    """targets=None: falls back to global verification."""
+    _test_section("Targets=None Fallback")
+
+    with tempfile.TemporaryDirectory() as tmpdir:
+        tools = BaseTools(Path(tmpdir))
+        (Path(tmpdir) / "service.py").write_text(
+            "def get_user_service(user):\n"
+            "    return user.uid\n"
+        )
+
+        # Same as test_rename_complete — no targets param
+        result = tools.verify_symbol_rename(
+            old_symbols=["user_id"], new_symbols=["uid"], paths=["."],
+        )
+        data = _parse(result)
+        _test_result("success=true (fallback)", data["success"] is True)
+        _test_result("meaningful_remaining empty", len(data.get("meaningful_remaining", [])) == 0)
+
+
 # ═══════════════════════════════════════════════════════════════
 # Run All Tests
 # ═══════════════════════════════════════════════════════════════
@@ -378,6 +496,11 @@ def main():
         test_string_literal_only_remaining,
         test_scope_all_includes_non_code,
         test_scope_code_only_mixed,
+        test_targeted_verification_clean,
+        test_targeted_verification_dirty,
+        test_targeted_function_not_found,
+        test_targeted_multiple_targets,
+        test_targeted_no_targets_fallback,
     ]
 
     for test in tests:

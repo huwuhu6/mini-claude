@@ -631,7 +631,7 @@ class MiniClaudeAgent:
             },
             {
                 'name': 'verify_symbol_rename',
-                'description': '验证符号重命名/重构是否结构性完成。使用 AST 进行语义分析，支持 scope 参数（code_only 仅检查真实代码标识符，忽略 docstring/注释/字符串；all 检查全部）。同时执行语法验证。对于简单 rename 任务优先使用此工具而非生成 verify.py。',
+                'description': '验证符号重命名/重构是否结构性完成。使用 AST 进行语义分析，支持 scope（code_only/all）和 targets（指定函数级验证范围）。对于简单 rename 任务优先使用此工具而非生成 verify.py。',
                 'input_schema': {
                     'type': 'object',
                     'properties': {
@@ -654,6 +654,20 @@ class MiniClaudeAgent:
                             'type': 'string',
                             'enum': ['code_only', 'all'],
                             'description': "验证范围: code_only（默认）忽略 docstring/注释/字符串字面量中的残留；all 将全部视作有意义残留",
+                        },
+                        'targets': {
+                            'type': 'array',
+                            'items': {
+                                'type': 'object',
+                                'properties': {
+                                    'file': {'type': 'string', 'description': '目标文件路径'},
+                                    'function': {'type': 'string', 'description': '目标函数名'},
+                                    'old': {'type': 'string', 'description': '旧符号'},
+                                    'new': {'type': 'string', 'description': '新符号'},
+                                },
+                                'required': ['file', 'function', 'old', 'new'],
+                            },
+                            'description': '目标函数列表（可选）。提供后仅验证指定函数内的符号重命名，其他函数中的旧符号不影响 verdict。',
                         },
                     },
                     'required': ['old_symbols', 'new_symbols', 'paths'],
@@ -854,11 +868,12 @@ class MiniClaudeAgent:
     def _handle_verify_symbol_rename(self, old_symbols: list,
                                       new_symbols: list,
                                       paths: list,
-                                      scope: str = "code_only") -> str:
+                                      scope: str = "code_only",
+                                      targets: list = None) -> str:
         """Handle verify_symbol_rename tool calls — delegate to BaseTools."""
         result = self.tools.verify_symbol_rename(
             old_symbols=old_symbols, new_symbols=new_symbols,
-            paths=paths, scope=scope,
+            paths=paths, scope=scope, targets=targets,
         )
         return result.content
 

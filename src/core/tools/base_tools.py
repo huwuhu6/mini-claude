@@ -953,6 +953,7 @@ class BaseTools:
         new_symbols: List[str],
         paths: List[str],
         scope: str = "code_only",
+        targets: Optional[List[Dict[str, str]]] = None,
     ) -> ToolResult:
         """Verify whether a symbol rename is structurally complete.
 
@@ -971,6 +972,13 @@ class BaseTools:
             paths:       Files or directories to inspect.
             scope:       Verification scope — "code_only" (default) or "all".
 
+        When ``targets`` is provided (list of ``{"file", "function",
+        "old", "new"}`` dicts), verification is scoped to only those
+        specific functions.  Old symbols in other functions do NOT
+        affect the verdict.
+
+            targets:     Optional list of target dicts for function-level
+                         scoped verification.
         Returns:
             ToolResult with a structured JSON verdict.
         """
@@ -984,6 +992,154 @@ class BaseTools:
             return ToolResult(
                 f"错误: scope 必须是 'code_only' 或 'all'，收到 '{scope}'",
                 success=False,
+            )
+
+        # ── Targeted verification (when targets is provided) ──────────
+        if targets is not None:
+            t_remaining: List[Dict[str, Any]] = []
+            t_syntax_errors: List[Dict[str, Any]] = []
+            t_new_counts: Dict[str, int] = {}
+
+            for target in targets:
+                if not isinstance(target, dict):
+                    return ToolResult(
+                        "错误: targets 元素应为 object 类型",
+                        success=False,
+                    )
+                for key in ("file", "function", "old", "new"):
+                    if key not in target:
+                        return ToolResult(
+                            f"错误: target 缺少必要字段 '{key}'",
+                            success=False,
+                        )
+
+                file_str = target["file"]
+                fun_name = target["function"]
+                target_old = target["old"]
+                target_new = target["new"]
+
+                try:
+                    file_path = self.safe_path(file_str)
+                except ValueError as e:
+                    return ToolResult(
+                        f"错误: 文件路径无法解析: {file_str} — {e}",
+                        success=False,
+                    )
+
+                if not file_path.exists():
+                    return ToolResult(
+                        f"错误: 文件不存在: {file_str}",
+                        success=False,
+                    )
+                if not file_path.is_file():
+                    return ToolResult(
+                        f"错误: 路径不是文件: {file_str}",
+                        success=False,
+                    )
+
+                try:
+                    with open(file_path, "r", encoding="utf-8") as f:
+                        source = f.read()
+                except Exception as e:
+                    t_syntax_errors.append({
+                        "file": str(file_path), "line": 0, "message": str(e),
+                    })
+                    continue
+
+                try:
+                    tree = ast.parse(source, filename=str(file_path))
+                except SyntaxError as e:
+                    t_syntax_errors.append({
+                        "file": str(file_path),
+                        "line": e.lineno or 0,
+                        "message": e.msg,
+                    })
+                    continue
+
+                # Locate target function in AST
+                fn_node = None
+                for node in ast.walk(tree):
+                    if (isinstance(node, (ast.FunctionDef, ast.AsyncFunctionDef))
+                            and node.name == fun_name):
+                        fn_node = node
+                        break
+
+                if fn_node is None:
+                    # Function not found — assume already renamed/removed
+                    continue
+
+                fn_start = fn_node.lineno
+                fn_end = fn_node.end_lineno
+
+                # Find old symbols within function range
+                finder = _SymbolFinder([target_old])
+                finder.visit(tree)
+                for symbol, lineno in finder.found:
+                    if fn_start <= lineno <= fn_end:
+                        t_remaining.append({
+                            "symbol": symbol,
+                            "file": str(file_path),
+                            "line": lineno,
+                        })
+
+                # Count new symbols within function range
+                new_finder = _SymbolFinder([target_new])
+                new_finder.visit(tree)
+                for symbol, lineno in new_finder.found:
+                    if fn_start <= lineno <= fn_end:
+                        t_new_counts[symbol] = t_new_counts.get(symbol, 0) + 1
+
+            # ── Build verdict for targeted verification ──
+            if t_syntax_errors:
+                result = {
+                    "success": False,
+                    "meaningful_remaining": [],
+                    "syntax_ok": False,
+                    "message": "Syntax error(s) detected - rename cannot be validated.",
+                    "errors": t_syntax_errors,
+                }
+                return ToolResult(
+                    json.dumps(result, indent=2, ensure_ascii=False), success=False,
+                )
+
+            if t_remaining:
+                result = {
+                    "success": False,
+                    "confidence": "low",
+                    "task_complete_likely": False,
+                    "meaningful_remaining": t_remaining,
+                    "syntax_ok": True,
+                    "targets_verified": len(targets),
+                    "message": "Target function(s) still contain old symbols.",
+                }
+                return ToolResult(
+                    json.dumps(result, indent=2, ensure_ascii=False), success=False,
+                )
+
+            # Success: all target functions clean
+            new_info = ""
+            if t_new_counts:
+                items = ", ".join(
+                    f"'{k}' appears in {v} location(s)"
+                    for k, v in t_new_counts.items()
+                )
+                new_info = f" New symbols: {items}."
+
+            result = {
+                "success": True,
+                "confidence": "high",
+                "task_complete_likely": True,
+                "meaningful_remaining": [],
+                "syntax_ok": True,
+                "targets_verified": len(targets),
+                "message": (
+                    f"All {len(targets)} target function(s) verified. "
+                    f"No remaining old symbols in targeted scope.{new_info}"
+                    f" Additional verification is likely unnecessary."
+                ),
+            }
+            return ToolResult(
+                json.dumps(result, indent=2, ensure_ascii=False), success=True,
             )
 
         try:
