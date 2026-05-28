@@ -54,7 +54,8 @@ _METRIC_FIELDS = (
 # ═══════════════════════════════════════════════════════════════
 
 def _discover_versions() -> list[tuple[str, Path]]:
-    """扫描 EVAL_ROOT，返回 (版本名, 目录Path) 列表，baseline 排第一。"""
+    """扫描 EVAL_ROOT，返回 (版本名, 目录Path) 列表，baseline 排第一，
+    其余按目录生成时间（创建时间）排序。"""
     if not EVAL_ROOT.is_dir():
         print(f"错误: 目录不存在 {EVAL_ROOT}")
         sys.exit(1)
@@ -67,7 +68,11 @@ def _discover_versions() -> list[tuple[str, Path]]:
             continue
         entries.append((p.name, p))
 
-    entries.sort(key=lambda x: (0, "") if x[0] == "baseline" else (1, x[0]))
+    # baseline 排第一，其余按目录创建时间升序
+    entries.sort(key=lambda x: (
+        -1 if x[0] == "baseline" else 0,
+        0 if x[0] == "baseline" else x[1].stat().st_ctime,
+    ))
     return entries
 
 
@@ -121,16 +126,27 @@ def _compute_avg_tool_latency(raw: dict) -> float | None:
     return round(total_ms / count, 1) if count > 0 else None
 
 
-def _compute_tool_distribution(raw: dict) -> str:
-    """工具调用分布统计，返回 'bash:3 read:2 write:1' 格式。"""
+def _compute_tool_distribution_dict(raw: dict) -> dict[str, int]:
+    """计算工具调用分布，返回 {tool_name: count}。"""
     dist: dict[str, int] = {}
     for turn in raw.get("turns", []):
         for tc in turn.get("tools", []):
             name = tc.get("tool_name", "unknown")
             dist[name] = dist.get(name, 0) + 1
+    return dist
+
+
+def _fmt_tool_distribution(dist: dict[str, int | float]) -> str:
+    """将工具分布 dict 格式化为 'bash:3 read:2' 字符串。"""
     if not dist:
         return "-"
-    return " ".join(f"{k}:{v}" for k, v in sorted(dist.items()))
+    parts = []
+    for k, v in sorted(dist.items()):
+        if isinstance(v, float):
+            parts.append(f"{k}:{v:.1f}")
+        else:
+            parts.append(f"{k}:{v}")
+    return " ".join(parts)
 
 
 def _load_trace_metrics(trace_path: Path) -> dict[str, Any]:
@@ -172,7 +188,9 @@ def _load_trace_metrics(trace_path: Path) -> dict[str, Any]:
     result["_tool_failure_count"] = _compute_failure_count(raw)
     result["_avg_tokens_per_turn"] = _compute_avg_tokens_per_turn(raw)
     result["_avg_tool_latency_ms"] = _compute_avg_tool_latency(raw)
-    result["_tool_distribution"] = _compute_tool_distribution(raw)
+    dist_dict = _compute_tool_distribution_dict(raw)
+    result["_tool_distribution_dict"] = dist_dict
+    result["_tool_distribution"] = _fmt_tool_distribution(dist_dict)
 
     return result
 
@@ -212,6 +230,8 @@ def _aggregate_metrics(all_metrics: list[dict]) -> dict[str, Any]:
         fields.update(m.keys())
 
     for field in fields:
+        if field == "_tool_distribution_dict":
+            continue
         vals = [m.get(field) for m in all_metrics if m.get(field) is not None]
         if not vals:
             continue
@@ -226,6 +246,22 @@ def _aggregate_metrics(all_metrics: list[dict]) -> dict[str, Any]:
             from collections import Counter
             counter = Counter(str(v) for v in vals)
             result[field] = counter.most_common(1)[0][0]
+
+    # ── 工具分布按工具名分列聚合 ────────────────────────────
+    dist_dicts = [
+        m.get("_tool_distribution_dict", {})
+        for m in all_metrics if m.get("_tool_distribution_dict")
+    ]
+    if dist_dicts:
+        all_tools: set[str] = set()
+        for d in dist_dicts:
+            all_tools.update(d.keys())
+        agg_dist: dict[str, float] = {}
+        for tool in sorted(all_tools):
+            vals = [d.get(tool, 0) for d in dist_dicts]
+            agg_dist[tool] = sum(vals) / len(vals)
+        result["_tool_distribution_dict"] = agg_dist
+        result["_tool_distribution"] = _fmt_tool_distribution(agg_dist)
 
     result["_run_count"] = len(all_metrics)
     result["_pass_count"] = sum(
