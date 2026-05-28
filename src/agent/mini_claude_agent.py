@@ -327,9 +327,8 @@ class MiniClaudeAgent:
         "You can use tools to read/write files, run commands, and manage tasks.\n"
         "\n"
         "CRITICAL RULES FOR WINDOWS ENVIRONMENT:\n"
-        "1. NO INLINE SCRIPTS: Never use inline scripts like `python -c \"...\"` "
-        "or `node -e \"...\"` in the bash tool. Windows CMD cannot handle nested "
-        "quotes and newlines properly.\n"
+        "1. NO INLINE SCRIPTS: Never use `python -c \"...\"` or `node -e \"...\"` "
+        "in the bash tool. Windows CMD cannot handle nested quotes and newlines properly.\n"
         "2. SCRIPT WORKFLOW: If you need to run complex logic or multi-line code, "
         "you MUST first use `write_file` to save the code to a temporary file "
         "(e.g., script.py), and then use `bash` to execute that file "
@@ -341,45 +340,37 @@ class MiniClaudeAgent:
         "in code or files, always use the `search_code` tool. Do NOT call grep, "
         "findstr, or Select-String via the bash tool for file content searching.\n"
         "\n"
-        "5. VERIFICATION STRATEGY (MUST FOLLOW - NEW):\n"
+        "TASK TRACKING WITH TodoWrite:\n"
+        "- For any multi‑step task, update your plan via `TodoWrite` BEFORE taking action.\n"
+        "- Every entry must describe the GOAL (e.g., \"Rename parameter X to Y in all files\", "
+        "\"Confirm no remaining old symbols\"). Never describe the tool or method.\n"
+        "- Mark the current step as `in_progress`, update it to `completed` when done, "
+        "and move to the next.\n"
         "\n"
-        "   A. Determine verification type based on task:\n"
-        "      - Parameter rename / code style change → STATIC verification only\n"
-        "      - Logic change / bug fix → STATIC + possibly FUNCTIONAL verification\n"
-        "      - New feature → FUNCTIONAL verification (run code)\n"
+        "VERIFICATION STRATEGY (MUST FOLLOW):\n"
         "\n"
-        "   B. Always start with static verification:\n"
-        "      - For rename/refactor: use `verify_symbol_rename` (scope=code_only by default,\n"
-        "        ignores docstrings/comments/string literals). Fall back to `count_occurrences`\n"
-        "        if search needs to cover non-Python files.\n"
-        "      - For structural correctness: use `syntax_check` after edits.\n"
-        "      - For general pattern search: use `search_code`.\n"
-        "      - If result is \"No matches found\" or success, verification is COMPLETE.\n"
-        "        Do NOT write any script. Task done.\n"
-        "      - If matches found, fix those locations first, then re-run verification.\n"
+        "1. CATEGORIZE THE TASK:\n"
+        "   - Purely structural changes (rename, import cleanup, dead code removal, "
+        "signature migration): these require only static verification.\n"
+        "   - Logic changes, bug fixes, new features: may need runtime verification.\n"
         "\n"
-        "   C. Only write functional test scripts when:\n"
-        "      - User explicitly asks for \"run tests\" or \"verify functionality\", OR\n"
-        "      - Task cannot be verified statically (e.g., need to check runtime behavior).\n"
-        "      - In such cases, keep script under 30 lines and do not include assertions\n"
-        "        that depend on specific test data (e.g., 'user_1' that may not exist).\n"
-        "        Prefer using `inspect.signature` over running functions.\n"
+        "2. FOR STRUCTURAL CHANGES, USE STATIC VERIFICATION ONLY:\n"
+        "   - `verify_symbol_rename` (scope=code_only) for Python rename/refactor tasks.\n"
+        "   - `syntax_check` to ensure files still parse correctly.\n"
+        "   - `count_occurrences` to confirm old patterns are gone (especially non‑Python).\n"
+        "   - When these all pass, the task is COMPLETE. Stop immediately – no further actions.\n"
         "\n"
-        "   D. Success condition for refactoring tasks:\n"
-        "      - All target files modified as requested.\n"
-        "      - `count_occurrences` returns 0 for all removed patterns.\n"
-        "      - `syntax_check` passes for all modified files.\n"
-        "      - No functional test script needed unless requested.\n"
-        "   E. Stopping heuristic for low-risk static refactor:\n"
-        "      When verify_symbol_rename with scope=code_only returns confidence=high\n"
-        "      and task_complete_likely=true, the refactor is structurally complete —\n"
-        "      remaining matches in ignored_matches (docstrings/comments/strings) need\n"
-        "      no action. Combined with syntax_check success, stop here.\n"
-        "      (This does NOT apply to bug fixes, feature work, or logic changes.)\n"
+        "3. RUNTIME VERIFICATION IS ALLOWED ONLY WHEN:\n"
+        "   - The user explicitly requests it, OR the task cannot be validated statically "
+        "(e.g., runtime behavior, integration, bug fixes).\n"
+        "   - In those rare cases, keep any temporary file small and self‑contained.\n"
         "\n"
-        "   Violation prevention: If you are about to write a script that exceeds 30 lines\n"
-        "   or contains calls to API functions (like `api_get_user`), pause and consider\n"
-        "   whether static verification would suffice.\n"
+        "4. SUCCESS DEFINITION FOR STRUCTURAL TASKS:\n"
+        "   - All requested files modified correctly.\n"
+        "   - `verify_symbol_rename` returns confidence=high and task_complete_likely=true "
+        "(or `count_occurrences` returns 0 for removed patterns).\n"
+        "   - `syntax_check` reports no errors.\n"
+        "   - No further steps required.\n"
     )
 
     def _register_commands(self):
@@ -675,7 +666,12 @@ class MiniClaudeAgent:
             },
             {
                 'name': 'TodoWrite',
-                'description': 'Update the task tracking list. Use this to plan and track your progress through complex multi-step tasks. Max 20 items, only one in_progress at a time.',
+                # 外层 description 保持精简，定下“目标导向”的基调
+                'description': (
+                    'Update the task tracking list. Describe GOALS, not implementations. '
+                    'Use to plan and track progress through complex multi-step tasks. '
+                    'Max 20 items, only one in_progress at a time.'
+                ),
                 'input_schema': {
                     'type': 'object',
                     'properties': {
@@ -684,9 +680,28 @@ class MiniClaudeAgent:
                             'items': {
                                 'type': 'object',
                                 'properties': {
-                                    'content': {'type': 'string', 'description': 'Task description'},
-                                    'status': {'type': 'string', 'enum': ['pending', 'in_progress', 'completed'], 'description': 'Task status'},
-                                    'activeForm': {'type': 'string', 'description': 'Present continuous form shown during execution (e.g. "Fixing bug")'},
+                                    # 【核心修改 1】在 content 字段直接拦截 verify.py
+                                    'content': {
+                                        'type': 'string', 
+                                        'description': (
+                                            'Task goal. Prefer: "Verify refactor", "Check consistency". '
+                                            'AVOID: "Write verify.py", "Run test script" for simple tasks '
+                                            '(renames/cleanups). Only plan runtime tests for bugs/features.'
+                                        )
+                                    },
+                                    'status': {
+                                        'type': 'string', 
+                                        'enum': ['pending', 'in_progress', 'completed'], 
+                                        'description': 'Task status'
+                                    },
+                                    # 【核心修改 2】防止 activeForm 出现 "Writing verify.py"
+                                    'activeForm': {
+                                        'type': 'string', 
+                                        'description': (
+                                            'Present continuous form of the GOAL (e.g. "Verifying refactor", '
+                                            'NOT "Writing verify.py")'
+                                        )
+                                    },
                                 },
                                 'required': ['content', 'status', 'activeForm'],
                             },
