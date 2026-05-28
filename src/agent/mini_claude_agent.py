@@ -349,8 +349,8 @@ class MiniClaudeAgent:
         "      - New feature → FUNCTIONAL verification (run code)\n"
         "\n"
         "   B. Always start with static verification:\n"
-        "      - For rename/refactor: use `verify_symbol_rename` (AST-based,\n"
-        "        ignores comments/docstrings).  Fall back to `count_occurrences`\n"
+        "      - For rename/refactor: use `verify_symbol_rename` (scope=code_only by default,\n"
+        "        ignores docstrings/comments/string literals). Fall back to `count_occurrences`\n"
         "        if search needs to cover non-Python files.\n"
         "      - For structural correctness: use `syntax_check` after edits.\n"
         "      - For general pattern search: use `search_code`.\n"
@@ -371,9 +371,10 @@ class MiniClaudeAgent:
         "      - `syntax_check` passes for all modified files.\n"
         "      - No functional test script needed unless requested.\n"
         "   E. Stopping heuristic for low-risk static refactor:\n"
-        "      When verify_symbol_rename returns confidence=high and task_complete_likely=true,\n"
-        "      combined with syntax_check success, the refactor is structurally complete.\n"
-        "      Additional file searches or verify.py scripts are typically unnecessary.\n"
+        "      When verify_symbol_rename with scope=code_only returns confidence=high\n"
+        "      and task_complete_likely=true, the refactor is structurally complete —\n"
+        "      remaining matches in ignored_matches (docstrings/comments/strings) need\n"
+        "      no action. Combined with syntax_check success, stop here.\n"
         "      (This does NOT apply to bug fixes, feature work, or logic changes.)\n"
         "\n"
         "   Violation prevention: If you are about to write a script that exceeds 30 lines\n"
@@ -630,7 +631,7 @@ class MiniClaudeAgent:
             },
             {
                 'name': 'verify_symbol_rename',
-                'description': '验证符号重命名/重构是否结构性完成。使用 AST 进行语义分析，自动忽略注释、docstring、字符串字面量。同时执行语法验证。对于简单 rename 任务，优先使用此工具而非生成 verify.py。',
+                'description': '验证符号重命名/重构是否结构性完成。使用 AST 进行语义分析，支持 scope 参数（code_only 仅检查真实代码标识符，忽略 docstring/注释/字符串；all 检查全部）。同时执行语法验证。对于简单 rename 任务优先使用此工具而非生成 verify.py。',
                 'input_schema': {
                     'type': 'object',
                     'properties': {
@@ -648,6 +649,11 @@ class MiniClaudeAgent:
                             'type': 'array',
                             'items': {'type': 'string'},
                             'description': '要检查的 Python 文件或目录路径列表',
+                        },
+                        'scope': {
+                            'type': 'string',
+                            'enum': ['code_only', 'all'],
+                            'description': "验证范围: code_only（默认）忽略 docstring/注释/字符串字面量中的残留；all 将全部视作有意义残留",
                         },
                     },
                     'required': ['old_symbols', 'new_symbols', 'paths'],
@@ -847,10 +853,12 @@ class MiniClaudeAgent:
 
     def _handle_verify_symbol_rename(self, old_symbols: list,
                                       new_symbols: list,
-                                      paths: list) -> str:
+                                      paths: list,
+                                      scope: str = "code_only") -> str:
         """Handle verify_symbol_rename tool calls — delegate to BaseTools."""
         result = self.tools.verify_symbol_rename(
-            old_symbols=old_symbols, new_symbols=new_symbols, paths=paths,
+            old_symbols=old_symbols, new_symbols=new_symbols,
+            paths=paths, scope=scope,
         )
         return result.content
 

@@ -952,22 +952,24 @@ class BaseTools:
         old_symbols: List[str],
         new_symbols: List[str],
         paths: List[str],
+        scope: str = "code_only",
     ) -> ToolResult:
         """Verify whether a symbol rename is structurally complete.
 
-        Unlike ``count_occurrences`` (which also hits comments, docstrings
-        and string literals), this tool uses **AST analysis** to find only
-        real identifier usages.  Comments, docstrings, and string constants
-        are naturally ignored by the parser.
+        Uses AST analysis to find real identifier usages.
 
-        The tool also performs automatic syntax validation — a rename is
-        only reported as complete when all modified files parse cleanly.
+        When ``scope="code_only"`` (default), occurrences in docstrings,
+        comments, and string literals are reported separately as
+        ``ignored_matches`` — they do NOT affect the success verdict.
+
+        When ``scope="all"``, all occurrences (including non-code) are
+        treated as meaningful remaining identifiers.
 
         Args:
             old_symbols: Symbols that should no longer appear as identifiers.
-            new_symbols: Symbols expected to appear (informational / positive
-                         confirmation).
+            new_symbols: Symbols expected to appear (positive confirmation).
             paths:       Files or directories to inspect.
+            scope:       Verification scope — "code_only" (default) or "all".
 
         Returns:
             ToolResult with a structured JSON verdict.
@@ -978,6 +980,11 @@ class BaseTools:
             return ToolResult("错误: 需要至少提供一个旧符号 (old_symbols)", success=False)
         if not new_symbols:
             return ToolResult("错误: 需要至少提供一个新符号 (new_symbols)", success=False)
+        if scope not in ("code_only", "all"):
+            return ToolResult(
+                f"错误: scope 必须是 'code_only' 或 'all'，收到 '{scope}'",
+                success=False,
+            )
 
         try:
             search_files = self._expand_search_paths(paths)
@@ -992,6 +999,7 @@ class BaseTools:
         remaining: List[Dict[str, Any]] = []
         syntax_errors: List[Dict[str, Any]] = []
         new_counts: Dict[str, int] = {}
+        all_ignored: Dict[str, int] = {"docstring": 0, "comments": 0, "string_literal": 0}
 
         for file_path in py_files:
             try:
@@ -1032,43 +1040,154 @@ class BaseTools:
             for symbol, _lineno in new_finder.found:
                 new_counts[symbol] = new_counts.get(symbol, 0) + 1
 
-        # ── Build verdict ─────────────────────────────────────────
+            # ── Classify non-code matches (docstrings/comments/strings) ──
+            if scope == "code_only":
+                d, c, s = self._classify_non_code(source, tree, old_symbols)
+                all_ignored["docstring"] += d
+                all_ignored["comments"] += c
+                all_ignored["string_literal"] += s
+
+        # ── Build verdict (scope-aware) ──────────────────────────────
         if syntax_errors:
-            # Syntax errors take precedence
             result = {
                 "success": False,
-                "remaining_identifiers": [],
+                "meaningful_remaining": [],
                 "syntax_ok": False,
                 "message": "Syntax error(s) detected — rename cannot be validated.",
                 "errors": syntax_errors,
             }
             return ToolResult(json.dumps(result, indent=2, ensure_ascii=False), success=False)
 
-        if remaining:
+        if scope == "code_only":
+            # Non-code matches (docstrings/comments/strings) do NOT count
+            has_meaningful = bool(remaining)
+            if has_meaningful:
+                result = {
+                    "success": False,
+                    "confidence": "low",
+                    "task_complete_likely": False,
+                    "meaningful_remaining": remaining,
+                    "syntax_ok": True,
+                    "ignored_matches": all_ignored,
+                    "message": "Meaningful code identifiers still contain old symbols.",
+                }
+                return ToolResult(
+                    json.dumps(result, indent=2, ensure_ascii=False), success=False,
+                )
+
+            # Success: no meaningful code identifiers remain
+            ignored_detail = []
+            if all_ignored["docstring"]:
+                ignored_detail.append(f"docstrings ({all_ignored['docstring']})")
+            if all_ignored["comments"]:
+                ignored_detail.append(f"comments ({all_ignored['comments']})")
+            if all_ignored["string_literal"]:
+                ignored_detail.append(f"string literals ({all_ignored['string_literal']})")
+
+            msg = "Rename task structurally verified."
+            if ignored_detail:
+                msg += (f" Remaining occurrences are only in "
+                        f"{'; '.join(ignored_detail)}. No action needed.")
+            msg += " Additional verification is likely unnecessary for this low-risk refactor task."
+
+            new_info = (
+                f" New symbols appear in {sum(new_counts.values())} location(s)."
+                if new_counts else ""
+            )
+            result = {
+                "success": True,
+                "confidence": "high",
+                "task_complete_likely": True,
+                "meaningful_remaining": [],
+                "syntax_ok": True,
+                "ignored_matches": all_ignored,
+                "message": msg + new_info,
+            }
+            return ToolResult(
+                json.dumps(result, indent=2, ensure_ascii=False), success=True,
+            )
+
+        # scope == "all": all occurrences count (code + non-code)
+        has_any = bool(remaining) or any(all_ignored.values())
+        if has_any:
             result = {
                 "success": False,
-                "remaining_identifiers": remaining,
+                "meaningful_remaining": remaining,
                 "syntax_ok": True,
+                "ignored_matches": all_ignored,
                 "message": "Remaining identifier usages detected.",
             }
-            return ToolResult(json.dumps(result, indent=2, ensure_ascii=False), success=False)
+            return ToolResult(
+                json.dumps(result, indent=2, ensure_ascii=False), success=False,
+            )
 
-        # ── Success (enhanced completion signal) ─────────────────
         new_info = (
             f" New symbols appear in {sum(new_counts.values())} location(s)."
-            if new_counts
-            else ""
+            if new_counts else ""
         )
         result = {
             "success": True,
             "confidence": "high",
             "task_complete_likely": True,
-            "remaining_identifiers": [],
+            "meaningful_remaining": [],
             "syntax_ok": True,
-            "message": (
-                f"Rename task structurally verified. "
-                f"Additional verification is likely unnecessary "
-                f"for this low-risk refactor task.{new_info}"
-            ),
+            "ignored_matches": all_ignored,
+            "message": f"Rename task structurally verified.{new_info}",
         }
-        return ToolResult(json.dumps(result, indent=2, ensure_ascii=False), success=True)
+        return ToolResult(
+            json.dumps(result, indent=2, ensure_ascii=False), success=True,
+        )
+
+    @staticmethod
+    def _classify_non_code(source: str, tree, old_symbols):
+        """Classify old symbol occurrences in docstrings, comments, and string literals.
+
+        Returns:
+            Tuple of (docstring_count, comment_count, string_literal_count).
+        """
+        import tokenize, io
+
+        # ── Identify docstring AST nodes ─────────────────────────
+        docstring_nodes = set()
+        for node in ast.walk(tree):
+            if isinstance(node, (ast.FunctionDef, ast.AsyncFunctionDef,
+                                 ast.ClassDef, ast.Module)):
+                if (node.body
+                    and isinstance(node.body[0], ast.Expr)
+                    and isinstance(node.body[0].value, ast.Constant)
+                    and isinstance(node.body[0].value.value, str)):
+                    docstring_nodes.add(node.body[0].value)
+
+        # ── Count in docstrings ──────────────────────────────────
+        doc_count = 0
+        for ds_node in docstring_nodes:
+            for sym in old_symbols:
+                doc_count += ds_node.value.count(sym)
+
+        # ── Count in string literals (non-docstring) ─────────────
+        str_count = 0
+        for node in ast.walk(tree):
+            if isinstance(node, ast.Constant) and isinstance(node.value, str):
+                if node not in docstring_nodes:
+                    for sym in old_symbols:
+                        str_count += node.value.count(sym)
+            elif isinstance(node, ast.JoinedStr):
+                for vn in node.values:
+                    if (isinstance(vn, ast.Constant)
+                        and isinstance(vn.value, str)
+                        and vn not in docstring_nodes):
+                        for sym in old_symbols:
+                            str_count += vn.value.count(sym)
+
+        # ── Count in comments (via tokenize) ────────────────────
+        com_count = 0
+        try:
+            tokens = tokenize.generate_tokens(io.StringIO(source).readline)
+            for token in tokens:
+                if token.type == tokenize.COMMENT:
+                    for sym in old_symbols:
+                        com_count += token.string.count(sym)
+        except Exception:
+            pass
+
+        return doc_count, com_count, str_count
