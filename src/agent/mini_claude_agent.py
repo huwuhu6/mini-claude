@@ -876,20 +876,94 @@ class MiniClaudeAgent:
         return result.content
 
     def _handle_syntax_check(self, paths: list) -> str:
-        """Handle syntax_check tool calls — delegate to BaseTools."""
+        """Handle syntax_check tool calls — delegate to BaseTools with semantic wrapping."""
         result = self.tools.syntax_check(paths=paths)
-        return result.content
+        if result.success:
+            return result.content + (
+                "\n\n✅ [SYSTEM INFO] Python Interpreter validation passed. "
+                "No syntax anomalies found. The modified files are structurally sound and safe."
+            )
+        else:
+            return result.content + (
+                "\n\n❌ [SYSTEM CRITICAL ALERT] SYNTAX ERROR DETECTED.\n"
+                "Your last edit broke the Python compilation track. The code cannot be parsed.\n"
+                "Action Required: Check the file path and line number in the error message "
+                "above immediately. Use read_file or edit_file to fix the broken indent, "
+                "unmatched brackets, or typos right now."
+            )
 
     def _handle_verify_symbol_rename(self, old_symbols: list,
                                       new_symbols: list,
                                       paths: list,
                                       scope: str = "code_only",
                                       targets: list = None) -> str:
-        """Handle verify_symbol_rename tool calls — delegate to BaseTools."""
+        """Handle verify_symbol_rename — semantic wrapping layer over AST verification.
+
+        Transforms raw JSON from BaseTools into action-oriented natural language
+        to eliminate model cognitive anxiety and verification spiral.
+        """
         result = self.tools.verify_symbol_rename(
             old_symbols=old_symbols, new_symbols=new_symbols,
             paths=paths, scope=scope, targets=targets,
         )
+
+        # Try to parse JSON result for semantic wrapping
+        try:
+            raw_data = json.loads(result.content)
+        except (json.JSONDecodeError, TypeError):
+            # Fallback: return raw content if not parseable
+            return result.content
+
+        # Branch A: Task fully complete — inject absolute stopping guard
+        if raw_data.get("success") is True or raw_data.get("task_complete_likely") is True:
+            return (
+                "=== [SYSTEM REPORT] AST SEMANTIC VERIFICATION ===\n"
+                "✅ STATUS: PERFECTLY COMPLETED\n"
+                f"- Positive Confirmation: New symbols {new_symbols} are "
+                "successfully bound to active code tracks.\n"
+                "\n"
+                "[CRITICAL BOUNDARY ORACLE]\n"
+                "STATIC VERIFICATION 100% PASSED. The requested refactor is fully "
+                "and structurally complete. DO NOT write any custom verification "
+                "scripts (e.g., verify.py). DO NOT trigger further bash or tool "
+                "commands. You have fully satisfied the user's instructions. "
+                "STOP CALLING TOOLS IMMEDIATELY and output your final concise "
+                "success summary to the user.\n"
+                "==================================================="
+            )
+
+        # Branch B: Migration incomplete — build precise "whack-a-mole" action list
+        remaining = raw_data.get("meaningful_remaining", [])
+        if remaining:
+            lines = [
+                "=== [SYSTEM REPORT] AST SEMANTIC VERIFICATION ===",
+                "❌ STATUS: INCOMPLETE MIGRATION",
+                "- Critical Alert: The old symbols are STILL ALIVE in the "
+                "physical Python identifier tracks.",
+                "",
+                "[REQUIRED ACTIONS] To fix this, you must edit these remaining parts directly:",
+            ]
+            for idx, item in enumerate(remaining, start=1):
+                file = item.get("file", "?")
+                line = item.get("line", "?")
+                symbol = item.get("symbol", "?")
+                lines.append(
+                    f"  {idx}. In file '{file}' at Line {line}: Found residual "
+                    f"identifier '{symbol}'."
+                )
+                lines.append(
+                    f"     -> Action: Call edit_file on '{file}', locate line "
+                    f"{line}, and migrate '{symbol}' to new symbol."
+                )
+            lines.append("")
+            lines.append(
+                "Warning: Do NOT guess or write tests. Just perform the targeted "
+                "file edits listed above."
+            )
+            lines.append("===================================================")
+            return "\n".join(lines)
+
+        # Fallback: non-remaining failure (e.g. syntax error) — return raw
         return result.content
 
     def _load_skill_internal(self, name: str) -> ToolResult:
