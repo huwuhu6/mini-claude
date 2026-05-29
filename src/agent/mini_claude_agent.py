@@ -1020,26 +1020,6 @@ class MiniClaudeAgent:
                 pass
         return False
 
-    def _microcompact(self) -> bool:
-        """Lightweight compression: clear old tool result content (s_full.py s06).
-
-        Returns:
-            True if any tool result was actually cleared.
-        """
-        tool_result_indices = []
-        for i, msg in enumerate(self.messages):
-            if msg.role == 'tool':
-                tool_result_indices.append(i)
-        # Keep last 3 tool results, clear content of older ones
-        if len(tool_result_indices) > 3:
-            cleared = False
-            for idx in tool_result_indices[:-3]:
-                if len(self.messages[idx].content) > 100:
-                    self.messages[idx].content = "[已清除]"
-                    cleared = True
-            return cleared
-        return False
-
     def _check_auto_compress(self) -> bool:
         """Auto-compress if token threshold exceeded.
 
@@ -1131,8 +1111,6 @@ class MiniClaudeAgent:
                 self.trace.start_turn(iteration)
                 # ── Pre-LLM: compression pipeline (s_full.py s06) ──
                 # (safe inside the loop — only modifies existing messages)
-                if self._microcompact():
-                    self.trace.record_compression()
                 if self._check_auto_compress():
                     self.trace.record_compression()
 

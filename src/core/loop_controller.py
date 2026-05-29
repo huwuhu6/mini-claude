@@ -108,6 +108,14 @@ class CommandNormalizer:
         if not isinstance(args, dict):
             return tool_name
 
+        # ── TodoWrite: hash items content so status changes produce different keys ──
+        if tool_name == "TodoWrite":
+            items = args.get("items", [])
+            # Sort by content to ignore item reordering
+            sorted_items = sorted(items, key=lambda x: json.dumps(x, sort_keys=True))
+            h = hashlib.md5(json.dumps(sorted_items, sort_keys=True).encode()).hexdigest()[:8]
+            return f"state:{h}"
+
         target = cls._extract_base_path(args)
 
         # Tool-specific disambiguation

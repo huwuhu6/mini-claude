@@ -113,30 +113,82 @@ class Compressor:
 
     def microcompact(self, messages: List[Message]) -> List[Message]:
         """
-        Lightweight compression: remove redundant system messages,
-        merge consecutive assistant messages, trim old context.
+        基于"存根替换（Stubbing）"的微压缩：保留所有消息节点和 tool_call_id，
+        仅替换 ``content`` 为精简存根以释放 Token。
+
+        三层淘汰（Tiered Eviction）：
+          Tier 1（重型输出）—— 截断 bash/search_code/count_occurrences 的长内容
+          状态折叠（State Folding）—— 只保留最新一条 TodoWrite 的完整内容
+          Tier 3（核心资产）—— 对过长的 read_file/edit_file 保留首尾各 500 字符
         """
         if len(messages) < 10:
             return messages
 
-        compacted = messages[:2]  # Keep system + first user message
+        # 保护前 2 条（system + 首条 user）和最近的 6 条消息
+        protect_start = max(len(messages) - 6, 2)
 
-        # Remove redundant or very old tool result messages
-        skip_tool_results = 0
-        for msg in messages[2:]:
-            if msg.role in ('tool', 'tool_result') and len(msg.content) > 100:
-                skip_tool_results += 1
-                if skip_tool_results > 5:  # Keep first 5, skip rest
-                    continue
-            compacted.append(msg)
+        # 收集 TodoWrite 工具消息的索引（用于状态折叠）
+        todo_indices: List[int] = []
 
-        # If still too many, keep last N messages
-        if len(compacted) > 50:
-            compacted = compacted[:3] + compacted[-47:]
+        for i, msg in enumerate(messages):
+            if i < 2 or i >= protect_start:
+                continue
+            if msg.role != 'tool':
+                continue
 
-        # Clean up orphaned tool chains, then sanitize for absolute closure
-        cleaned = self._clean_tool_chains(compacted)
-        return self.sanitize_openai_messages(cleaned)
+            tool_name = self._infer_tool_name(messages, i)
+
+            # ── Tier 1：重型标准输出工具 ──
+            if tool_name in ('bash', 'search_code', 'count_occurrences'):
+                if len(msg.content) > 300:
+                    msg.content = (
+                        "[System: Command output truncated to save context window. "
+                        "Execution was recorded as successful.]"
+                    )
+                continue
+
+            # ── 状态折叠：TodoWrite 只保留时间线上最后一次 ──
+            if tool_name == 'TodoWrite':
+                todo_indices.append(i)
+                continue
+
+            # ── Tier 3：核心资产（read_file / edit_file） ──
+            if tool_name in ('read_file', 'edit_file') and len(msg.content) > 5000:
+                head = msg.content[:500]
+                tail = msg.content[-500:]
+                msg.content = (
+                    f"{head}\n...\n"
+                    "[System: Middle content omitted during micro-compaction]\n"
+                    f"...\n{tail}"
+                )
+                continue
+
+        # 折叠状态：之前所有旧 TodoWrite 替换为存根
+        for idx in todo_indices[:-1]:
+            messages[idx].content = "[System: State superseded by newer TodoWrite.]"
+
+        return messages
+
+    @staticmethod
+    def _infer_tool_name(messages: List[Message], tool_idx: int) -> str:
+        """
+        通过匹配 ``tool_call_id`` 与前一条 ``assistant`` 消息的 ``tool_calls``，
+        推断指定 ``tool`` 消息是由哪个工具产生的。
+        """
+        tool_msg = messages[tool_idx]
+        if not tool_msg.tool_call_id:
+            return ""
+        for i in range(tool_idx - 1, -1, -1):
+            msg = messages[i]
+            if msg.role == 'assistant' and msg.tool_calls:
+                for tc in msg.tool_calls:
+                    if not isinstance(tc, dict):
+                        continue
+                    if tc.get('id', '') == tool_msg.tool_call_id:
+                        fn = tc.get('function', {})
+                        if isinstance(fn, dict):
+                            return fn.get('name', '')
+        return ""
 
     def compress(self, messages: List[Message]) -> List[Message]:
         """
@@ -150,9 +202,9 @@ class Compressor:
         token_estimate = self.estimate_tokens(messages)
         message_count = len(messages)
 
-        # Keep first 2 (system + intro) and last 10 messages
+        # Keep first 2 (system + intro) and last 15 messages
         head = messages[:2]
-        tail = list(messages[-10:])
+        tail = list(messages[-15:])
 
         # Extend tail to include any tool messages that belong to a
         # tool_calls assistant message at the start of the tail window.
@@ -161,7 +213,7 @@ class Compressor:
         for i, msg in enumerate(tail):
             if msg.role == 'assistant' and msg.tool_calls:
                 tool_call_ids = {tc.get('id', '') for tc in msg.tool_calls}
-                idx = len(messages) - 10 + i + 1
+                idx = len(messages) - 15 + i + 1
                 while idx < len(messages) and messages[idx].role == 'tool':
                     if messages[idx].tool_call_id in tool_call_ids and id(messages[idx]) not in tail_set:
                         tail.append(messages[idx])
@@ -170,7 +222,7 @@ class Compressor:
                 break
 
         # Summarize the middle
-        middle = messages[2:-10]
+        middle = messages[2:-15]
         summary = self._generate_summary(middle)
 
         # Create a compressed transcript record
@@ -305,12 +357,9 @@ class Compressor:
     # ── Summarization ──────────────────────────────────────────
 
     def _generate_summary(self, messages: List[Message]) -> str:
-        """Generate a summary of the given messages.
+        """Generate a high-level summary preserving only what's needed for continuity.
 
-        When a provider is available, delegates to the LLM for a
-        high-fidelity continuity summary that preserves names, tokens,
-        secrets, and key decisions.  Falls back to a lightweight
-        statistical summary on failure.
+        Delegates to an LLM when available; falls back to statistical summary.
         """
         # ── Primary: LLM-powered summary ──────────────────────
         if self._provider:
@@ -323,7 +372,7 @@ class Compressor:
         return self._statistical_summary(messages)
 
     def _llm_summarize(self, messages: List[Message]) -> str:
-        """Call the LLM to produce a continuity-preserving summary.
+        """Call the LLM to produce a high-level intent summary.
 
         The summarization request is intentionally small (max 600 output
         tokens, no tools) so it cannot trigger recursive compression or
@@ -345,12 +394,11 @@ class Compressor:
             Message(
                 role="user",
                 content=(
-                    "Summarize the following conversation history for continuity. "
-                    "Keep ALL specific details: names, IDs, tokens, secrets, "
-                    "commands, file paths, code snippets, numbers, and key "
-                    "decisions. Preserve exact values that appeared in the "
-                    "conversation. Write the summary in the same language as "
-                    "the conversation.\n\n"
+                    "Summarize the high-level intent and current progress of "
+                    "this conversation. Do not attempt to summarize code blocks, "
+                    "file contents, or exact IDs. Focus entirely on what has been "
+                    "accomplished so far and what the immediate next blocked step "
+                    "is. Keep it concise.\n\n"
                     f"{conv_text}"
                 ),
             )

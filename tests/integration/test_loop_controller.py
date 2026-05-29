@@ -167,6 +167,60 @@ def test_verify_symbol_rename_order():
     assert intent_a.to_key() == intent_b.to_key()
 
 
+# ── TodoWrite state tests ────────────────────────────────────────────
+
+def test_todo_write_different_items():
+    """TodoWrite with different items → different intent keys."""
+    intent_a = CommandNormalizer.normalize(
+        "TodoWrite",
+        {"items": [{"content": "task1", "status": "in_progress"}]},
+    )
+    intent_b = CommandNormalizer.normalize(
+        "TodoWrite",
+        {"items": [{"content": "task1", "status": "completed"}]},
+    )
+    assert intent_a.to_key() != intent_b.to_key()
+    assert intent_a.target.startswith("state:")
+
+
+def test_todo_write_same_items():
+    """TodoWrite with same items → identical intent key."""
+    intent_a = CommandNormalizer.normalize(
+        "TodoWrite",
+        {"items": [{"content": "task1", "status": "in_progress"}]},
+    )
+    intent_b = CommandNormalizer.normalize(
+        "TodoWrite",
+        {"items": [{"content": "task1", "status": "in_progress"}]},
+    )
+    assert intent_a.to_key() == intent_b.to_key()
+
+
+def test_todo_write_items_order():
+    """TodoWrite same items in different order → identical intent key."""
+    intent_a = CommandNormalizer.normalize(
+        "TodoWrite",
+        {"items": [
+            {"content": "task1", "status": "in_progress"},
+            {"content": "task2", "status": "pending"},
+        ]},
+    )
+    intent_b = CommandNormalizer.normalize(
+        "TodoWrite",
+        {"items": [
+            {"content": "task2", "status": "pending"},
+            {"content": "task1", "status": "in_progress"},
+        ]},
+    )
+    assert intent_a.to_key() == intent_b.to_key()
+
+
+def test_todo_write_empty_items():
+    """TodoWrite with empty items list."""
+    intent = CommandNormalizer.normalize("TodoWrite", {"items": []})
+    assert intent.target.startswith("state:")
+
+
 # ── syntax_check (uses paths hash, no extra suffix) ───────────────────
 
 def test_syntax_check_paths_hash():
