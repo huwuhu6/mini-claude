@@ -858,8 +858,15 @@ class MiniClaudeAgent:
         )
 
     def _handle_todo_write(self, items: list) -> str:
-        """Update the in-memory todo list and return its rendered state."""
-        return self.todo.update(items)
+        """Update the in-memory todo list silently and return a static stub.
+
+        The rendered todo state is intentionally discarded — it is a
+        highly dynamic payload that would shatter prefix-cache affinity
+        if persisted as a tool message.  Use ``_get_dynamic_hot_context``
+        to inject current todo status as temporary hot context instead.
+        """
+        self.todo.update(items)
+        return "Todo state successfully updated in the system background."
 
     def _handle_search_code(self, paths: list, patterns: list,
                              context_lines: int = 0,
