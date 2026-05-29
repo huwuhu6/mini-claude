@@ -311,7 +311,15 @@ class MiniClaudeAgent:
                 logger.info("正在无提供者模式下运行（功能受限）")
 
     def _load_system_prompt(self):
-        """Load or generate the system prompt."""
+        """Load or generate the system prompt.
+
+        Ordering (cold-zone first → warm guidance later):
+          1. Identity, features, workdir
+          2. CRITICAL RULES (promoted — right after identity for cache stability)
+          3. VERIFICATION STRATEGY
+          4. Skills description (after rules — not before, to avoid lost-in-the-middle)
+          5. TodoWrite soft constraint (replaces the old mandatory punch-clock)
+        """
         features = self.feature_manager.get_enabled_features()
         skills_text = ""
         if self.feature_manager.is_enabled('skills') and hasattr(self, 'skill_loader'):
@@ -319,13 +327,14 @@ class MiniClaudeAgent:
             if desc:
                 skills_text = f"\nAvailable skill modules (use load_skill to access):\n{desc}"
         self.system_prompt = (
+        # ── Layer 1: Identity ──────────────────────────────────
         f"You are {self.config.agent.name} v{self.config.agent.version}, "
         f"an AI assistant with tools and team capabilities.\n"
         f"Enabled features: {', '.join(features) if features else 'base'}.\n"
-        f"Working directory: {self.workdir}"
-        f"{skills_text}\n"
+        f"Working directory: {self.workdir}\n"
         "You can use tools to read/write files, run commands, and manage tasks.\n"
         "\n"
+        # ── Layer 2: Critical rules (promoted — before skills) ─
         "CRITICAL RULES FOR WINDOWS ENVIRONMENT:\n"
         "1. NO INLINE SCRIPTS: Never use `python -c \"...\"` or `node -e \"...\"` "
         "in the bash tool. Windows CMD cannot handle nested quotes and newlines properly.\n"
@@ -340,13 +349,7 @@ class MiniClaudeAgent:
         "in code or files, always use the `search_code` tool. Do NOT call grep, "
         "findstr, or Select-String via the bash tool for file content searching.\n"
         "\n"
-        "TASK TRACKING WITH TodoWrite:\n"
-        "- For any multi‑step task, update your plan via `TodoWrite` BEFORE taking action.\n"
-        "- Every entry must describe the GOAL (e.g., \"Rename parameter X to Y in all files\", "
-        "\"Confirm no remaining old symbols\"). Never describe the tool or method.\n"
-        "- Mark the current step as `in_progress`, update it to `completed` when done, "
-        "and move to the next.\n"
-        "\n"
+        # ── Layer 3: Verification strategy ─────────────────────
         "VERIFICATION STRATEGY (MUST FOLLOW):\n"
         "\n"
         "1. CATEGORIZE THE TASK:\n"
@@ -371,6 +374,15 @@ class MiniClaudeAgent:
         "(or `count_occurrences` returns 0 for removed patterns).\n"
         "   - `syntax_check` reports no errors.\n"
         "   - No further steps required.\n"
+        "\n"
+        # ── Layer 4: Skills (after critical rules) ─────────────
+        f"{skills_text}"
+        "\n"
+        # ── Layer 5: TodoWrite soft constraint ─────────────────
+        "TASK TRACKING WITH TodoWrite:\n"
+        "Use `TodoWrite` ONLY for high-level planning of complex, multi-step tasks. "
+        "For simple structural refactors, file edits, or localized fixes, execute "
+        "the tool directly. Do not meticulously punch-clock every minor action.\n"
     )
 
     def _register_commands(self):
@@ -1037,35 +1049,81 @@ class MiniClaudeAgent:
                 return True
         return False
 
-    def _drain_background_notifications(self):
-        """Drain background task notifications and inject into messages."""
-        if not self.feature_manager.is_enabled('background'):
-            return
-        notifs = self.background.check_notifications()
-        if notifs:
-            lines = []
-            for tid in notifs:
-                task = self.background.get(tid)
-                if task:
-                    lines.append(f"[bg:{tid}] {task.status.value}: {task.result or task.error}")
-            if lines:
-                text = "\n".join(lines)
-                self.messages.append(Message(
-                    role='user',
-                    content=f"<background-results>\n{text}\n</background-results>"
-                ))
+    def _drain_background_notifications(self) -> Optional[str]:
+        """Drain background task notifications and return as formatted string.
 
-    def _check_inbox(self):
-        """Check lead inbox for messages from teammates."""
+        Returns:
+            Formatted notification text, or None if nothing to report.
+        """
+        if not self.feature_manager.is_enabled('background'):
+            return None
+        notifs = self.background.check_notifications()
+        if not notifs:
+            return None
+        lines = []
+        for tid in notifs:
+            task = self.background.get(tid)
+            if task:
+                lines.append(f"[bg:{tid}] {task.status.value}: {task.result or task.error}")
+        if not lines:
+            return None
+        return "\n".join(lines)
+
+    def _check_inbox(self) -> Optional[str]:
+        """Check lead inbox for messages from teammates.
+
+        Returns:
+            Formatted inbox text, or None if inbox is empty.
+        """
         inbox = self.message_bus.read_inbox(self.config.agent.name)
-        if inbox:
-            import json as _json
-            text = _json.dumps([{'from': m.sender, 'type': m.msg_type.value, 'content': m.content[:200]}
-                               for m in inbox], indent=2, ensure_ascii=False)
-            self.messages.append(Message(
-                role='user',
-                content=f"<inbox>{text}</inbox>"
-            ))
+        if not inbox:
+            return None
+        import json as _json
+        text = _json.dumps([{'from': m.sender, 'type': m.msg_type.value, 'content': m.content[:200]}
+                           for m in inbox], indent=2, ensure_ascii=False)
+        return text
+
+    def _get_dynamic_hot_context(self,
+                                  rounds_without_todo: int = 0) -> str:
+        """Aggregate all transient dynamic state into one hot-context block.
+
+        This data is injected temporarily before each LLM call and must
+        NEVER be appended to ``self.messages``, protecting prefix-cache
+        stability and message-history immutability.
+
+        Sources:
+          - Incomplete todo items (from in-memory TodoManager)
+          - Background task notifications
+          - Teammate inbox messages
+          - Nag reminder when todos are stale (``rounds_without_todo >= 3``)
+
+        Returns:
+            Empty string if nothing dynamic; otherwise an XML-wrapped block.
+        """
+        parts = []
+
+        # 1. Todo status snapshot
+        if self.todo.has_open_items():
+            todo_text = self.todo.render()
+            parts.append(f"<todo-status>\n{todo_text}\n</todo-status>")
+
+        # 2. Background notifications
+        bg_text = self._drain_background_notifications()
+        if bg_text:
+            parts.append(f"<background-results>\n{bg_text}\n</background-results>")
+
+        # 3. Inbox
+        inbox_text = self._check_inbox()
+        if inbox_text:
+            parts.append(f"<inbox>\n{inbox_text}\n</inbox>")
+
+        # 4. Nag reminder (soft prompt, not persisted)
+        if self.todo.has_open_items() and rounds_without_todo >= 3:
+            parts.append("<nag>Consider updating your todos.</nag>")
+
+        if not parts:
+            return ""
+        return "<dynamic_context>\n" + "\n".join(parts) + "\n</dynamic_context>"
 
     # ── Core LLM + Tool Cycle ──────────────────────────────────────
 
@@ -1081,13 +1139,6 @@ class MiniClaudeAgent:
 
         tools = self._get_llm_tools()
         tool_defs = [ProviderToolDef(**t) for t in tools]
-
-        # ── Pre-loop: drain background notifications and inbox ──
-        # (must run before the tool loop, not inside it, because Deepseek
-        #  requires tool messages to immediately follow the tool_calls
-        #  assistant message without intervening user messages)
-        self._drain_background_notifications()
-        self._check_inbox()
 
         # ── Reset benchmark metrics ──
         self.last_metrics = {"turns": 0, "total_tokens": 0, "api_errors": 0}
@@ -1125,9 +1176,31 @@ class MiniClaudeAgent:
                 # ── Update trace with current message count ──
                 self.trace.set_message_count(len(self.messages))
 
+                # ── Build message list with hot context injected ──
+                # Hot context (todos, notifications, inbox) is assembled as a
+                # temporary injection — NEVER appended to self.messages — so
+                # the persisted history stays clean and prefix-cache-friendly.
+                hot_text = self._get_dynamic_hot_context(
+                    rounds_without_todo=rounds_without_todo,
+                )
+                if hot_text:
+                    msgs_for_llm = list(self.messages)  # shallow copy
+                    if msgs_for_llm and msgs_for_llm[-1].role == 'user':
+                        last = msgs_for_llm[-1]
+                        msgs_for_llm[-1] = Message(
+                            role='user',
+                            content=last.content + "\n\n" + hot_text,
+                        )
+                    else:
+                        msgs_for_llm.append(
+                            Message(role='user', content=hot_text)
+                        )
+                else:
+                    msgs_for_llm = self.messages
+
                 # ── LLM call with system prompt ──
                 response = provider.create_message(
-                    self.messages,
+                    msgs_for_llm,
                     tool_defs,
                     system=self.system_prompt,
                     max_tokens=self.config.llm.max_tokens,
@@ -1289,13 +1362,8 @@ class MiniClaudeAgent:
                         tool_call_id=tc.get('id', ''),
                     ))
 
-                # ── Nag reminder (s_full.py s03) ──────────────
+                # ── Nag tracking (s_full.py s03 — hot-injected via _get_dynamic_hot_context) ──
                 rounds_without_todo = 0 if used_todo else rounds_without_todo + 1
-                if self.todo.has_open_items() and rounds_without_todo >= 3:
-                    self.messages.append(Message(
-                        role='user',
-                        content='<reminder>Update your todos.</reminder>',
-                    ))
 
             except Exception as e:
                 self.last_metrics["api_errors"] += 1
