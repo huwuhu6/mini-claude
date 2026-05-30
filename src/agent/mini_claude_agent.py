@@ -311,7 +311,7 @@ class MiniClaudeAgent:
                 logger.info("正在无提供者模式下运行（功能受限）")
 
     def _load_system_prompt(self):
-        """Load or generate the system prompt.
+        """Load or generate the system prompt.v
 
         Ordering (cold-zone first → warm guidance later):
           1. Identity, features, workdir
@@ -349,7 +349,12 @@ class MiniClaudeAgent:
         "in code or files, always use the `search_code` tool. Do NOT call grep, "
         "findstr, or Select-String via the bash tool for file content searching.\n"
         "\n"
-        # ── Layer 3: Verification strategy ─────────────────────
+        # ── Layer 3: Planning rule ───────────────────────────────
+        "PLANNING RULE:"
+        " Do not assume runtime testing is required."
+        "For structural refactors (rename, import updates, signature changes, API migration, code cleanup), plan only the edits and the minimal static verification required."
+        "Do not include verify.py, test scripts, runtime execution, or integration testing in the initial plan unless the task explicitly requires behavioral validation."
+        # ── Layer 4: Verification strategy ─────────────────────
         "VERIFICATION STRATEGY (MUST FOLLOW):\n"
         "\n"
         "1. CATEGORIZE THE TASK:\n"
@@ -384,10 +389,10 @@ class MiniClaudeAgent:
         "changes, algorithmic implementations, or specific bug fixes that cannot "
         "be proven statically.\n"
         "\n"
-        # ── Layer 4: Skills (after critical rules) ─────────────
+        # ── Layer 5: Skills (after critical rules) ─────────────
         f"{skills_text}"
         "\n"
-        # ── Layer 5: TodoWrite soft constraint ─────────────────
+        # ── Layer 6: TodoWrite soft constraint ─────────────────
         "TASK TRACKING WITH TodoWrite:\n"
         "Use `TodoWrite` ONLY for high-level planning of complex, multi-step tasks. "
         "For simple structural refactors, file edits, or localized fixes, execute "
@@ -685,53 +690,53 @@ class MiniClaudeAgent:
                     'required': ['old_symbols', 'new_symbols', 'paths'],
                 },
             },
-            {
-                'name': 'TodoWrite',
-                # 外层 description 保持精简，定下“目标导向”的基调
-                'description': (
-                    'Update the task tracking list. Describe GOALS, not implementations. '
-                    'Use to plan and track progress through complex multi-step tasks. '
-                    'Max 20 items, only one in_progress at a time.'
-                ),
-                'input_schema': {
-                    'type': 'object',
-                    'properties': {
-                        'items': {
-                            'type': 'array',
-                            'items': {
-                                'type': 'object',
-                                'properties': {
-                                    # 【核心修改 1】在 content 字段直接拦截 verify.py
-                                    'content': {
-                                        'type': 'string', 
-                                        'description': (
-                                            'Task goal. Prefer: "Verify refactor", "Check consistency". '
-                                            'AVOID: "Write verify.py", "Run test script" for simple tasks '
-                                            '(renames/cleanups). Only plan runtime tests for bugs/features.'
-                                        )
-                                    },
-                                    'status': {
-                                        'type': 'string', 
-                                        'enum': ['pending', 'in_progress', 'completed'], 
-                                        'description': 'Task status'
-                                    },
-                                    # 【核心修改 2】防止 activeForm 出现 "Writing verify.py"
-                                    'activeForm': {
-                                        'type': 'string', 
-                                        'description': (
-                                            'Present continuous form of the GOAL (e.g. "Verifying refactor", '
-                                            'NOT "Writing verify.py")'
-                                        )
-                                    },
-                                },
-                                'required': ['content', 'status', 'activeForm'],
-                            },
-                            'description': 'List of todo items',
-                        },
-                    },
-                    'required': ['items'],
-                },
-            },
+            # {
+            #     'name': 'TodoWrite',
+            #     # 外层 description 保持精简，定下“目标导向”的基调
+            #     'description': (
+            #         'Update the task tracking list. Describe GOALS, not implementations. '
+            #         'Use to plan and track progress through complex multi-step tasks. '
+            #         'Max 20 items, only one in_progress at a time.'
+            #     ),
+            #     'input_schema': {
+            #         'type': 'object',
+            #         'properties': {
+            #             'items': {
+            #                 'type': 'array',
+            #                 'items': {
+            #                     'type': 'object',
+            #                     'properties': {
+            #                         # 【核心修改 1】在 content 字段直接拦截 verify.py
+            #                         'content': {
+            #                             'type': 'string', 
+            #                             'description': (
+            #                                 'Task goal. Prefer: "Verify refactor", "Check consistency". '
+            #                                 'AVOID: "Write verify.py", "Run test script" for simple tasks '
+            #                                 '(renames/cleanups). Only plan runtime tests for bugs/features.'
+            #                             )
+            #                         },
+            #                         'status': {
+            #                             'type': 'string', 
+            #                             'enum': ['pending', 'in_progress', 'completed'], 
+            #                             'description': 'Task status'
+            #                         },
+            #                         # 【核心修改 2】防止 activeForm 出现 "Writing verify.py"
+            #                         'activeForm': {
+            #                             'type': 'string', 
+            #                             'description': (
+            #                                 'Present continuous form of the GOAL (e.g. "Verifying refactor", '
+            #                                 'NOT "Writing verify.py")'
+            #                             )
+            #                         },
+            #                     },
+            #                     'required': ['content', 'status', 'activeForm'],
+            #                 },
+            #                 'description': 'List of todo items',
+            #             },
+            #         },
+            #         'required': ['items'],
+            #     },
+            # },
         ]
 
         return self.feature_manager.filter_tools(all_tools)
