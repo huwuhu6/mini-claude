@@ -422,6 +422,23 @@ class BaseTools:
                         success=False,
                     )
 
+                # ── 载荷大小硬熔断 (Payload Size Circuit Breaker) ──
+                if len(search) > 1500 or len(replace) > 2000:
+                    logger.warning(
+                        f"[Harness 拦截] edit_file 载荷过大: "
+                        f"search={len(search)}, replace={len(replace)}"
+                    )
+                    return ToolResult(
+                        f"【系统安全拦截】第 {i+1} 处修改失败。\n"
+                        f"你的 'search' 块 ({len(search)} 字符) 或 "
+                        f"'replace' 块 ({len(replace)} 字符) 严重超标！\n"
+                        f"系统允许修改完整的函数块，但绝对禁止复制长篇幅的"
+                        f"类或无关上下文。当前事务已回滚，请将修改提炼到"
+                        f"核心函数范围内（建议 20 行以内）后重新调用 "
+                        f"edit_file。",
+                        success=False,
+                    )
+
                 # ── Level 1: strict exact match ──────────────────────
                 if search in working_content:
                     working_content = working_content.replace(search, replace, 1)

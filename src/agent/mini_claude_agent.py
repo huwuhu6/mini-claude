@@ -375,6 +375,15 @@ class MiniClaudeAgent:
         "   - `syntax_check` reports no errors.\n"
         "   - No further steps required.\n"
         "\n"
+        "5. NO GHOST SCRIPTS FOR PURELY STATIC TASKS: If your task is purely "
+        "structural (e.g., renaming variables, modifying parameters) and your "
+        "static verification tools (`syntax_check`, `verify_symbol_rename`) "
+        "report success, you MUST STOP and declare SUCCESS. Do NOT write custom "
+        "runtime test scripts (like `verify.py`) just to 'double-check'. Only "
+        "write and run custom test scripts if the task involves complex logical "
+        "changes, algorithmic implementations, or specific bug fixes that cannot "
+        "be proven statically.\n"
+        "\n"
         # ── Layer 4: Skills (after critical rules) ─────────────
         f"{skills_text}"
         "\n"
@@ -505,7 +514,7 @@ class MiniClaudeAgent:
             },
             {
                 'name': 'edit_file',
-                'description': 'Apply multiple precise text replacements in a single file atomically. Use this for batch edits — all replacements commit together or none at all.',
+                'description': "Apply precise text replacements. CRITICAL RULE: Keep replacements focused on the affected function body or block (usually under 20 lines). Avoid copying entire large classes. Think of this as a unified diff. If your search/replace blocks are overly large, the system will actively REJECT the edit.",
                 'input_schema': {
                     'type': 'object',
                     'properties': {
@@ -515,7 +524,7 @@ class MiniClaudeAgent:
                             'items': {
                                 'type': 'object',
                                 'properties': {
-                                    'search': {'type': 'string', 'description': 'Exact text fragment to find (single occurrence)'},
+                                    'search': {'type': 'string', 'description': 'Exact text fragment to find. Max 2000 characters. Do NOT copy entire large classes.'},
                                     'replace': {'type': 'string', 'description': 'Replacement text'},
                                 },
                                 'required': ['search', 'replace'],
@@ -634,7 +643,7 @@ class MiniClaudeAgent:
             },
             {
                 'name': 'verify_symbol_rename',
-                'description': '验证符号重命名/重构是否结构性完成。使用 AST 进行语义分析，支持 scope（code_only/all）和 targets（指定函数级验证范围）。对于简单 rename 任务优先使用此工具而非生成 verify.py。',
+                'description': '验证符号重命名/重构是否结构性完成。使用 AST 进行语义分析，支持 scope（code_only/all）和 targets（指定函数级验证范围）。对于简单 rename 任务优先使用此工具而非生成 verify.py。Expect false positives if you perform a partial refactor without providing the \'targets\' parameter.',
                 'input_schema': {
                     'type': 'object',
                     'properties': {
@@ -670,7 +679,7 @@ class MiniClaudeAgent:
                                 },
                                 'required': ['file', 'function', 'old', 'new'],
                             },
-                            'description': '目标函数列表（可选）。提供后仅验证指定函数内的符号重命名，其他函数中的旧符号不影响 verdict。',
+                            'description': "Optional list of target dicts. CRITICAL WARNING: If you are performing a PARTIAL refactor (only modifying specific functions, not the whole file), you MUST meticulously provide this parameter to specify the exact functions. Failing to do so will force a global file scan, triggering severe FALSE POSITIVES from untouched, legitimate code. Do NOT omit this for targeted refactors.",
                         },
                     },
                     'required': ['old_symbols', 'new_symbols', 'paths'],
