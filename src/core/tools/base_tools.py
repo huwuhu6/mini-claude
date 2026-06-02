@@ -2,14 +2,16 @@ import os
 import ast
 import json
 import re
-import subprocess
 import logging
 from pathlib import Path
-from typing import Dict, Any, Optional, List
+from typing import Dict, Any, Optional, List, TYPE_CHECKING
 from dataclasses import dataclass
 
 from core.runtime_context.command_policy import CommandPolicy
 from cli.authority import WorkspaceAuthority
+
+if TYPE_CHECKING:
+    from core.runtime_context.shell_session import ShellSession
 
 logger = logging.getLogger(__name__)
 
@@ -104,10 +106,12 @@ class BaseTools:
     })
     MAX_FILE_SIZE: int = 1 * 1024 * 1024  # 1 MB
 
-    def __init__(self, workdir: Path, authority: Optional[WorkspaceAuthority] = None):
+    def __init__(self, workdir: Path, authority: Optional[WorkspaceAuthority] = None,
+                 shell_session: Optional['ShellSession'] = None):
         self.workdir = workdir
         self._allowed_paths: List[Path] = []  # Path whitelist
         self._authority = authority
+        self.shell_session = shell_session
         logger.info(f"BaseTools 已初始化，工作目录: {workdir}")
 
     # ── Path Whitelist Management ──────────────────────────────────
@@ -187,64 +191,37 @@ class BaseTools:
     def run_bash(self, command: str, timeout: int = 120,
                   cwd: Optional[Path] = None) -> ToolResult:
         """
-        Run a bash command safely.
+        Run a shell command via ShellSession (unified execution engine).
 
         Args:
             command: The command to run
             timeout: Timeout in seconds
-            cwd: Working directory (defaults to self.workdir)
+            cwd: Explicit working directory (overrides ShellSession cwd for
+                 this call only).  Rarely needed — use ``cd`` inside command.
 
         Returns:
             ToolResult with output
         """
-        # ── Command Policy (replaces blanket shell control char ban) ──
+        # ── Command Policy (first line of defence) ──
         block_msg = _COMMAND_POLICY.check(command)
         if block_msg:
             return ToolResult(content=block_msg, success=False)
 
-        effective_cwd = cwd or self.workdir
-
-        try:
-            logger.debug(f"正在执行命令: {command[:100]}...")
-            # 移除 text=True，捕获二进制流以处理 Windows 的 GBK 编码问题
-            r = subprocess.run(command, shell=True, cwd=str(effective_cwd),
-                               capture_output=True, timeout=timeout)
-
-            raw_output = r.stdout + r.stderr
-            try:
-                output_str = raw_output.decode('utf-8')
-            except UnicodeDecodeError:
-                output_str = raw_output.decode('gbk', errors='replace')
-
-            out = output_str.strip()
-
-            # Truncate output if too long
-            if len(out) > 50000:
-                out = out[:50000] + f"\n... (已截断，剩余 {len(out) - 50000} 个字符)"
-
-            # 必须返回 Exit Code，防止模型忽略 CMD 的静默失败
-            result = f"[Exit Code: {r.returncode}]\n"
-            if out:
-                result += out
-            else:
-                result += "(Command executed silently with no output or errors.)"
-
-            logger.debug(f"命令执行完成，返回码: {r.returncode}")
-
-            return ToolResult(
-                content=result,
-                success=r.returncode == 0
+        # ── Delegate to ShellSession (single subprocess.run source) ──
+        if self.shell_session is None:
+            raise RuntimeError(
+                "BaseTools.run_bash: ShellSession not injected — "
+                "all callers must provide a shell_session instance."
             )
 
-        except subprocess.TimeoutExpired:
-            logger.warning(f"命令超时已超过 {timeout} 秒")
-            return ToolResult(
-                content=f"错误: 执行超时（{timeout} 秒）",
-                success=False
-            )
-        except Exception as e:
-            logger.error(f"执行命令出错: {e}")
-            return ToolResult(f"错误: {str(e)}", success=False)
+        cwd_override = cwd.resolve() if cwd is not None else None
+        result = self.shell_session.execute(
+            command, timeout=timeout, cwd_override=cwd_override,
+        )
+        return ToolResult(
+            content=result["content"],
+            success=result["success"],
+        )
 
     @staticmethod
     def _read_lines(file_path: Path, encoding: str):

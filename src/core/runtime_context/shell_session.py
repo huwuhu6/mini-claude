@@ -13,8 +13,6 @@ import uuid
 from pathlib import Path
 from typing import Dict, Any, List, Optional
 
-from .command_policy import CommandPolicy
-
 logger = logging.getLogger(__name__)
 
 # Detect cd commands
@@ -36,30 +34,34 @@ class ShellSession:
         self.env: Dict[str, str] = os.environ.copy()
         self.session_id: str = uuid.uuid4().hex[:8]
         self.command_history: List[str] = []
-        self._policy = CommandPolicy()
 
     # ── Public API ─────────────────────────────────────────────────
 
-    def execute(self, command: str, timeout: int = 120) -> Dict[str, Any]:
+    def execute(self, command: str, timeout: int = 120,
+                cwd_override: Optional[Path] = None) -> Dict[str, Any]:
         """Execute a command in the persistent shell session.
 
         Args:
             command: Shell command string.
             timeout: Execution timeout in seconds.
+            cwd_override: One-time subprocess cwd override (does NOT
+                          modify persistent session state).
 
         Returns:
             Dict with keys: content (str), success (bool), cwd (str).
         """
-        # Security check
-        block_msg = self._policy.check(command)
-        if block_msg:
-            return {"content": block_msg, "success": False, "cwd": str(self.cwd)}
-
         cmd_stripped = command.strip()
 
         # Capture cwd BEFORE any cd updates (subprocess cd needs old cwd)
         old_cwd = self.cwd
-        self._update_cwd(command)
+        try:
+            self._update_cwd(command)
+        except FileNotFoundError as e:
+            return {
+                "content": f"[Exit Code: 1]\n{str(e)}",
+                "success": False,
+                "cwd": str(self.cwd),
+            }
 
         # Record history
         self.command_history.append(command)
@@ -72,15 +74,18 @@ class ShellSession:
                 "cwd": str(self.cwd),
             }
 
-        # For non-cd (or chained) commands, use old_cwd so relative paths resolve
+        # Determine effective cwd for subprocess (cwd_override takes precedence)
+        effective_cwd = cwd_override if cwd_override is not None else old_cwd
+
+        # For non-cd (or chained) commands, use effective_cwd so relative paths resolve
         try:
             logger.debug(
-                f"[ShellSession:{self.session_id}] cwd={old_cwd} | {command[:100]}"
+                f"[ShellSession:{self.session_id}] cwd={effective_cwd} | {command[:100]}"
             )
             r = subprocess.run(
                 command,
                 shell=True,
-                cwd=str(old_cwd),
+                cwd=str(effective_cwd),
                 capture_output=True,
                 timeout=timeout,
             )
@@ -135,7 +140,11 @@ class ShellSession:
                 self._apply_cd(target)
 
     def _apply_cd(self, target: str) -> None:
-        """Resolve and apply a cd target to the session cwd."""
+        """Resolve and apply a cd target to the session cwd.
+
+        Raises:
+            FileNotFoundError: If the target directory does not exist.
+        """
         p = Path(target)
         if not p.is_absolute():
             p = (self.cwd / p).resolve()
@@ -146,7 +155,9 @@ class ShellSession:
             self.cwd = p
             logger.info(f"ShellSession: cwd → {self.cwd}")
         else:
-            logger.debug(f"ShellSession: cd target does not exist: {p}")
+            raise FileNotFoundError(
+                f"cd: {target}: No such file or directory"
+            )
 
     def reset(self) -> None:
         """Reset session to workspace root."""

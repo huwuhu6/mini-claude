@@ -58,7 +58,7 @@ class CommandPolicy:
     BACKGROUND = re.compile(r'(?<![&])&(?![&])')
 
     # ── Shell sub / command substitution ────────────────────────────
-    SUBSTITUTION = re.compile(r'[$\x60]')  # $ and backtick
+    SUBSTITUTION = re.compile(r'\$\(|\x60')  # $(…) and backtick; allow $PATH etc.
 
     def check(self, command: str) -> Optional[str]:
         """Validate a command string against the policy.

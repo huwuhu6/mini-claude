@@ -17,6 +17,7 @@ from models.config import ConfigManager
 from providers.manager import ProviderManager
 from providers.base import Message, ToolDefinition
 from core.tools.base_tools import BaseTools
+from core.runtime_context.shell_session import ShellSession
 
 # Configure logging
 logging.basicConfig(
@@ -33,7 +34,8 @@ class MinimalAgent:
         self.config_manager = ConfigManager()
         self.config = self.config_manager.get_config()
         self.provider_manager = ProviderManager()
-        self.tools = BaseTools(Path.cwd())
+        self.shell_session = ShellSession(Path.cwd())
+        self.tools = BaseTools(Path.cwd(), shell_session=self.shell_session)
         self.messages = []
 
         # Setup providers

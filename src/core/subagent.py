@@ -14,6 +14,7 @@ from enum import Enum
 from providers.base import LLMProvider, Message, ToolDefinition
 from providers.manager import ProviderManager
 from core.tools.base_tools import BaseTools, ToolResult
+from core.runtime_context.shell_session import ShellSession
 from core.loop_guard import LoopGuard
 
 logger = logging.getLogger(__name__)
@@ -51,10 +52,16 @@ class SubAgent:
                  workdir: Optional[Path] = None,
                  provider: Optional[LLMProvider] = None,
                  model: str = "",
-                 authority=None):
+                 authority=None,
+                 shell_session: Optional[ShellSession] = None):
         self.agent_type = agent_type
         self.workdir = workdir or Path.cwd()
-        self.tools = BaseTools(self.workdir, authority=authority)
+        self.shell_session = shell_session or ShellSession(self.workdir)
+        self.tools = BaseTools(
+            self.workdir,
+            authority=authority,
+            shell_session=self.shell_session,
+        )
         self.provider = provider
         self.model = model or getattr(provider, 'model', '')
         self.messages: List[Message] = []

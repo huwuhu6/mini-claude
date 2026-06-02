@@ -88,11 +88,15 @@ class MiniClaudeAgent:
         # Workspace Authority — unified permission boundary
         self.workspace_authority = WorkspaceAuthority(primary_root=self.workdir)
 
-        # Core tools (delegates whitelist to WorkspaceAuthority when available)
-        self.tools = BaseTools(self.workdir, authority=self.workspace_authority)
-
         # Runtime context — workspace binding, path resolution, shell session
         self.runtime_context = RuntimeContext(workspace_root=self.workdir)
+
+        # Core tools (delegates whitelist to WorkspaceAuthority when available)
+        self.tools = BaseTools(
+            self.workdir,
+            authority=self.workspace_authority,
+            shell_session=self.runtime_context.shell_session,
+        )
 
         # Tool dispatcher — dict-based routing bound once at init (s_full.py TOOL_HANDLERS pattern)
         self.tool_dispatcher = {
@@ -755,8 +759,8 @@ class MiniClaudeAgent:
                     f"且具有路径安全保护。\n"
                     f"被拦截的命令: {command[:200]}]"
                 )
-        result = self.runtime_context.shell_session.execute(command)
-        return result["content"]
+        result = self.tools.run_bash(command)
+        return result.content
 
     def _handle_read_file(self, path: str, start_line: int = None, end_line: int = None) -> str:
         result = self.tools.read_file(path, start_line, end_line)
