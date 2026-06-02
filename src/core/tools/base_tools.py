@@ -246,20 +246,37 @@ class BaseTools:
             logger.error(f"执行命令出错: {e}")
             return ToolResult(f"错误: {str(e)}", success=False)
 
+    @staticmethod
+    def _read_lines(file_path: Path, encoding: str):
+        """Read file with the given encoding and return (lines_list, total_lines).
+
+        Raises UnicodeDecodeError when the encoding cannot decode the file.
+        """
+        with open(file_path, 'r', encoding=encoding) as f:
+            lines = f.read().splitlines(keepends=False)
+        return lines, len(lines)
+
     def read_file(self, path: str, start_line: int = None,
-                  end_line: int = None) -> ToolResult:
+                  end_line: int = None, max_lines: int = 200) -> ToolResult:
         """
         Read a window of file content with anchor-comment delimiters.
 
         Pure code output (no per-line prefix) to maximise Prompt Cache
         stability — line numbers shift after edits, destroying cache hits.
 
+        When ``end_line`` is not provided the result is capped at
+        ``start_line + max_lines - 1`` to prevent accidental token floods.
+        Pass ``end_line`` explicitly to override this limit.
+
         Args:
             path: File path
             start_line: First line number to include (1-based, inclusive).
                         Defaults to 1 when omitted.
             end_line: Last line number to include (1-based, inclusive).
-                      Defaults to total line count when omitted.
+                      Defaults to total line count when omitted
+                      (soft-capped by ``max_lines``).
+            max_lines: Maximum lines to return when ``end_line`` is omitted.
+                       Default 200. Ignored when ``end_line`` is explicit.
 
         Returns:
             ToolResult with an anchor header/footer and clean code body.
@@ -276,14 +293,27 @@ class BaseTools:
             if not file_path.is_file():
                 return ToolResult(f"错误: 路径不是文件: {path}", success=False)
 
-            with open(file_path, 'r', encoding='utf-8') as f:
-                lines = f.read().splitlines(keepends=False)
-
-            total_lines = len(lines)
+            # ── Read with encoding fallback ──────────────────────────
+            try:
+                lines, total_lines = self._read_lines(file_path, 'utf-8')
+            except UnicodeDecodeError:
+                try:
+                    lines, total_lines = self._read_lines(file_path, 'latin-1')
+                except Exception as e:
+                    return ToolResult(
+                        f"读取文件时出错（编码问题）: {str(e)}", success=False,
+                    )
+            except Exception as e:
+                logger.error(f"读取文件 {path} 出错: {e}")
+                return ToolResult(f"错误: {str(e)}", success=False)
 
             # Resolve slice boundaries (1-based inclusive)
             start = 1 if start_line is None else max(1, int(start_line))
-            end = total_lines if end_line is None else min(total_lines, int(end_line))
+
+            if end_line is not None:
+                end = min(total_lines, int(end_line))
+            else:
+                end = min(total_lines, start + max_lines - 1)
 
             # Validation: start must not exceed end
             if start > end:
@@ -297,11 +327,20 @@ class BaseTools:
             chunk = lines[start - 1:end]
 
             # Build anchor-delimited output (no per-line prefix)
-            output = (
-                f"--- FILE: {path} (LINES: {start}-{end} of {total_lines}) ---\n"
-                + '\n'.join(chunk)
-                + f"\n--- END FILE: {path} ---"
-            )
+            output_parts = [
+                f"--- FILE: {path} (LINES: {start}-{end} of {total_lines}) ---",
+            ]
+            output_parts.append('\n'.join(chunk))
+
+            # Truncation notice when max_lines capped an un-specified end
+            if end_line is None and end < total_lines:
+                output_parts.append(
+                    f"... (内容被截断，仅显示 {start}-{end} 行，共 {total_lines} 行。"
+                    f"请指定 end_line 继续读取)"
+                )
+
+            output_parts.append(f"--- END FILE: {path} ---")
+            output = '\n'.join(output_parts)
 
             logger.debug(
                 f"读取文件: {path} [{start}-{end}/{total_lines} 行] "
@@ -310,27 +349,6 @@ class BaseTools:
 
             return ToolResult(output)
 
-        except UnicodeDecodeError:
-            try:
-                with open(file_path, 'r', encoding='latin-1') as f:
-                    content = f.read()
-                lines = content.splitlines(keepends=False)
-                total_lines = len(lines)
-                start = 1 if start_line is None else max(1, int(start_line))
-                end = total_lines if end_line is None else min(total_lines, int(end_line))
-                if start > end:
-                    return ToolResult(
-                        f"错误: start_line ({start}) > end_line ({end})，行号范围非法。",
-                        success=False,
-                    )
-                chunk = lines[start - 1:end]
-                return ToolResult(
-                    f"--- FILE: {path} (LINES: {start}-{end} of {total_lines}) ---\n"
-                    + '\n'.join(chunk)
-                    + f"\n--- END FILE: {path} ---"
-                )
-            except Exception as e:
-                return ToolResult(f"读取文件时出错（编码问题）: {str(e)}", success=False)
         except Exception as e:
             logger.error(f"读取文件 {path} 出错: {e}")
             return ToolResult(f"错误: {str(e)}", success=False)
@@ -362,17 +380,6 @@ class BaseTools:
             logger.error(f"写入文件 {path} 出错: {e}")
             return ToolResult(f"错误: {str(e)}", success=False)
 
-    @staticmethod
-    def _normalize_text(text: str) -> str:
-        """Normalize text for fuzzy search fallback:
-        1. Normalize line endings (\\r\\n → \\n, \\r → \\n)
-        2. Strip trailing whitespace from each line
-        """
-        text = text.replace('\r\n', '\n').replace('\r', '\n')
-        lines = text.split('\n')
-        lines = [line.rstrip() for line in lines]
-        return '\n'.join(lines)
-
     def edit_file(self, path: str, edits: list) -> ToolResult:
         """
         Apply multiple search/replace edits atomically using a shadow buffer.
@@ -381,20 +388,16 @@ class BaseTools:
           1. Verify ALL edits against the in-memory shadow buffer first.
           2. Only on full success write to disk once.
 
-        Each edit goes through two matching levels:
-          - Level 1 — strict exact match on the raw buffer text
-          - Level 2 — normalised match (unified line endings, trailing
-                      whitespace stripped) as fallback
-
-        If ANY edit fails both levels the entire operation is rolled back
-        and the file is left untouched.
+        Each edit requires the ``search`` string to appear exactly once
+        in the file — duplicate or missing matches abort the entire
+        transaction.
 
         Args:
             path: File path
             edits: List of {"search": str, "replace": str} dicts
 
         Returns:
-            ToolResult with status
+            ToolResult with a per-edit summary of every applied change.
         """
         try:
             file_path = self.safe_path(path)
@@ -406,7 +409,7 @@ class BaseTools:
             with open(file_path, 'r', encoding='utf-8') as f:
                 working_content = f.read()
 
-            normalized_content = self._normalize_text(working_content)
+            edit_summaries = []  # [(search_preview, line_no, replace_preview)]
 
             for i, edit in enumerate(edits):
                 if not isinstance(edit, dict):
@@ -422,8 +425,8 @@ class BaseTools:
                         success=False,
                     )
 
-                # ── 载荷大小硬熔断 (Payload Size Circuit Breaker) ──
-                if len(search) > 1500 or len(replace) > 2000:
+                # ── Payload Size Circuit Breaker ──────────────────────
+                if len(search) > 1200 or len(replace) > 1200:
                     logger.warning(
                         f"[Harness 拦截] edit_file 载荷过大: "
                         f"search={len(search)}, replace={len(replace)}"
@@ -431,48 +434,56 @@ class BaseTools:
                     return ToolResult(
                         f"【系统安全拦截】第 {i+1} 处修改失败。\n"
                         f"你的 'search' 块 ({len(search)} 字符) 或 "
-                        f"'replace' 块 ({len(replace)} 字符) 严重超标！\n"
-                        f"系统允许修改完整的函数块，但绝对禁止复制长篇幅的"
-                        f"类或无关上下文。当前事务已回滚，请将修改提炼到"
-                        f"核心函数范围内（建议 20 行以内）后重新调用 "
-                        f"edit_file。",
+                        f"'replace' 块 ({len(replace)} 字符) 超出限制 "
+                        f"(1200)！请将修改范围压缩至核心函数 "
+                        f"（建议 20 行以内）后重新调用。\n"
+                        f"当前事务已回滚，未做任何修改。",
                         success=False,
                     )
 
-                # ── Level 1: strict exact match ──────────────────────
-                if search in working_content:
-                    working_content = working_content.replace(search, replace, 1)
-                    normalized_content = self._normalize_text(working_content)
-                    continue
-
-                # ── Level 2: normalised fallback ─────────────────────
-                normalized_search = self._normalize_text(search)
-                if normalized_search in normalized_content:
-                    working_content = normalized_content.replace(
-                        normalized_search, replace, 1,
+                # ── Uniqueness check (critical for correctness) ───────
+                count = working_content.count(search)
+                if count == 0:
+                    return ToolResult(
+                        f"【Harness 事务拦截】第 {i+1} 处修改匹配失败。\n"
+                        f"无法在文件中定位您的 'search' 片段，请重新使用 "
+                        f"read_file 核对该段代码的精准缩进与换行符。\n"
+                        f"当前文件已自动整体回滚，未做任何修改。",
+                        success=False,
                     )
-                    normalized_content = self._normalize_text(working_content)
-                    logger.info(
-                        f"第 {i+1} 处修改通过归一化匹配 "
-                        f"(消除换行符/行尾空格差异)"
+                if count > 1:
+                    offset = working_content.find(search)
+                    example_line = working_content[:offset].count('\n') + 1
+                    return ToolResult(
+                        f"【Harness 事务拦截】第 {i+1} 处修改匹配到 {count} 处 "
+                        f"（例如第 {example_line} 行附近）。请提供更多上下文使 "
+                        f"search 字符串在文件中唯一。\n"
+                        f"当前文件已自动整体回滚，未做任何修改。",
+                        success=False,
                     )
-                    continue
 
-                # ── Rollback: neither level matched ──────────────────
-                return ToolResult(
-                    f"【Harness 事务拦截】第 {i+1} 处修改匹配失败。\n"
-                    f"无法定位您的 'search' 片段，请重新使用 read_file "
-                    f"核对该段代码的精准缩进与换行符。\n"
-                    f"当前文件已自动整体回滚，未做任何修改。",
-                    success=False,
-                )
+                # ── Exactly one match — safe to replace ───────────────
+                offset = working_content.find(search)
+                line_num = working_content[:offset].count('\n') + 1
+                working_content = working_content.replace(search, replace, 1)
+
+                # Capture preview for success summary
+                s_preview = search[:50].replace('\n', ' ')
+                r_preview = replace[:50].replace('\n', ' ')
+                edit_summaries.append((s_preview, line_num, r_preview))
 
             # ── Phase 2: Commit — single disk write ──────────────────
             with open(file_path, 'w', encoding='utf-8') as f:
                 f.write(working_content)
 
+            # Build rich per-edit success summary
+            summary_lines = [f"成功编辑 {path}，共完成 {len(edits)} 处修改:"]
+            for idx, (s_p, ln, r_p) in enumerate(edit_summaries, 1):
+                summary_lines.append(f"  {idx}. 第 {ln} 行: \"{s_p}\" → \"{r_p}\"")
+            result = '\n'.join(summary_lines)
+
             logger.info(f"已编辑文件: {path} ({len(edits)} 处修改)")
-            return ToolResult(f"成功编辑 {path}，共完成 {len(edits)} 处修改")
+            return ToolResult(result)
 
         except Exception as e:
             logger.error(f"编辑文件 {path} 出错: {e}")

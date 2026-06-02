@@ -125,6 +125,8 @@ class CommandNormalizer:
             target = cls._suffix_patterns(target, args)
         elif tool_name == "verify_symbol_rename":
             target = cls._suffix_old_symbols(target, args)
+        elif tool_name == "edit_file":
+            target = cls._suffix_edits(target, args)
 
         return target or tool_name
 
@@ -175,6 +177,17 @@ class CommandNormalizer:
             sorted_tuple = tuple(sorted(str(s) for s in old_symbols))
             h = hashlib.md5(str(sorted_tuple).encode()).hexdigest()[:8]
             return f"{target}:S:{h}"
+        return target
+
+    @classmethod
+    def _suffix_edits(cls, target: str, args: Dict[str, Any]) -> str:
+        """Append ``:E:<hash>`` for edit_file so different edits produce different keys."""
+        edits = args.get("edits")
+        if edits and isinstance(edits, (list, tuple)) and len(edits) > 0:
+            # Sort by canonical JSON to ignore item reordering
+            sorted_edits = sorted(edits, key=lambda x: json.dumps(x, sort_keys=True))
+            h = hashlib.md5(json.dumps(sorted_edits, sort_keys=True).encode()).hexdigest()[:8]
+            return f"{target}:E:{h}"
         return target
 
     # ── Public entry point ─────────────────────────────────────────────

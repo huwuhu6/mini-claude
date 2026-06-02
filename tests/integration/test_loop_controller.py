@@ -57,9 +57,71 @@ def test_write_file_target_is_filename():
 
 def test_edit_file_target_is_filename():
     """edit_file uses filename from path."""
-    intent = CommandNormalizer.normalize("edit_file", {"path": "src/main.py"})
+    intent = CommandNormalizer.normalize("edit_file", {"path": "src/main.py", "edits": []})
     assert intent.target == "main.py"
     assert intent.action == "EDIT"
+
+
+# ── edit_file content hashing tests ───────────────────────────────────
+
+def test_edit_file_different_edits():
+    """edit_file with different edits on the same file → different intent keys."""
+    intent_a = CommandNormalizer.normalize(
+        "edit_file",
+        {"path": "service.py", "edits": [{"search": "def foo", "replace": "def bar"}]},
+    )
+    intent_b = CommandNormalizer.normalize(
+        "edit_file",
+        {"path": "service.py", "edits": [{"search": "def baz", "replace": "def qux"}]},
+    )
+    assert intent_a.to_key() != intent_b.to_key()
+    assert ":E:" in intent_a.target
+    assert ":E:" in intent_b.target
+
+
+def test_edit_file_same_edits():
+    """Same file + same edits → identical intent key."""
+    intent_a = CommandNormalizer.normalize(
+        "edit_file",
+        {"path": "service.py", "edits": [{"search": "def foo", "replace": "def bar"}]},
+    )
+    intent_b = CommandNormalizer.normalize(
+        "edit_file",
+        {"path": "service.py", "edits": [{"search": "def foo", "replace": "def bar"}]},
+    )
+    assert intent_a.to_key() == intent_b.to_key()
+
+
+def test_edit_file_edits_order():
+    """Same edits in different order → identical intent key."""
+    edits_a = [
+        {"search": "aaa", "replace": "bbb"},
+        {"search": "ccc", "replace": "ddd"},
+    ]
+    edits_b = [
+        {"search": "ccc", "replace": "ddd"},
+        {"search": "aaa", "replace": "bbb"},
+    ]
+    intent_a = CommandNormalizer.normalize(
+        "edit_file", {"path": "service.py", "edits": edits_a},
+    )
+    intent_b = CommandNormalizer.normalize(
+        "edit_file", {"path": "service.py", "edits": edits_b},
+    )
+    assert intent_a.to_key() == intent_b.to_key()
+
+
+def test_edit_file_edits_same_file():
+    """edit_file same file with same edits → same key, different files → different keys."""
+    intent_a = CommandNormalizer.normalize(
+        "edit_file",
+        {"path": "service.py", "edits": [{"search": "def foo", "replace": "def bar"}]},
+    )
+    intent_b = CommandNormalizer.normalize(
+        "edit_file",
+        {"path": "controller.py", "edits": [{"search": "def foo", "replace": "def bar"}]},
+    )
+    assert intent_a.to_key() != intent_b.to_key()
 
 
 # ── search_code paths tests ───────────────────────────────────────────
