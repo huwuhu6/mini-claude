@@ -523,18 +523,19 @@ class MiniClaudeAgent:
             },
             {
                 'name': 'edit_file',
-                'description': "Apply precise text replacements. CRITICAL RULE: Keep replacements focused on the affected function body or block (usually under 20 lines). Avoid copying entire large classes. Think of this as a unified diff. If your search/replace blocks are overly large, the system will actively REJECT the edit.",
+                'description': "Apply precise text replacements to an existing file. CRITICAL RULE: Keep replacements focused on the affected function body or block (usually under 20 lines). Avoid copying entire large classes. Think of this as a unified diff. If your search/replace blocks are overly large, the system will actively REJECT the edit. For new files or full overwrites, use write_file instead.",
                 'input_schema': {
                     'type': 'object',
                     'properties': {
-                        'path': {'type': 'string', 'description': 'Path to the file'},
+                        'path': {'type': 'string', 'description': 'Path to the file (must exist)'},
                         'edits': {
                             'type': 'array',
                             'items': {
                                 'type': 'object',
                                 'properties': {
-                                    'search': {'type': 'string', 'description': 'Exact text fragment to find. Max 2000 characters. Do NOT copy entire large classes.'},
+                                    'search': {'type': 'string', 'description': 'Exact text fragment to find in the existing file. Must be non-empty and appear exactly once — for new files or full overwrites use write_file. Max 2000 characters. Do NOT copy entire large classes.'},
                                     'replace': {'type': 'string', 'description': 'Replacement text'},
+                                    'approx_line_start': {'type': 'integer', 'description': '可选的预估行号（1-based）。提供此值时，搜索范围将锁定在 ±50 行的局部窗口内。适合大文件中存在多处相似代码块时，辅助后端精准定位，避免全局 count>1 拦截。'},
                                 },
                                 'required': ['search', 'replace'],
                             },

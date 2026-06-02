@@ -2,6 +2,7 @@ import os
 import ast
 import json
 import re
+import tempfile
 import logging
 from pathlib import Path
 from typing import Dict, Any, Optional, List, TYPE_CHECKING
@@ -359,19 +360,33 @@ class BaseTools:
 
     def edit_file(self, path: str, edits: list) -> ToolResult:
         """
-        Apply multiple search/replace edits atomically using a shadow buffer.
+        Apply multiple search/replace edits atomically using a shadow buffer
+        with reverse-offset ordering.
 
-        Two-phase commit:
-          1. Verify ALL edits against the in-memory shadow buffer first.
-          2. Only on full success write to disk once.
+        Designed for **surgical local edits only** — creating new files or
+        fully overwriting files must use ``write_file`` instead.
 
-        Each edit requires the ``search`` string to appear exactly once
-        in the file — duplicate or missing matches abort the entire
-        transaction.
+        Architecture:
+        1. Read the original content once — the **reference copy** that
+           all pre-validation runs against.
+        2. Normalise ``\\r\\n`` → ``\\n`` so CRLF/LF differences never cause
+           a spurious match failure.  The original line-ending style is
+           restored before the final write.
+        3. Pre-validate **every** edit against the **unchanged** reference
+           copy, recording exact byte offsets and line numbers.
+        4. Execute all replacements in **reverse offset order** (from the
+           bottom of the file upward) so earlier edits never shift the
+           positions needed by later ones.
+        5. Write atomically via a temporary file + ``os.replace()``.
 
         Args:
-            path: File path
-            edits: List of {"search": str, "replace": str} dicts
+            path: File path (must exist — use ``write_file`` for creation).
+            edits: List of {"search": str, "replace": str, ...} dicts.
+                   Each edit optionally accepts ``approx_line_start`` (int) —
+                   an approximate 1-based line number that scopes the search
+                   to a ±50-line window around the estimate, drastically
+                   reducing false uniqueness failures in large files with
+                   similar code blocks.
 
         Returns:
             ToolResult with a per-edit summary of every applied change.
@@ -379,14 +394,24 @@ class BaseTools:
         try:
             file_path = self.safe_path(path)
 
+            # edit_file is for surgical edits only — require existing file
             if not file_path.exists():
-                return ToolResult(f"错误: 文件不存在: {path}", success=False)
+                return ToolResult(
+                    f"错误: 文件不存在: {path}。新建文件请使用 write_file 工具。",
+                    success=False,
+                )
 
-            # ── Phase 1: Load shadow buffer ──────────────────────────
+            # ── Phase 1: Load content ─────────────────────────────
             with open(file_path, 'r', encoding='utf-8') as f:
                 working_content = f.read()
 
-            edit_summaries = []  # [(search_preview, line_no, replace_preview)]
+            # Detect and normalise line endings (CRLF → LF) so that
+            # \r\n / \n mismatch never causes a spurious match failure.
+            original_line_ending = "\r\n" if "\r\n" in working_content else "\n"
+            working_content = working_content.replace("\r\n", "\n")
+
+            # ── Phase 2: Pre-validate ALL edits against original ──
+            prepared = []  # [{search, replace, offset, line_no}]
 
             for i, edit in enumerate(edits):
                 if not isinstance(edit, dict):
@@ -394,25 +419,24 @@ class BaseTools:
                         f"错误: 第 {i+1} 处编辑格式无效，应为 object",
                         success=False,
                     )
-                search = edit.get('search')
-                replace = edit.get('replace')
-                if search is None or replace is None:
+                search_raw = edit.get('search')
+                replace_raw = edit.get('replace')
+                if not search_raw:
                     return ToolResult(
-                        f"错误: 第 {i+1} 处编辑缺少 'search' 或 'replace' 字段",
+                        f"错误: 第 {i+1} 处编辑缺少 'search' 或 search 为空。\n"
+                        f"edit_file 只接受精确局部修改，需要提供具体代码片段。"
+                        f"新建文件或全量覆盖请使用 write_file。",
                         success=False,
                     )
-
-                # ── Lower-bound guard (context sufficiency) ─────────────
-                if len(search) < 15:
+                if replace_raw is None:
                     return ToolResult(
-                        f"【系统安全拦截】第 {i+1} 处修改失败。\n"
-                        f"search 块过短（{len(search)} 字符，要求至少 15），"
-                        f"请包含足够的上下文代码以保证匹配的唯一性。\n"
-                        f"当前事务已回滚，未做任何修改。",
+                        f"错误: 第 {i+1} 处编辑缺少 'replace' 字段",
                         success=False,
                     )
+                search = search_raw.replace("\r\n", "\n")
+                replace = replace_raw.replace("\r\n", "\n")
 
-                # ── Payload Size Circuit Breaker ──────────────────────
+                # ── Upper-bound guard ──────────────────────────────
                 if len(search) > 2000 or len(replace) > 2000:
                     logger.warning(
                         f"[Harness 拦截] edit_file 载荷过大: "
@@ -428,48 +452,115 @@ class BaseTools:
                         success=False,
                     )
 
-                # ── Uniqueness check (critical for correctness) ───────
-                count = working_content.count(search)
+                # ── Resolve search scope (global or windowed) ────────
+                approx_line_start = edit.get('approx_line_start')
+                SEARCH_WINDOW = 50
+
+                if approx_line_start is not None:
+                    lines = working_content.splitlines(True)
+                    total = len(lines)
+                    ws = max(1, int(approx_line_start) - SEARCH_WINDOW)
+                    we = min(total, int(approx_line_start) + SEARCH_WINDOW)
+                    global_before = len(''.join(lines[:ws - 1]))
+                    scope_text = ''.join(lines[ws - 1:we])
+                else:
+                    scope_text = working_content
+                    ws = we = global_before = None
+
+                # ── Uniqueness check — the ONLY safety gate ──────
+                count = scope_text.count(search)
                 if count == 0:
+                    hint = (
+                        f"（在 {ws}-{we} 行范围内查找，"
+                        f"approx_line_start={approx_line_start} "
+                        f"估计可能有偏差）"
+                        if approx_line_start is not None
+                        else ""
+                    )
                     return ToolResult(
                         f"【Harness 事务拦截】第 {i+1} 处修改匹配失败。\n"
                         f"无法在文件中定位您的 'search' 片段，请重新使用 "
-                        f"read_file 核对该段代码的精准缩进与换行符。\n"
+                        f"read_file 核对该段代码的精准缩进与换行符。{hint}\n"
                         f"当前文件已自动整体回滚，未做任何修改。",
                         success=False,
                     )
                 if count > 1:
-                    offset = working_content.find(search)
-                    example_line = working_content[:offset].count('\n') + 1
+                    local_off = scope_text.find(search)
+                    ex_line_raw = scope_text[:local_off].count('\n') + 1
+                    ex_line_global = ex_line_raw + (ws - 1) if ws else ex_line_raw
+                    hint = (
+                        f"（在 {ws}-{we} 行范围内仍匹配到 {count} 处，"
+                        f"请补充更多上下文或调整 approx_line_start）"
+                        if approx_line_start is not None
+                        else f"（例如第 {ex_line_global} 行附近）"
+                    )
                     return ToolResult(
                         f"【Harness 事务拦截】第 {i+1} 处修改匹配到 {count} 处 "
-                        f"（例如第 {example_line} 行附近）。请提供更多上下文使 "
-                        f"search 字符串在文件中唯一。\n"
+                        f"{hint}。请提供更多上下文使 search 字符串在文件中唯一。\n"
                         f"当前文件已自动整体回滚，未做任何修改。",
                         success=False,
                     )
 
-                # ── Exactly one match — safe to replace ───────────────
-                offset = working_content.find(search)
-                line_num = working_content[:offset].count('\n') + 1
-                working_content = working_content.replace(search, replace, 1)
+                # ── Calculate absolute byte offset ────────────────────
+                if approx_line_start is not None:
+                    local_offset = scope_text.find(search)
+                    offset = global_before + local_offset
+                else:
+                    offset = working_content.find(search)
+                line_no = working_content[:offset].count('\n') + 1
+                prepared.append({
+                    'search': search, 'replace': replace,
+                    'offset': offset, 'line_no': line_no,
+                })
 
-                # Capture preview for success summary
-                s_preview = search[:50].replace('\n', ' ')
-                r_preview = replace[:50].replace('\n', ' ')
-                edit_summaries.append((s_preview, line_num, r_preview))
+            # ── Phase 3: Execute in reverse-offset order ──────────
+            # Apply from file bottom → top so each earlier (higher-up)
+            # edit's offset stays correct regardless of text-length shifts.
+            prepared.sort(key=lambda x: x['offset'], reverse=True)
 
-            # ── Phase 2: Commit — single disk write ──────────────────
-            with open(file_path, 'w', encoding='utf-8') as f:
-                f.write(working_content)
+            edit_summaries = []
+            for edit in prepared:
+                s, r, off, ln = (
+                    edit['search'], edit['replace'],
+                    edit['offset'], edit['line_no'],
+                )
+                working_content = (
+                    working_content[:off] + r + working_content[off + len(s):]
+                )
+                edit_summaries.append((
+                    s[:40].replace('\n', ' '),
+                    ln,
+                    r[:40].replace('\n', ' '),
+                ))
 
-            # Build rich per-edit success summary
-            summary_lines = [f"成功编辑 {path}，共完成 {len(edits)} 处修改:"]
+            # Restore original line-ending style to preserve file convention
+            if original_line_ending == "\r\n":
+                working_content = working_content.replace("\n", "\r\n")
+
+            # ── Phase 4: Atomic disk write via temp file ──────────
+            file_path.parent.mkdir(parents=True, exist_ok=True)
+
+            with tempfile.NamedTemporaryFile(
+                'w', dir=file_path.parent, delete=False, encoding='utf-8',
+            ) as tf:
+                tf.write(working_content)
+                temp_name = tf.name
+
+            try:
+                os.replace(temp_name, str(file_path))
+            except Exception:
+                if os.path.exists(temp_name):
+                    os.remove(temp_name)
+                raise
+
+            # ── Phase 5: Build response ────────────────────────────
+            edit_summaries.reverse()  # restore original edit order
+            summary_lines = [f"编辑成功 {path}，共完成 {len(edits)} 处修改:"]
             for idx, (s_p, ln, r_p) in enumerate(edit_summaries, 1):
                 summary_lines.append(f"  {idx}. 第 {ln} 行: \"{s_p}\" → \"{r_p}\"")
             result = '\n'.join(summary_lines)
 
-            logger.info(f"已编辑文件: {path} ({len(edits)} 处修改)")
+            logger.info(f"编辑成功: {path} ({len(edits)} 处修改)")
             return ToolResult(result)
 
         except Exception as e:
