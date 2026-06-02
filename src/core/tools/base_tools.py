@@ -425,8 +425,18 @@ class BaseTools:
                         success=False,
                     )
 
+                # ── Lower-bound guard (context sufficiency) ─────────────
+                if len(search) < 15:
+                    return ToolResult(
+                        f"【系统安全拦截】第 {i+1} 处修改失败。\n"
+                        f"search 块过短（{len(search)} 字符，要求至少 15），"
+                        f"请包含足够的上下文代码以保证匹配的唯一性。\n"
+                        f"当前事务已回滚，未做任何修改。",
+                        success=False,
+                    )
+
                 # ── Payload Size Circuit Breaker ──────────────────────
-                if len(search) > 1200 or len(replace) > 1200:
+                if len(search) > 2000 or len(replace) > 2000:
                     logger.warning(
                         f"[Harness 拦截] edit_file 载荷过大: "
                         f"search={len(search)}, replace={len(replace)}"
@@ -435,8 +445,8 @@ class BaseTools:
                         f"【系统安全拦截】第 {i+1} 处修改失败。\n"
                         f"你的 'search' 块 ({len(search)} 字符) 或 "
                         f"'replace' 块 ({len(replace)} 字符) 超出限制 "
-                        f"(1200)！请将修改范围压缩至核心函数 "
-                        f"（建议 20 行以内）后重新调用。\n"
+                        f"(2000)！请将修改范围压缩至核心函数 "
+                        f"（建议 50 行以内）后重新调用。\n"
                         f"当前事务已回滚，未做任何修改。",
                         success=False,
                     )
