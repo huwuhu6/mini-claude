@@ -109,8 +109,8 @@ class MiniClaudeAgent:
             "TodoWrite": self._handle_todo_write,
             "search_code": self._handle_search_code,
             "count_occurrences": self._handle_count_occurrences,
-            "syntax_check": self._handle_syntax_check,
-            "verify_symbol_rename": self._handle_verify_symbol_rename,
+            # "syntax_check": self._handle_syntax_check,  # removed — use language-native tools
+            "list_files": self._handle_list_files,
         }
 
         # In-memory todo tracker (s_full.py s03 Nag system)
@@ -357,7 +357,7 @@ class MiniClaudeAgent:
         "PLANNING RULE:"
         " Do not assume runtime testing is required."
         "For structural refactors (rename, import updates, signature changes, API migration, code cleanup), plan only the edits and the minimal static verification required."
-        "Do not include verify.py, test scripts, runtime execution, or integration testing in the initial plan unless the task explicitly requires behavioral validation."
+        "Do not plan runtime execution or integration testing in the initial plan unless the task explicitly requires behavioral validation."
         # ── Layer 4: Verification strategy ─────────────────────
         "VERIFICATION STRATEGY (MUST FOLLOW):\n"
         "\n"
@@ -367,8 +367,9 @@ class MiniClaudeAgent:
         "   - Logic changes, bug fixes, new features: may need runtime verification.\n"
         "\n"
         "2. FOR STRUCTURAL CHANGES, USE STATIC VERIFICATION ONLY:\n"
-        "   - `verify_symbol_rename` (scope=code_only) for Python rename/refactor tasks.\n"
-        "   - `syntax_check` to ensure files still parse correctly.\n"
+        "   Use language-native tools for syntax validation: "
+        "``python -c \"import ast; ast.parse(open('file.py').read())\"`` / "
+        "``javac File.java`` / ``npx tsc --noEmit`` / ``go vet`` / ``cargo check``.\n"
         "   - `count_occurrences` to confirm old patterns are gone (especially non‑Python).\n"
         "   - When these all pass, the task is COMPLETE. Stop immediately – no further actions.\n"
         "\n"
@@ -379,19 +380,16 @@ class MiniClaudeAgent:
         "\n"
         "4. SUCCESS DEFINITION FOR STRUCTURAL TASKS:\n"
         "   - All requested files modified correctly.\n"
-        "   - `verify_symbol_rename` returns confidence=high and task_complete_likely=true "
-        "(or `count_occurrences` returns 0 for removed patterns).\n"
-        "   - `syntax_check` reports no errors.\n"
+        "   - `count_occurrences` returns 0 for removed patterns.\n"
         "   - No further steps required.\n"
         "\n"
-        "5. NO GHOST SCRIPTS FOR PURELY STATIC TASKS: If your task is purely "
-        "structural (e.g., renaming variables, modifying parameters) and your "
-        "static verification tools (`syntax_check`, `verify_symbol_rename`) "
-        "report success, you MUST STOP and declare SUCCESS. Do NOT write custom "
-        "runtime test scripts (like `verify.py`) just to 'double-check'. Only "
-        "write and run custom test scripts if the task involves complex logical "
-        "changes, algorithmic implementations, or specific bug fixes that cannot "
-        "be proven statically.\n"
+        "5. ONE-SHOT VERIFICATION SCRIPTS (IF NEEDED): If your task is purely "
+        "structural (e.g., renaming variables, modifying parameters) and "
+        "`count_occurrences` reports 0 for removed patterns, you should generally "
+        "stop. If you still need to confirm correctness, you may write a small "
+        "one-shot script using the project's own tooling (e.g., `pytest`, `cargo test`, "
+        "`go test`, `npm test`). Clean up such scripts after use. Do not write "
+        "elaborate multi-file verification harnesses for trivial renames.\n"
         "\n"
         # ── Layer 5: Skills (after critical rules) ─────────────
         f"{skills_text}"
@@ -636,63 +634,41 @@ class MiniClaudeAgent:
                     'required': ['paths', 'patterns'],
                 },
             },
+            # {
+            #     'name': 'syntax_check',
+            #     'description': '快速检查 Python 源文件是否存在语法错误。使用 ast.parse 进行轻量结构验证。用于 rename/refactor 后确认文件仍可被正确解析。',
+            #     'input_schema': {
+            #         'type': 'object',
+            #         'properties': {
+            #             'paths': {
+            #                 'type': 'array',
+            #                 'items': {'type': 'string'},
+            #                 'description': '要检查的 Python 文件或目录路径列表',
+            #             },
+            #         },
+            #         'required': ['paths'],
+            #     },
+            # },
             {
-                'name': 'syntax_check',
-                'description': '快速检查 Python 源文件是否存在语法错误。使用 ast.parse 进行轻量结构验证。用于 rename/refactor 后确认文件仍可被正确解析。',
+                'name': 'list_files',
+                'description': '列出目录中的文件和子目录（支持深度控制和忽略规则）。不可用于读取文件内容，只用于浏览项目结构。',
                 'input_schema': {
                     'type': 'object',
                     'properties': {
-                        'paths': {
-                            'type': 'array',
-                            'items': {'type': 'string'},
-                            'description': '要检查的 Python 文件或目录路径列表',
-                        },
-                    },
-                    'required': ['paths'],
-                },
-            },
-            {
-                'name': 'verify_symbol_rename',
-                'description': '验证符号重命名/重构是否结构性完成。使用 AST 进行语义分析，支持 scope（code_only/all）和 targets（指定函数级验证范围）。对于简单 rename 任务优先使用此工具而非生成 verify.py。Expect false positives if you perform a partial refactor without providing the \'targets\' parameter.',
-                'input_schema': {
-                    'type': 'object',
-                    'properties': {
-                        'old_symbols': {
-                            'type': 'array',
-                            'items': {'type': 'string'},
-                            'description': '不应再作为标识符出现的旧符号列表',
-                        },
-                        'new_symbols': {
-                            'type': 'array',
-                            'items': {'type': 'string'},
-                            'description': '预期出现的新符号列表（正向确认）',
-                        },
-                        'paths': {
-                            'type': 'array',
-                            'items': {'type': 'string'},
-                            'description': '要检查的 Python 文件或目录路径列表',
-                        },
-                        'scope': {
+                        'path': {
                             'type': 'string',
-                            'enum': ['code_only', 'all'],
-                            'description': "验证范围: code_only（默认）忽略 docstring/注释/字符串字面量中的残留；all 将全部视作有意义残留",
+                            'description': '要列出的目录路径，默认为当前工作目录',
                         },
-                        'targets': {
-                            'type': 'array',
-                            'items': {
-                                'type': 'object',
-                                'properties': {
-                                    'file': {'type': 'string', 'description': '目标文件路径'},
-                                    'function': {'type': 'string', 'description': '目标函数名'},
-                                    'old': {'type': 'string', 'description': '旧符号'},
-                                    'new': {'type': 'string', 'description': '新符号'},
-                                },
-                                'required': ['file', 'function', 'old', 'new'],
-                            },
-                            'description': "Optional list of target dicts. CRITICAL WARNING: If you are performing a PARTIAL refactor (only modifying specific functions, not the whole file), you MUST meticulously provide this parameter to specify the exact functions. Failing to do so will force a global file scan, triggering severe FALSE POSITIVES from untouched, legitimate code. Do NOT omit this for targeted refactors.",
+                        'max_depth': {
+                            'type': 'integer',
+                            'description': '递归深度。0=仅当前目录，1=含直接子目录，2=含子目录的子目录（默认）。仅在目录结构复杂时增加此值',
+                        },
+                        'max_files': {
+                            'type': 'integer',
+                            'description': '返回条目的最大数量，超出后截断提示。默认 200',
                         },
                     },
-                    'required': ['old_symbols', 'new_symbols', 'paths'],
+                    'required': [],
                 },
             },
             # {
@@ -913,95 +889,29 @@ class MiniClaudeAgent:
         )
         return result.content
 
-    def _handle_syntax_check(self, paths: list) -> str:
-        """Handle syntax_check tool calls — delegate to BaseTools with semantic wrapping."""
-        result = self.tools.syntax_check(paths=paths)
-        if result.success:
-            return result.content + (
-                "\n\n✅ [SYSTEM INFO] Python Interpreter validation passed. "
-                "No syntax anomalies found. The modified files are structurally sound and safe."
-            )
-        else:
-            return result.content + (
-                "\n\n❌ [SYSTEM CRITICAL ALERT] SYNTAX ERROR DETECTED.\n"
-                "Your last edit broke the Python compilation track. The code cannot be parsed.\n"
-                "Action Required: Check the file path and line number in the error message "
-                "above immediately. Use read_file or edit_file to fix the broken indent, "
-                "unmatched brackets, or typos right now."
-            )
+    # def _handle_syntax_check(self, paths: list) -> str:
+    #     """Handle syntax_check tool calls — delegate to BaseTools with semantic wrapping."""
+    #     result = self.tools.syntax_check(paths=paths)
+    #     if result.success:
+    #         return result.content + (
+    #             "\n\n✅ [SYSTEM INFO] Python Interpreter validation passed. "
+    #             "No syntax anomalies found. The modified files are structurally sound and safe."
+    #         )
+    #     else:
+    #         return result.content + (
+    #             "\n\n❌ [SYSTEM CRITICAL ALERT] SYNTAX ERROR DETECTED.\n"
+    #             "Your last edit broke the Python compilation track. The code cannot be parsed.\n"
+    #             "Action Required: Check the file path and line number in the error message "
+    #             "above immediately. Use read_file or edit_file to fix the broken indent, "
+    #             "unmatched brackets, or typos right now."
+    #         )
 
-    def _handle_verify_symbol_rename(self, old_symbols: list,
-                                      new_symbols: list,
-                                      paths: list,
-                                      scope: str = "code_only",
-                                      targets: list = None) -> str:
-        """Handle verify_symbol_rename — semantic wrapping layer over AST verification.
-
-        Transforms raw JSON from BaseTools into action-oriented natural language
-        to eliminate model cognitive anxiety and verification spiral.
-        """
-        result = self.tools.verify_symbol_rename(
-            old_symbols=old_symbols, new_symbols=new_symbols,
-            paths=paths, scope=scope, targets=targets,
+    def _handle_list_files(self, path: str = ".", max_depth: int = 2,
+                            max_files: int = 200) -> str:
+        """Handle list_files tool calls — delegate to BaseTools."""
+        result = self.tools.list_files(
+            path=path, max_depth=max_depth, max_files=max_files,
         )
-
-        # Try to parse JSON result for semantic wrapping
-        try:
-            raw_data = json.loads(result.content)
-        except (json.JSONDecodeError, TypeError):
-            # Fallback: return raw content if not parseable
-            return result.content
-
-        # Branch A: Task fully complete — inject absolute stopping guard
-        if raw_data.get("success") is True or raw_data.get("task_complete_likely") is True:
-            return (
-                "=== [SYSTEM REPORT] AST SEMANTIC VERIFICATION ===\n"
-                "✅ STATUS: PERFECTLY COMPLETED\n"
-                f"- Positive Confirmation: New symbols {new_symbols} are "
-                "successfully bound to active code tracks.\n"
-                "\n"
-                "[CRITICAL BOUNDARY ORACLE]\n"
-                "STATIC VERIFICATION 100% PASSED. The requested refactor is fully "
-                "and structurally complete. DO NOT write any custom verification "
-                "scripts (e.g., verify.py). DO NOT trigger further bash or tool "
-                "commands. You have fully satisfied the user's instructions. "
-                "STOP CALLING TOOLS IMMEDIATELY and output your final concise "
-                "success summary to the user.\n"
-                "==================================================="
-            )
-
-        # Branch B: Migration incomplete — build precise "whack-a-mole" action list
-        remaining = raw_data.get("meaningful_remaining", [])
-        if remaining:
-            lines = [
-                "=== [SYSTEM REPORT] AST SEMANTIC VERIFICATION ===",
-                "❌ STATUS: INCOMPLETE MIGRATION",
-                "- Critical Alert: The old symbols are STILL ALIVE in the "
-                "physical Python identifier tracks.",
-                "",
-                "[REQUIRED ACTIONS] To fix this, you must edit these remaining parts directly:",
-            ]
-            for idx, item in enumerate(remaining, start=1):
-                file = item.get("file", "?")
-                line = item.get("line", "?")
-                symbol = item.get("symbol", "?")
-                lines.append(
-                    f"  {idx}. In file '{file}' at Line {line}: Found residual "
-                    f"identifier '{symbol}'."
-                )
-                lines.append(
-                    f"     -> Action: Call edit_file on '{file}', locate line "
-                    f"{line}, and migrate '{symbol}' to new symbol."
-                )
-            lines.append("")
-            lines.append(
-                "Warning: Do NOT guess or write tests. Just perform the targeted "
-                "file edits listed above."
-            )
-            lines.append("===================================================")
-            return "\n".join(lines)
-
-        # Fallback: non-remaining failure (e.g. syntax error) — return raw
         return result.content
 
     def _load_skill_internal(self, name: str) -> ToolResult:

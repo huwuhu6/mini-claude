@@ -200,35 +200,6 @@ def test_count_occurrences_patterns():
     assert ":P:" in intent.target
 
 
-# ── verify_symbol_rename tests ────────────────────────────────────────
-
-def test_verify_symbol_rename_old_symbols():
-    """Different old_symbols produce different intent keys."""
-    intent_a = CommandNormalizer.normalize(
-        "verify_symbol_rename",
-        {"paths": ["src"], "old_symbols": ["OldName"], "new_symbols": ["NewName"]},
-    )
-    intent_b = CommandNormalizer.normalize(
-        "verify_symbol_rename",
-        {"paths": ["src"], "old_symbols": ["Deprecated"], "new_symbols": ["NewName"]},
-    )
-    assert intent_a.to_key() != intent_b.to_key()
-    assert ":S:" in intent_a.target
-
-
-def test_verify_symbol_rename_order():
-    """Same old_symbols in different order → identical intent key."""
-    intent_a = CommandNormalizer.normalize(
-        "verify_symbol_rename",
-        {"paths": ["src"], "old_symbols": ["Foo", "Bar"]},
-    )
-    intent_b = CommandNormalizer.normalize(
-        "verify_symbol_rename",
-        {"paths": ["src"], "old_symbols": ["Bar", "Foo"]},
-    )
-    assert intent_a.to_key() == intent_b.to_key()
-
-
 # ── TodoWrite state tests ────────────────────────────────────────────
 
 def test_todo_write_different_items():

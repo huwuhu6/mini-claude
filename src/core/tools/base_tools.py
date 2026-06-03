@@ -1,11 +1,10 @@
 import os
 import ast
-import json
 import re
 import tempfile
 import logging
 from pathlib import Path
-from typing import Dict, Any, Optional, List, TYPE_CHECKING
+from typing import Optional, List, TYPE_CHECKING
 from dataclasses import dataclass
 
 from core.runtime_context.command_policy import CommandPolicy
@@ -21,59 +20,6 @@ logger = logging.getLogger(__name__)
 class ToolResult:
     content: str
     success: bool = True
-
-
-class _SymbolFinder(ast.NodeVisitor):
-    """AST visitor that collects identifier nodes matching ``old_symbols``.
-
-    Only finds **real identifier usages** — comments, docstrings, and string
-    literals are naturally excluded because the Python parser strips them.
-    """
-
-    def __init__(self, old_symbols):
-        self.old_symbols = set(old_symbols)
-        self.found: list = []  # [(symbol_str, lineno)]
-
-    def visit_Name(self, node):
-        if node.id in self.old_symbols:
-            self.found.append((node.id, node.lineno))
-        self.generic_visit(node)
-
-    def visit_Attribute(self, node):
-        if node.attr in self.old_symbols:
-            self.found.append((node.attr, node.lineno))
-        self.generic_visit(node)
-
-    def visit_FunctionDef(self, node):
-        if node.name in self.old_symbols:
-            self.found.append((node.name, node.lineno))
-        self.generic_visit(node)
-
-    def visit_AsyncFunctionDef(self, node):
-        if node.name in self.old_symbols:
-            self.found.append((node.name, node.lineno))
-        self.generic_visit(node)
-
-    def visit_ClassDef(self, node):
-        if node.name in self.old_symbols:
-            self.found.append((node.name, node.lineno))
-        self.generic_visit(node)
-
-    def visit_Import(self, node):
-        for alias in node.names:
-            name = alias.name.split(".")[0]
-            if name in self.old_symbols:
-                ln = getattr(alias, "lineno", node.lineno)
-                self.found.append((name, ln))
-        self.generic_visit(node)
-
-    def visit_ImportFrom(self, node):
-        for alias in node.names:
-            name = alias.name.split(".")[0]
-            if name in self.old_symbols:
-                ln = getattr(alias, "lineno", node.lineno)
-                self.found.append((name, ln))
-        self.generic_visit(node)
 
 
 # Shared policy instance
@@ -567,46 +513,81 @@ class BaseTools:
             logger.error(f"编辑文件 {path} 出错: {e}")
             return ToolResult(f"错误: {str(e)}", success=False)
 
-    def list_files(self, path: str = ".", recursive: bool = False) -> ToolResult:
+    def list_files(self, path: str = ".", max_depth: int = 2,
+                    max_files: int = 200) -> ToolResult:
         """
-        List files in directory.
+        List files in directory with depth control and ignore rules.
+
+        ``max_depth=0`` means non-recursive (current directory only).
+        ``max_depth>=1`` recurses up to that many levels relative to ``path``.
+        Hard-coded ignore list (``IGNORE_DIRS``) is always applied.
 
         Args:
-            path: Directory path
-            recursive: Whether to list recursively
+            path:      Directory path to list.
+            max_depth: Recursion depth relative to ``path`` (0 = non-recursive).
+                       Default 2.
+            max_files: Hard cap on entries returned.  Default 200.
 
         Returns:
-            ToolResult with file list
+            ToolResult with sorted file/directory listing.
         """
         try:
             dir_path = self.safe_path(path)
 
             if not dir_path.exists():
                 return ToolResult(f"错误: 目录不存在: {path}", success=False)
-
             if not dir_path.is_dir():
                 return ToolResult(f"错误: 路径不是目录: {path}", success=False)
 
-            if recursive:
-                files = []
-                for item in dir_path.rglob('*'):
-                    if item.is_file():
-                        rel_path = item.relative_to(dir_path)
-                        files.append(f"  {rel_path}")
-                    else:
-                        rel_path = item.relative_to(dir_path)
-                        files.append(f"  {rel_path}/")
-            else:
-                files = []
-                for item in dir_path.iterdir():
-                    if item.is_file():
-                        files.append(f"  {item.name}")
-                    else:
-                        files.append(f"  {item.name}/")
+            # ── Walk with depth tracking ────────────────────────────
+            entries: List[str] = []
+            truncated = False
+            base_depth = len(dir_path.parents)
 
-            result = "\n".join(sorted(files))
-            logger.debug(f"已列出 {path} 中的 {len(files)} 个文件")
+            for root, dirs, filenames in os.walk(dir_path):
+                # Compute current depth
+                cur_depth = len(Path(root).parents) - base_depth
 
+                # Ignore directories: always skip blacklisted dirs
+                dirs[:] = [d for d in dirs if d not in BaseTools.IGNORE_DIRS]
+
+                if cur_depth > 0 and cur_depth > max_depth:
+                    # Exceeds depth limit — stop recursion, no marker needed
+                    # (subdirectory was already listed at the parent level)
+                    dirs[:] = []
+                    continue
+
+                # Root level: list contents
+                if cur_depth == 0:
+                    # List subdirectories
+                    for d in sorted(dirs):
+                        if len(entries) >= max_files:
+                            truncated = True
+                            break
+                        entries.append(f"  {d}/")
+                    # List files
+                    for fn in sorted(filenames):
+                        if len(entries) >= max_files:
+                            truncated = True
+                            break
+                        entries.append(f"  {fn}")
+                else:
+                    # Subdirectory: prefix with relative path
+                    rel = Path(root).relative_to(dir_path)
+                    for fn in sorted(filenames):
+                        if len(entries) >= max_files:
+                            truncated = True
+                            break
+                        entries.append(f"  {rel / fn}")
+
+                    if truncated:
+                        break
+
+            result = "\n".join(entries)
+            if truncated:
+                result += f"\n---\n已截断至 {max_files} 条（完整结果需缩小范围）"
+
+            logger.debug(f"已列出 {path} 中的 {len(entries)} 个文件")
             return ToolResult(result)
 
         except Exception as e:
@@ -980,476 +961,76 @@ class BaseTools:
         return ToolResult("\n".join(lines))
 
     # ── syntax_check ─────────────────────────────────────────────────
+    # (Commented out — LLM should use language-native tools instead,
+    #  e.g. python -c "import ast; ast.parse(open('f.py').read())"
+    #  / javac File.java / npx tsc --noEmit / go vet / cargo check)
 
-    def syntax_check(self, paths: List[str]) -> ToolResult:
-        """Check Python source files for syntax errors via ``ast.parse``.
-
-        Only ``.py`` files are inspected.  Non-Python files are silently
-        skipped.  Returns a compact pass/fail report with per-file errors.
-
-        Typical output (success)::
-
-            Syntax check: 5 files checked, 0 errors
-
-        Typical output (failure)::
-
-            Syntax check: 3 files checked, 1 error
-              src/broken.py:42 - unmatched ')'
-        """
-        if not paths:
-            return ToolResult("错误: 需要至少提供一个路径 (paths)", success=False)
-
-        import ast
-
-        try:
-            search_files = self._expand_search_paths(paths)
-        except ValueError as e:
-            return ToolResult(str(e), success=False)
-
-        # ── Filter for .py files only ────────────────────────────────
-        py_files = [f for f in search_files if f.suffix == ".py"]
-
-        if not py_files:
-            return ToolResult("没有找到 Python 文件", success=False)
-
-        errors: List[Dict[str, Any]] = []
-
-        for file_path in py_files:
-            try:
-                with open(file_path, 'r', encoding='utf-8') as f:
-                    source = f.read()
-                ast.parse(source, filename=str(file_path))
-            except SyntaxError as e:
-                errors.append({
-                    "file": str(file_path),
-                    "line": e.lineno or 0,
-                    "message": e.msg,
-                })
-            except UnicodeDecodeError:
-                continue
-            except Exception as e:
-                errors.append({
-                    "file": str(file_path),
-                    "line": 0,
-                    "message": str(e),
-                })
-
-        checked = len(py_files)
-        if not errors:
-            return ToolResult(
-                f"Syntax check: {checked} file(s) checked, 0 errors",
-                success=True,
-            )
-
-        err_lines: List[str] = [
-            f"Syntax check: {checked} file(s) checked, {len(errors)} error(s)",
-        ]
-        for err in errors:
-            err_lines.append(
-                f"  {err['file']}:{err['line']} - {err['message']}"
-            )
-
-        return ToolResult("\n".join(err_lines), success=False)
-
-    # ── verify_symbol_rename ─────────────────────────────────────────
-
-    def verify_symbol_rename(
-        self,
-        old_symbols: List[str],
-        new_symbols: List[str],
-        paths: List[str],
-        scope: str = "code_only",
-        targets: Optional[List[Dict[str, str]]] = None,
-    ) -> ToolResult:
-        """Verify whether a symbol rename is structurally complete.
-
-        Uses AST analysis to find real identifier usages.
-
-        When ``scope="code_only"`` (default), occurrences in docstrings,
-        comments, and string literals are reported separately as
-        ``ignored_matches`` — they do NOT affect the success verdict.
-
-        When ``scope="all"``, all occurrences (including non-code) are
-        treated as meaningful remaining identifiers.
-
-        Args:
-            old_symbols: Symbols that should no longer appear as identifiers.
-            new_symbols: Symbols expected to appear (positive confirmation).
-            paths:       Files or directories to inspect.
-            scope:       Verification scope — "code_only" (default) or "all".
-
-        When ``targets`` is provided (list of ``{"file", "function",
-        "old", "new"}`` dicts), verification is scoped to only those
-        specific functions.  Old symbols in other functions do NOT
-        affect the verdict.
-
-            targets:     Optional list of target dicts for function-level
-                         scoped verification.
-        Returns:
-            ToolResult with a structured JSON verdict.
-        """
-        if not paths:
-            return ToolResult("错误: 需要至少提供一个路径 (paths)", success=False)
-        if not old_symbols:
-            return ToolResult("错误: 需要至少提供一个旧符号 (old_symbols)", success=False)
-        if not new_symbols:
-            return ToolResult("错误: 需要至少提供一个新符号 (new_symbols)", success=False)
-        if scope not in ("code_only", "all"):
-            return ToolResult(
-                f"错误: scope 必须是 'code_only' 或 'all'，收到 '{scope}'",
-                success=False,
-            )
-
-        # ── Targeted verification (when targets is provided) ──────────
-        if targets is not None:
-            t_remaining: List[Dict[str, Any]] = []
-            t_syntax_errors: List[Dict[str, Any]] = []
-            t_new_counts: Dict[str, int] = {}
-
-            for target in targets:
-                if not isinstance(target, dict):
-                    return ToolResult(
-                        "错误: targets 元素应为 object 类型",
-                        success=False,
-                    )
-                for key in ("file", "function", "old", "new"):
-                    if key not in target:
-                        return ToolResult(
-                            f"错误: target 缺少必要字段 '{key}'",
-                            success=False,
-                        )
-
-                file_str = target["file"]
-                fun_name = target["function"]
-                target_old = target["old"]
-                target_new = target["new"]
-
-                try:
-                    file_path = self.safe_path(file_str)
-                except ValueError as e:
-                    return ToolResult(
-                        f"错误: 文件路径无法解析: {file_str} — {e}",
-                        success=False,
-                    )
-
-                if not file_path.exists():
-                    return ToolResult(
-                        f"错误: 文件不存在: {file_str}",
-                        success=False,
-                    )
-                if not file_path.is_file():
-                    return ToolResult(
-                        f"错误: 路径不是文件: {file_str}",
-                        success=False,
-                    )
-
-                try:
-                    with open(file_path, "r", encoding="utf-8") as f:
-                        source = f.read()
-                except Exception as e:
-                    t_syntax_errors.append({
-                        "file": str(file_path), "line": 0, "message": str(e),
-                    })
-                    continue
-
-                try:
-                    tree = ast.parse(source, filename=str(file_path))
-                except SyntaxError as e:
-                    t_syntax_errors.append({
-                        "file": str(file_path),
-                        "line": e.lineno or 0,
-                        "message": e.msg,
-                    })
-                    continue
-
-                # Locate target function in AST
-                fn_node = None
-                for node in ast.walk(tree):
-                    if (isinstance(node, (ast.FunctionDef, ast.AsyncFunctionDef))
-                            and node.name == fun_name):
-                        fn_node = node
-                        break
-
-                if fn_node is None:
-                    # Function not found — assume already renamed/removed
-                    continue
-
-                fn_start = fn_node.lineno
-                fn_end = fn_node.end_lineno
-
-                # Find old symbols within function range
-                finder = _SymbolFinder([target_old])
-                finder.visit(tree)
-                for symbol, lineno in finder.found:
-                    if fn_start <= lineno <= fn_end:
-                        t_remaining.append({
-                            "symbol": symbol,
-                            "file": str(file_path),
-                            "line": lineno,
-                        })
-
-                # Count new symbols within function range
-                new_finder = _SymbolFinder([target_new])
-                new_finder.visit(tree)
-                for symbol, lineno in new_finder.found:
-                    if fn_start <= lineno <= fn_end:
-                        t_new_counts[symbol] = t_new_counts.get(symbol, 0) + 1
-
-            # ── Build verdict for targeted verification ──
-            if t_syntax_errors:
-                result = {
-                    "success": False,
-                    "meaningful_remaining": [],
-                    "syntax_ok": False,
-                    "message": "Syntax error(s) detected - rename cannot be validated.",
-                    "errors": t_syntax_errors,
-                }
-                return ToolResult(
-                    json.dumps(result, indent=2, ensure_ascii=False), success=False,
-                )
-
-            if t_remaining:
-                result = {
-                    "success": False,
-                    "confidence": "low",
-                    "task_complete_likely": False,
-                    "meaningful_remaining": t_remaining,
-                    "syntax_ok": True,
-                    "targets_verified": len(targets),
-                    "message": "Target function(s) still contain old symbols.",
-                }
-                return ToolResult(
-                    json.dumps(result, indent=2, ensure_ascii=False), success=False,
-                )
-
-            # Success: all target functions clean
-            new_info = ""
-            if t_new_counts:
-                items = ", ".join(
-                    f"'{k}' appears in {v} location(s)"
-                    for k, v in t_new_counts.items()
-                )
-                new_info = f" New symbols: {items}."
-
-            result = {
-                "success": True,
-                "confidence": "high",
-                "task_complete_likely": True,
-                "meaningful_remaining": [],
-                "syntax_ok": True,
-                "targets_verified": len(targets),
-                "message": (
-                    f"All {len(targets)} target function(s) verified. "
-                    f"No remaining old symbols in targeted scope.{new_info}"
-                    f" Additional verification is likely unnecessary."
-                ),
-            }
-            return ToolResult(
-                json.dumps(result, indent=2, ensure_ascii=False), success=True,
-            )
-
-        try:
-            search_files = self._expand_search_paths(paths)
-        except ValueError as e:
-            return ToolResult(str(e), success=False)
-
-        py_files = [f for f in search_files if f.suffix == ".py"]
-
-        if not py_files:
-            return ToolResult("没有找到 Python 文件", success=False)
-
-        remaining: List[Dict[str, Any]] = []
-        syntax_errors: List[Dict[str, Any]] = []
-        new_counts: Dict[str, int] = {}
-        all_ignored: Dict[str, int] = {"docstring": 0, "comments": 0, "string_literal": 0}
-
-        for file_path in py_files:
-            try:
-                with open(file_path, "r", encoding="utf-8") as f:
-                    source = f.read()
-            except Exception as e:
-                syntax_errors.append({
-                    "file": str(file_path),
-                    "line": 0,
-                    "message": str(e),
-                })
-                continue
-
-            # ── Syntax validation ────────────────────────────────
-            try:
-                tree = ast.parse(source, filename=str(file_path))
-            except SyntaxError as e:
-                syntax_errors.append({
-                    "file": str(file_path),
-                    "line": e.lineno or 0,
-                    "message": e.msg,
-                })
-                continue
-
-            # ── Find remaining old-symbol identifiers ─────────────
-            finder = _SymbolFinder(old_symbols)
-            finder.visit(tree)
-            for symbol, lineno in finder.found:
-                remaining.append({
-                    "symbol": symbol,
-                    "file": str(file_path),
-                    "line": lineno,
-                })
-
-            # ── Count new-symbol identifiers (positive signal) ───
-            new_finder = _SymbolFinder(new_symbols)
-            new_finder.visit(tree)
-            for symbol, _lineno in new_finder.found:
-                new_counts[symbol] = new_counts.get(symbol, 0) + 1
-
-            # ── Classify non-code matches (docstrings/comments/strings) ──
-            if scope == "code_only":
-                d, c, s = self._classify_non_code(source, tree, old_symbols)
-                all_ignored["docstring"] += d
-                all_ignored["comments"] += c
-                all_ignored["string_literal"] += s
-
-        # ── Build verdict (scope-aware) ──────────────────────────────
-        if syntax_errors:
-            result = {
-                "success": False,
-                "meaningful_remaining": [],
-                "syntax_ok": False,
-                "message": "Syntax error(s) detected — rename cannot be validated.",
-                "errors": syntax_errors,
-            }
-            return ToolResult(json.dumps(result, indent=2, ensure_ascii=False), success=False)
-
-        if scope == "code_only":
-            # Non-code matches (docstrings/comments/strings) do NOT count
-            has_meaningful = bool(remaining)
-            if has_meaningful:
-                result = {
-                    "success": False,
-                    "confidence": "low",
-                    "task_complete_likely": False,
-                    "meaningful_remaining": remaining,
-                    "syntax_ok": True,
-                    "ignored_matches": all_ignored,
-                    "message": "Meaningful code identifiers still contain old symbols.",
-                }
-                return ToolResult(
-                    json.dumps(result, indent=2, ensure_ascii=False), success=False,
-                )
-
-            # Success: no meaningful code identifiers remain
-            ignored_detail = []
-            if all_ignored["docstring"]:
-                ignored_detail.append(f"docstrings ({all_ignored['docstring']})")
-            if all_ignored["comments"]:
-                ignored_detail.append(f"comments ({all_ignored['comments']})")
-            if all_ignored["string_literal"]:
-                ignored_detail.append(f"string literals ({all_ignored['string_literal']})")
-
-            msg = "Rename task structurally verified."
-            if ignored_detail:
-                msg += (f" Remaining occurrences are only in "
-                        f"{'; '.join(ignored_detail)}. No action needed.")
-            msg += " Additional verification is likely unnecessary for this low-risk refactor task."
-
-            new_info = (
-                f" New symbols appear in {sum(new_counts.values())} location(s)."
-                if new_counts else ""
-            )
-            result = {
-                "success": True,
-                "confidence": "high",
-                "task_complete_likely": True,
-                "meaningful_remaining": [],
-                "syntax_ok": True,
-                "ignored_matches": all_ignored,
-                "message": msg + new_info,
-            }
-            return ToolResult(
-                json.dumps(result, indent=2, ensure_ascii=False), success=True,
-            )
-
-        # scope == "all": all occurrences count (code + non-code)
-        has_any = bool(remaining) or any(all_ignored.values())
-        if has_any:
-            result = {
-                "success": False,
-                "meaningful_remaining": remaining,
-                "syntax_ok": True,
-                "ignored_matches": all_ignored,
-                "message": "Remaining identifier usages detected.",
-            }
-            return ToolResult(
-                json.dumps(result, indent=2, ensure_ascii=False), success=False,
-            )
-
-        new_info = (
-            f" New symbols appear in {sum(new_counts.values())} location(s)."
-            if new_counts else ""
-        )
-        result = {
-            "success": True,
-            "confidence": "high",
-            "task_complete_likely": True,
-            "meaningful_remaining": [],
-            "syntax_ok": True,
-            "ignored_matches": all_ignored,
-            "message": f"Rename task structurally verified.{new_info}",
-        }
-        return ToolResult(
-            json.dumps(result, indent=2, ensure_ascii=False), success=True,
-        )
-
-    @staticmethod
-    def _classify_non_code(source: str, tree, old_symbols):
-        """Classify old symbol occurrences in docstrings, comments, and string literals.
-
-        Returns:
-            Tuple of (docstring_count, comment_count, string_literal_count).
-        """
-        import tokenize, io
-
-        # ── Identify docstring AST nodes ─────────────────────────
-        docstring_nodes = set()
-        for node in ast.walk(tree):
-            if isinstance(node, (ast.FunctionDef, ast.AsyncFunctionDef,
-                                 ast.ClassDef, ast.Module)):
-                if (node.body
-                    and isinstance(node.body[0], ast.Expr)
-                    and isinstance(node.body[0].value, ast.Constant)
-                    and isinstance(node.body[0].value.value, str)):
-                    docstring_nodes.add(node.body[0].value)
-
-        # ── Count in docstrings ──────────────────────────────────
-        doc_count = 0
-        for ds_node in docstring_nodes:
-            for sym in old_symbols:
-                doc_count += ds_node.value.count(sym)
-
-        # ── Count in string literals (non-docstring) ─────────────
-        str_count = 0
-        for node in ast.walk(tree):
-            if isinstance(node, ast.Constant) and isinstance(node.value, str):
-                if node not in docstring_nodes:
-                    for sym in old_symbols:
-                        str_count += node.value.count(sym)
-            elif isinstance(node, ast.JoinedStr):
-                for vn in node.values:
-                    if (isinstance(vn, ast.Constant)
-                        and isinstance(vn.value, str)
-                        and vn not in docstring_nodes):
-                        for sym in old_symbols:
-                            str_count += vn.value.count(sym)
-
-        # ── Count in comments (via tokenize) ────────────────────
-        com_count = 0
-        try:
-            tokens = tokenize.generate_tokens(io.StringIO(source).readline)
-            for token in tokens:
-                if token.type == tokenize.COMMENT:
-                    for sym in old_symbols:
-                        com_count += token.string.count(sym)
-        except Exception:
-            pass
-
-        return doc_count, com_count, str_count
+    # def syntax_check(self, paths: List[str]) -> ToolResult:
+    #     """Check Python source files for syntax errors via ``ast.parse``.
+    #
+    #     Only ``.py`` files are inspected.  Non-Python files are silently
+    #     skipped.  Returns a compact pass/fail report with per-file errors.
+    #
+    #     Typical output (success)::
+    #
+    #         Syntax check: 5 files checked, 0 errors
+    #
+    #     Typical output (failure)::
+    #
+    #         Syntax check: 3 files checked, 1 error
+    #           src/broken.py:42 - unmatched ')'
+    #     """
+    #     if not paths:
+    #         return ToolResult("错误: 需要至少提供一个路径 (paths)", success=False)
+    #
+    #     import ast
+    #
+    #     try:
+    #         search_files = self._expand_search_paths(paths)
+    #     except ValueError as e:
+    #         return ToolResult(str(e), success=False)
+    #
+    #     # ── Filter for .py files only ────────────────────────────────
+    #     py_files = [f for f in search_files if f.suffix == ".py"]
+    #
+    #     if not py_files:
+    #         return ToolResult("没有找到 Python 文件", success=False)
+    #
+    #     errors: List[Dict[str, Any]] = []
+    #
+    #     for file_path in py_files:
+    #         try:
+    #             with open(file_path, 'r', encoding='utf-8') as f:
+    #                 source = f.read()
+    #             ast.parse(source, filename=str(file_path))
+    #         except SyntaxError as e:
+    #             errors.append({
+    #                 "file": str(file_path),
+    #                 "line": e.lineno or 0,
+    #                 "message": e.msg,
+    #             })
+    #         except UnicodeDecodeError:
+    #             continue
+    #         except Exception as e:
+    #             errors.append({
+    #                 "file": str(file_path),
+    #                 "line": 0,
+    #                 "message": str(e),
+    #             })
+    #
+    #     checked = len(py_files)
+    #     if not errors:
+    #         return ToolResult(
+    #             f"Syntax check: {checked} file(s) checked, 0 errors",
+    #             success=True,
+    #         )
+    #
+    #     err_lines: List[str] = [
+    #         f"Syntax check: {checked} file(s) checked, {len(errors)} error(s)",
+    #     ]
+    #     for err in errors:
+    #         err_lines.append(
+    #             f"  {err['file']}:{err['line']} - {err['message']}"
+    #         )
+    #
+    #     return ToolResult("\n".join(err_lines), success=False)

@@ -123,8 +123,6 @@ class CommandNormalizer:
             target = cls._suffix_line_range(target, args)
         elif tool_name in ("search_code", "count_occurrences"):
             target = cls._suffix_patterns(target, args)
-        elif tool_name == "verify_symbol_rename":
-            target = cls._suffix_old_symbols(target, args)
         elif tool_name == "edit_file":
             target = cls._suffix_edits(target, args)
 
@@ -167,16 +165,6 @@ class CommandNormalizer:
             sorted_tuple = tuple(sorted(str(p) for p in patterns))
             h = hashlib.md5(str(sorted_tuple).encode()).hexdigest()[:8]
             return f"{target}:P:{h}"
-        return target
-
-    @classmethod
-    def _suffix_old_symbols(cls, target: str, args: Dict[str, Any]) -> str:
-        """Append ``:S:<hash>`` for verify_symbol_rename."""
-        old_symbols = args.get("old_symbols")
-        if old_symbols and isinstance(old_symbols, (list, tuple)) and len(old_symbols) > 0:
-            sorted_tuple = tuple(sorted(str(s) for s in old_symbols))
-            h = hashlib.md5(str(sorted_tuple).encode()).hexdigest()[:8]
-            return f"{target}:S:{h}"
         return target
 
     @classmethod

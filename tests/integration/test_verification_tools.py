@@ -138,89 +138,50 @@ def test_count_occurrences():
 
 
 # ═══════════════════════════════════════════════════════════════
-# Test: syntax_check
+# Test: syntax_check (commented out — tool removed, LLM uses
+# language-native tools like ast.parse / javac / tsc / go vet)
 # ═══════════════════════════════════════════════════════════════
+"""
 def test_syntax_check():
     _test_section("syntax_check")
 
     with tempfile.TemporaryDirectory() as tmpdir:
         tools = BaseTools(Path(tmpdir))
-
-        # Create valid Python files
-        (Path(tmpdir) / "good.py").write_text(
-            "def hello():\n    print('hello')\n"
-        )
-        (Path(tmpdir) / "also_good.py").write_text(
-            "x = 1\nif x > 0:\n    print(x)\n"
-        )
-        # Non-Python file (should be skipped)
+        (Path(tmpdir) / "good.py").write_text("def hello():\\n    print('hello')\\n")
+        (Path(tmpdir) / "also_good.py").write_text("x = 1\\nif x > 0:\\n    print(x)\\n")
         (Path(tmpdir) / "data.json").write_text('{"key": "value"}')
 
-        # Test 1: All files valid
         result = tools.syntax_check(paths=["."])
-        _test_result(
-            "all files valid",
-            result.success and "0 errors" in result.content,
-        )
+        _test_result("all files valid", result.success and "0 errors" in result.content)
 
-        # Test 2: Single file valid
         result = tools.syntax_check(paths=["good.py"])
-        _test_result(
-            "single file valid",
-            result.success and "1 file" in result.content or "1 file(s)" in result.content,
-        )
+        _test_result("single file valid", result.success and "1 file" in result.content or "1 file(s)" in result.content)
 
-    # Test 3: File with syntax error
     with tempfile.TemporaryDirectory() as tmpdir:
         tools = BaseTools(Path(tmpdir))
-        (Path(tmpdir) / "broken.py").write_text(
-            "def foo():\n    print('hello'\n"
-        )
-
+        (Path(tmpdir) / "broken.py").write_text("def foo():\\n    print('hello'\\n")
         result = tools.syntax_check(paths=["broken.py"])
-        _test_result(
-            "syntax error detected",
-            not result.success and "error" in result.content.lower(),
-        )
+        _test_result("syntax error detected", not result.success and "error" in result.content.lower())
 
-    # Test 4: Mixed valid and invalid
     with tempfile.TemporaryDirectory() as tmpdir:
         tools = BaseTools(Path(tmpdir))
-        (Path(tmpdir) / "good.py").write_text("x = 1\n")
-        (Path(tmpdir) / "broken.py").write_text(
-            "if True\n    pass\n"
-        )
-
+        (Path(tmpdir) / "good.py").write_text("x = 1\\n")
+        (Path(tmpdir) / "broken.py").write_text("if True\\n    pass\\n")
         result = tools.syntax_check(paths=["."])
-        _test_result(
-            "mixed valid/invalid",
-            not result.success
-            and "broken.py" in result.content
-            and "good.py" not in result.content  # should report errors only
-            and "error" in result.content.lower(),
-        )
+        _test_result("mixed valid/invalid", not result.success and "broken.py" in result.content)
 
-    # Test 5: Empty Python file
     with tempfile.TemporaryDirectory() as tmpdir:
         tools = BaseTools(Path(tmpdir))
         (Path(tmpdir) / "empty.py").write_text("")
-
         result = tools.syntax_check(paths=["empty.py"])
-        _test_result(
-            "empty file valid",
-            result.success,
-        )
+        _test_result("empty file valid", result.success)
 
-    # Test 6: No Python files
     with tempfile.TemporaryDirectory() as tmpdir:
         tools = BaseTools(Path(tmpdir))
         (Path(tmpdir) / "data.json").write_text("{}")
-
         result = tools.syntax_check(paths=["."])
-        _test_result(
-            "no python files",
-            not result.success and "没有找到" in result.content,
-        )
+        _test_result("no python files", not result.success and "没有找到" in result.content)
+"""
 
 
 # ═══════════════════════════════════════════════════════════════
@@ -237,7 +198,7 @@ def main():
 
     tests = [
         test_count_occurrences,
-        test_syntax_check,
+        # test_syntax_check,  # removed — syntax_check tool has been deactivated
     ]
 
     for test in tests:
