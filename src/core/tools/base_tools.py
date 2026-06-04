@@ -671,8 +671,8 @@ class BaseTools:
 
     def search_code(
         self,
-        paths: List[str],
-        patterns: List[str],
+        paths: Optional[List[str]] = None,
+        patterns: List[str] = None,
         context_lines: int = 0,
         case_sensitive: bool = False,
         max_matches: int = 50,
@@ -682,7 +682,7 @@ class BaseTools:
         """Search files for regex patterns (pure-Python, cross-platform).
 
         Args:
-            paths:         File/directory/glob path specifiers.
+            paths:         File/directory/glob path specifiers (default ``["."]``).
             patterns:      Regex patterns (OR logic — a line matching any
                            one of them is a hit).
             context_lines: Lines of context shown before & after each match
@@ -697,13 +697,13 @@ class BaseTools:
         """
         # ── Validate inputs ───────────────────────────────────────
         if not paths:
-            return ToolResult("错误: 需要至少提供一个路径 (paths)", success=False)
+            paths = ["."]
         if not patterns:
             return ToolResult("错误: 需要至少提供一个模式 (patterns)", success=False)
 
         try:
             context_lines = max(0, int(context_lines))
-            max_matches = max(1, int(max_matches))
+            max_matches = max(1, min(200, int(max_matches)))
         except (ValueError, TypeError):
             return ToolResult("错误: 数值参数无效", success=False)
 
@@ -778,87 +778,111 @@ class BaseTools:
                         break
 
             # ── Emit with context ─────────────────────────────────
-            for mi, (line_idx, matched_text) in enumerate(file_matches):
+            if not file_matches:
+                continue
+
+            # 1. No context — compact mode, line-number prefix only
+            if context_lines == 0:
+                file_header_printed = False
+                for line_idx, matched_text in file_matches:
+                    if total_matches >= max_matches:
+                        truncated = True
+                        break
+                    total_matches += 1
+                    if include_filename and not file_header_printed:
+                        output_lines.append(f"{file_path}")
+                        file_header_printed = True
+                    display = (matched_text[:200] + "..."
+                               if len(matched_text) > 200 else matched_text)
+                    prefix = f"{line_idx + 1}: " if include_line_number else ""
+                    output_lines.append(f"{prefix}{display}")
+                continue
+
+            # 2. Context mode — merge overlapping intervals
+            intervals = []
+            for idx, _ in file_matches:
+                start = max(0, idx - context_lines)
+                end = min(len(lines) - 1, idx + context_lines)
+                intervals.append([start, end, idx])
+
+            merged_blocks = []
+            if intervals:
+                intervals.sort(key=lambda x: x[0])
+                current_block = {
+                    'start': intervals[0][0], 'end': intervals[0][1],
+                    'hits': {intervals[0][2]},
+                }
+                for next_int in intervals[1:]:
+                    if next_int[0] <= current_block['end'] + 1:
+                        current_block['end'] = max(current_block['end'],
+                                                    next_int[1])
+                        current_block['hits'].add(next_int[2])
+                    else:
+                        merged_blocks.append(current_block)
+                        current_block = {
+                            'start': next_int[0], 'end': next_int[1],
+                            'hits': {next_int[2]},
+                        }
+                merged_blocks.append(current_block)
+
+            file_header_printed = False
+            for block in merged_blocks:
                 if total_matches >= max_matches:
                     truncated = True
                     break
 
-                # Group separator
-                if context_lines > 0 and mi > 0:
-                    output_lines.append("---")
-
-                if context_lines > 0:
-                    start = max(0, line_idx - context_lines)
-                    end = min(len(lines), line_idx + context_lines + 1)
-
-                    for ci in range(start, end):
+                block_lines = []
+                for ci in range(block['start'], block['end'] + 1):
+                    is_hit = ci in block['hits']
+                    if is_hit:
                         if total_matches >= max_matches:
                             truncated = True
                             break
+                        total_matches += 1
 
-                        raw = lines[ci].rstrip('\n\r')
-                        if len(raw) > 200:
-                            raw = raw[:200] + "..."
+                    raw = lines[ci].rstrip('\n\r')
+                    if len(raw) > 200:
+                        raw = raw[:200] + "..."
 
-                        prefix = ""
-                        if include_filename:
-                            prefix += str(file_path)
-                        if include_line_number:
-                            prefix += f":{ci + 1}" if prefix else str(ci + 1)
+                    line_prefix = f"{ci + 1}: " if include_line_number else ""
+                    block_lines.append(f"{line_prefix}{raw}")
 
-                        marker = ">" if ci == line_idx else ""
-                        if prefix:
-                            output_lines.append(f"{prefix}:{marker}{raw}")
-                        else:
-                            output_lines.append(f"{marker}{raw}")
+                if block_lines:
+                    if include_filename and not file_header_printed:
+                        output_lines.append(f"{file_path}")
+                        file_header_printed = True
+                    output_lines.extend(block_lines)
+                    output_lines.append("  ---")
 
-                        if ci == line_idx:
-                            total_matches += 1
-                else:
-                    # Compact one-line-per-match output
-                    prefix = ""
-                    if include_filename:
-                        prefix += str(file_path)
-                    if include_line_number:
-                        prefix += f":{line_idx + 1}" if prefix else str(line_idx + 1)
-
-                    display = matched_text
-                    if len(display) > 200:
-                        display = display[:200] + "..."
-
-                    out = f"{prefix}:{display}" if prefix else display
-                    output_lines.append(out)
-                    total_matches += 1
+            if output_lines and output_lines[-1] == "  ---":
+                output_lines.pop()
 
         # ── Build result text ─────────────────────────────────────
         result_parts: List[str] = []
 
         if total_matches == 0:
-            result_parts.append(f"未找到匹配: {patterns}")
+            result_parts.append(f"未找到任何匹配模式: {patterns}")
         else:
-            status = f" (已截断至 {max_matches} 条)" if truncated else ""
+            status = (" (⚠️ 系统触发 Hard-Cap 安全熔断，已强行截断)"
+                      if truncated else "")
             result_parts.append(
-                f"找到 {total_matches} 处匹配{status}: {patterns}"
+                f"🔍 搜索报告: 在项目中找到 {total_matches} 处核心匹配{status}"
             )
-            if truncated:
-                result_parts.append(f"前 {max_matches} 条匹配:")
+            result_parts.append("=" * 50)
             result_parts.extend(output_lines)
-            if truncated:
-                result_parts.append("")
-                result_parts.append(
-                    "提示: 使用更精确的模式或更少的文件来缩小搜索范围"
-                )
+
+        if truncated:
+            result_parts.append("\n" + "=" * 50)
+            result_parts.append(
+                "⚠️ 【系统核心警告】由于项目内匹配点过多，输出已被强制熔断。\n"
+                "请【严禁】尝试通过微调 paths 或重复运行此命令来刷取后续结果"
+                "（这会导致死循环报错）。\n"
+                "请立即换用更长、更精准的关键词（例如带上特定的函数名、"
+                "唯一的类前缀）来缩窄搜索范围！"
+            )
 
         if file_warnings:
-            result_parts.append("")
-            result_parts.append("警告:")
-            result_parts.extend(file_warnings)
-
-        result_parts.append(
-            ""
-            "[Tip: Use search_code for lightweight pattern searches; "
-            "write scripts only if necessary]"
-        )
+            result_parts.append("\n警告日志:\n" + "\n".join(file_warnings))
 
         return ToolResult("\n".join(result_parts))
 
@@ -866,8 +890,8 @@ class BaseTools:
 
     def count_occurrences(
         self,
-        paths: List[str],
-        patterns: List[str],
+        paths: Optional[List[str]] = None,
+        patterns: List[str] = None,
         case_sensitive: bool = False,
     ) -> ToolResult:
         """Count occurrences of regex patterns across files (compact output).
@@ -884,7 +908,7 @@ class BaseTools:
             Pattern "uid": 0 matches
         """
         if not paths:
-            return ToolResult("错误: 需要至少提供一个路径 (paths)", success=False)
+            paths = ["."]
         if not patterns:
             return ToolResult("错误: 需要至少提供一个模式 (patterns)", success=False)
 

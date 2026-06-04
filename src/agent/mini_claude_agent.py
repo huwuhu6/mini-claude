@@ -579,7 +579,7 @@ class MiniClaudeAgent:
                         'paths': {
                             'type': 'array',
                             'items': {'type': 'string'},
-                            'description': '文件或目录路径列表，支持通配符（*、**）。例如 ["*.py", "src/"]',
+                            'description': '文件或目录路径列表，支持通配符（*、**）。例如 ["*.py", "src/"]。不传则默认为项目根目录。',
                         },
                         'patterns': {
                             'type': 'array',
@@ -596,7 +596,7 @@ class MiniClaudeAgent:
                         },
                         'max_matches': {
                             'type': 'integer',
-                            'description': '最大匹配行数，超过则截断并提示。默认 50',
+                            'description': '最大匹配行数，超过则截断并提示。默认 50，最大 200',
                         },
                         'include_filename': {
                             'type': 'boolean',
@@ -607,7 +607,7 @@ class MiniClaudeAgent:
                             'description': '是否在输出中包含行号。默认 true',
                         },
                     },
-                    'required': ['paths', 'patterns'],
+                    'required': ['patterns'],
                 },
             },
             {
@@ -619,7 +619,7 @@ class MiniClaudeAgent:
                         'paths': {
                             'type': 'array',
                             'items': {'type': 'string'},
-                            'description': '文件或目录路径列表，支持通配符',
+                            'description': '文件或目录路径列表，支持通配符。不传则默认为项目根目录',
                         },
                         'patterns': {
                             'type': 'array',
@@ -631,7 +631,7 @@ class MiniClaudeAgent:
                             'description': '是否区分大小写。默认 false',
                         },
                     },
-                    'required': ['paths', 'patterns'],
+                    'required': ['patterns'],
                 },
             },
             # {
@@ -863,13 +863,17 @@ class MiniClaudeAgent:
         self.todo.update(items)
         return "Todo state successfully updated in the system background."
 
-    def _handle_search_code(self, paths: list, patterns: list,
+    def _handle_search_code(self, paths: list = None, patterns: list = None,
                              context_lines: int = 0,
                              case_sensitive: bool = False,
                              max_matches: int = 50,
                              include_filename: bool = True,
                              include_line_number: bool = True) -> str:
         """Handle search_code tool calls — delegate to BaseTools."""
+        if paths is None:
+            paths = ["."]
+        if patterns is None:
+            return "错误: 需要至少提供一个模式 (patterns)"
         result = self.tools.search_code(
             paths=paths, patterns=patterns,
             context_lines=context_lines,
@@ -880,9 +884,13 @@ class MiniClaudeAgent:
         )
         return result.content
 
-    def _handle_count_occurrences(self, paths: list, patterns: list,
+    def _handle_count_occurrences(self, paths: list = None, patterns: list = None,
                                    case_sensitive: bool = False) -> str:
         """Handle count_occurrences tool calls — delegate to BaseTools."""
+        if paths is None:
+            paths = ["."]
+        if patterns is None:
+            return "错误: 需要至少提供一个模式 (patterns)"
         result = self.tools.count_occurrences(
             paths=paths, patterns=patterns,
             case_sensitive=case_sensitive,
