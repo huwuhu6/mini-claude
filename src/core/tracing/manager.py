@@ -217,3 +217,8 @@ class TraceManager:
         """Set the current turn's message count (snapshot before LLM call)."""
         if self.current_turn:
             self.current_turn.message_count = count
+
+    def record_assistant_content(self, content: str) -> None:
+        """Record the LLM's text response for the current turn."""
+        if self.current_turn:
+            self.current_turn.assistant_content = content

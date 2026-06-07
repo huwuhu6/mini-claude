@@ -76,6 +76,7 @@ class TurnTrace:
     message_count: int = 0
     tool_calls_count: int = 0
     token_usage: int = 0
+    assistant_content: str = ""
     compression_triggered: bool = False
     reflection_triggered: bool = False
     tools: List[ToolTrace] = field(default_factory=list)
@@ -88,6 +89,7 @@ class TurnTrace:
             'message_count': self.message_count,
             'tool_calls_count': self.tool_calls_count,
             'token_usage': self.token_usage,
+            'assistant_content': self.assistant_content,
             'compression_triggered': self.compression_triggered,
             'reflection_triggered': self.reflection_triggered,
             'tools': [t.to_dict() for t in self.tools],

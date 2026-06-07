@@ -1154,6 +1154,9 @@ class MiniClaudeAgent:
                 content = parsed.get('content', '')
                 tool_calls = parsed.get('tool_calls', [])
 
+                # ── Trace: record assistant content ──
+                self.trace.record_assistant_content(content)
+
                 # ── Accumulate benchmark metrics ──
                 usage = parsed.get('usage', {})
                 self.last_metrics["total_tokens"] += usage.get('total_tokens', 0)
