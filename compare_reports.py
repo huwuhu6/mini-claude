@@ -323,6 +323,81 @@ def _load_task_descriptions() -> dict[str, str]:
     return descs
 
 
+def _load_latest_manifest(version_dir: Path) -> dict[str, Any] | None:
+    """读取版本目录中最近生成的运行清单；旧结果没有清单时返回 None。"""
+    manifests = sorted(
+        version_dir.glob("run_manifest_*.json"),
+        key=lambda path: path.stat().st_mtime,
+        reverse=True,
+    )
+    if not manifests:
+        return None
+    try:
+        data = json.loads(manifests[0].read_text(encoding="utf-8"))
+    except (OSError, json.JSONDecodeError) as exc:
+        return {"_error": f"无法读取 {manifests[0].name}: {exc}"}
+    return data if isinstance(data, dict) else {"_error": "manifest 顶层结构不是对象"}
+
+
+def _load_version_manifests(
+    versions: list[tuple[str, Path]],
+) -> dict[str, dict[str, Any] | None]:
+    return {version: _load_latest_manifest(version_dir) for version, version_dir in versions}
+
+
+def _short_sha(value: Any) -> str:
+    if not value:
+        return "-"
+    return str(value)[:8]
+
+
+def _render_provenance(
+    versions: list[tuple[str, Path]],
+    manifests: dict[str, dict[str, Any] | None],
+) -> list[str]:
+    """展示实验条件，并提示无法直接比较的版本。"""
+    lines = [
+        "## 运行条件\n",
+        "| 版本 | Agent 提交 | 工作区 | Python | 平台 | 任务集 | 用例数 |",
+        "|---|---|---|---|---|---:|---:|",
+    ]
+    suite_hashes: set[str] = set()
+    missing_manifest = False
+
+    for version, _ in versions:
+        manifest = manifests.get(version)
+        if not manifest:
+            missing_manifest = True
+            lines.append(f"| `{version}` | - | - | - | - | - | - |")
+            continue
+        if manifest.get("_error"):
+            missing_manifest = True
+            lines.append(f"| `{version}` | - | - | - | - | manifest 错误 | - |")
+            continue
+
+        agent = manifest.get("agent", {})
+        environment = manifest.get("environment", {})
+        suite_hash = str(manifest.get("task_suite_sha256", ""))
+        if suite_hash:
+            suite_hashes.add(suite_hash)
+        platform_name = str(environment.get("platform", "-")).replace("|", "\\|")
+        lines.append(
+            f"| `{version}` | `{_short_sha(agent.get('commit'))}` | "
+            f"{('dirty' if agent.get('dirty') else 'clean')} | "
+            f"{environment.get('python', '-')} | {platform_name} | "
+            f"`{_short_sha(suite_hash)}` | {len(manifest.get('tasks', []))} |"
+        )
+
+    if missing_manifest:
+        lines.append("> ⚠ 部分版本缺少可追溯的 run manifest，无法确认完整实验条件。")
+    if len(suite_hashes) > 1:
+        lines.append("> ⚠ 选中版本的 task suite hash 不一致，汇总差异不能直接归因于 Agent 代码变化。")
+    if missing_manifest or len(suite_hashes) > 1:
+        lines.append("> 建议：先确认任务集和运行环境，再解释轮数、Token 或成功率的变化。")
+    lines.append("")
+    return lines
+
+
 # ═══════════════════════════════════════════════════════════════
 # 格式化辅助
 # ═══════════════════════════════════════════════════════════════
@@ -744,6 +819,7 @@ def _render_report(
     matrix: dict[str, dict[str, dict[str, Any]]],
     detail: bool = False,
     descriptions: dict[str, str] | None = None,
+    manifests: dict[str, dict[str, Any] | None] | None = None,
 ) -> str:
     """组装完整 Markdown 报告。"""
     lines: list[str] = [
@@ -757,6 +833,9 @@ def _render_report(
     lines.append(f"> 版本: {', '.join(ver_names)}")
     lines.append(f"> 用例: {', '.join(sorted(matrix.keys())) or '(无)'}")
     lines.append("")
+
+    if manifests is not None:
+        lines.extend(_render_provenance(versions, manifests))
 
     lines.extend(_render_global_board(versions, matrix))
 
@@ -834,7 +913,14 @@ def main() -> None:
     print(f"  📋 共 {total_cases} 个用例")
 
     descriptions = _load_task_descriptions()
-    report = _render_report(versions, matrix, detail=args.detail, descriptions=descriptions)
+    manifests = _load_version_manifests(versions)
+    report = _render_report(
+        versions,
+        matrix,
+        detail=args.detail,
+        descriptions=descriptions,
+        manifests=manifests,
+    )
     output_path = Path(args.output)
     output_path.parent.mkdir(parents=True, exist_ok=True)
     output_path.write_text(report, encoding="utf-8")
