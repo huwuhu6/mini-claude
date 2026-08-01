@@ -1,0 +1,6 @@
+{
+  "case_id": "task_001_db_port",
+  "description": "Agent 能否识别并修复代码中硬编码的数据库端口号。验证方式：运行 run_test.py，检查是否输出「全部通过」字符串",
+  "prompt": "“运行 python run_test.py 会报错。请帮我分析原因并修复它。要求：只能修改 db.py 里的端口号（改为 8888），并确保运行 python run_test.py 时能成功打印出‘【🎉 终极大通关：所有跨模块测试完美通过！】’。”",
+  "verify_script_file": "verify.py"
+}

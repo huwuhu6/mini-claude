@@ -15,9 +15,15 @@ s_full.py
 task_list.md
 /example
 /logs
-/sandbox
+# Keep task fixtures versioned; generated evaluation results remain ignored.
+/sandbox/*
+!/sandbox/tasks/
+!/sandbox/tasks/**
+/sandbox/tasks/**/node_modules/
+/sandbox/tasks/**/__pycache__/
 
 # Personal / legacy docs
+docs/evolution/
 docs/legacy/
 docs/chat-logs/
 docs/pre-workflow-records/

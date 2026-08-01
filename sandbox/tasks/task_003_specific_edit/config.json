@@ -1,0 +1,6 @@
+{
+    "case_id": "task_003_specific_edit",
+    "description": "Agent 能否进行精确的局部代码修改，仅改动目标区域而不影响其他逻辑。验证方式：AST 分析检查折扣常量是否正确修改且无关函数未被触及",
+    "prompt": "请修改 coupon.py 文件。要求：将 VIP 优惠（calculate_vip_discount 函数）的折扣从 0.8 改为 0.7。注意：只能修改该函数内部的这一处逻辑，绝对不能影响新年优惠和大宗采购优惠的 0.8 折扣率。",
+    "verify_script_file": "verify.py"
+}

@@ -1,0 +1,6 @@
+{
+    "case_id": "task_010_json_flattener",
+    "description": "Code Generation - 数据处理：Agent 能否根据函数签名和 Docstring 实现递归 JSON 扁平化。验证方式：运行预设的 7 组单元测试。",
+    "prompt": "请完成 json_flattener.py 文件中的 flatten_json 函数。我已经写好了函数签名和文档注释，你只需要实现函数体。要求：1) 正确处理嵌套字典；2) 键使用点号连接；3) 不要修改函数签名和文档注释；4) 不要添加任何额外的打印语句。",
+    "verify_script_file": "verify.py"
+}

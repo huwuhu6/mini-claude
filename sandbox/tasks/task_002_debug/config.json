@@ -1,0 +1,6 @@
+{
+  "case_id": "task_002_debug",
+  "description": "Agent 能否自主排查并修复 Python 运行时错误。验证方式：运行 main.py，检查输出是否包含通关信息且返回码为 0",
+  "prompt": "**\"在当前目录下直接运行 `python main.py` 报错了。请帮我排查原因并彻底修复它，直到运行 `python main.py` 时能够顺利打印出'【🎉 恭喜通关：系统管道全部跑通！】'。\"**",
+  "verify_script_file": "verify.py"
+}

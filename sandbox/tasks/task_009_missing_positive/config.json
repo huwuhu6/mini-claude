@@ -1,0 +1,6 @@
+{
+    "case_id": "task_009_missing_positive",
+    "description": "Code Generation - 算法题：Agent 能否根据函数签名和 Docstring 生成正确的算法实现。验证方式：运行预设的 8 组单元测试。",
+    "prompt": "请完成 missing_positive.py 文件中的 find_first_missing_positive 函数。我已经写好了函数签名和文档注释，你只需要实现函数体。要求：1) 时间复杂度尽量优化；2) 不要修改函数签名和文档注释；3) 不要添加任何额外的打印语句。",
+    "verify_script_file": "verify.py"
+}

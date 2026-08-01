@@ -7,7 +7,7 @@ This file provides guidance to Claude Code when working in this repository.
 当需要理解系统设计或历史决策时，严禁盲目扫描整个项目。请优先读取以下精简文档：
 
 - **当前架构、入口和运行方式**: [README.md](README.md)
-- **技术演进历史**（防重复调用、FI 发展史）: [docs/evolution/tool_deduplication.md](docs/evolution/tool_deduplication.md)
+- **主题演进历史**: 本地 `docs/evolution/`，该目录不纳入 Git
 
 ## Language Rules
 

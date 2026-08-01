@@ -23,12 +23,15 @@ eval_runner.py — WF-2 工业级沙箱评测引擎
 from __future__ import annotations
 import argparse
 import gc
+import hashlib
 import json
 import os
+import platform
 import shutil
 import subprocess
 import sys
 import time
+from datetime import datetime, timezone
 from pathlib import Path
 from typing import Any, Optional
 
@@ -115,6 +118,125 @@ def _enforce_utf8_env() -> None:
         os.environ.setdefault("PYTHONUTF8", "1")
 
 
+def _sha256_file(path: Path) -> str:
+    """Return a content hash used to identify task fixtures."""
+    digest = hashlib.sha256()
+    with path.open("rb") as f:
+        for chunk in iter(lambda: f.read(1024 * 1024), b""):
+            digest.update(chunk)
+    return digest.hexdigest()
+
+
+def _sha256_tree(path: Path) -> str:
+    """Hash relative file names and contents in a deterministic order."""
+    digest = hashlib.sha256()
+    ignored_dirs = {"node_modules", "__pycache__"}
+    files = (
+        p for p in path.rglob("*")
+        if p.is_file() and not ignored_dirs.intersection(p.relative_to(path).parts)
+    )
+    for file_path in sorted(files):
+        digest.update(file_path.relative_to(path).as_posix().encode("utf-8"))
+        digest.update(_sha256_file(file_path).encode("ascii"))
+    return digest.hexdigest()
+
+
+def _git_metadata() -> dict[str, str | bool]:
+    """Capture lightweight source provenance without changing the worktree."""
+    try:
+        commit = subprocess.run(
+            ["git", "rev-parse", "HEAD"],
+            cwd=str(BASE_DIR), capture_output=True, text=True, check=True,
+        ).stdout.strip()
+        dirty = bool(subprocess.run(
+            ["git", "status", "--porcelain"],
+            cwd=str(BASE_DIR), capture_output=True, text=True, check=True,
+        ).stdout.strip())
+        return {"commit": commit, "worktree_dirty": dirty}
+    except (OSError, subprocess.CalledProcessError):
+        return {"commit": "unknown", "worktree_dirty": True}
+
+
+def _validate_task(case_dir: Path) -> tuple[dict[str, Any] | None, list[str]]:
+    """Validate the small task contract before an Agent is started."""
+    errors: list[str] = []
+    config_file = case_dir / "config.json"
+    try:
+        config = json.loads(config_file.read_text(encoding="utf-8"))
+    except (OSError, json.JSONDecodeError) as exc:
+        return None, [f"config.json 无法读取: {exc}"]
+
+    if config.get("case_id") != case_dir.name:
+        errors.append("case_id 必须与任务目录名一致")
+    if not isinstance(config.get("prompt"), str) or not config["prompt"].strip():
+        errors.append("prompt 必须是非空字符串")
+
+    baseline_dir = case_dir / "baseline"
+    if not baseline_dir.is_dir():
+        errors.append("缺少 baseline/ 目录")
+
+    verify_name = config.get("verify_script_file")
+    if verify_name is not None:
+        if not isinstance(verify_name, str) or not verify_name.strip():
+            errors.append("verify_script_file 必须是文件名或显式为 null")
+        else:
+            verify_path = (case_dir / verify_name).resolve()
+            try:
+                verify_path.relative_to(case_dir.resolve())
+            except ValueError:
+                errors.append("verify_script_file 不得越出任务目录")
+            if not verify_path.is_file():
+                errors.append(f"验证脚本不存在: {verify_name}")
+    elif (case_dir / "verify.py").is_file():
+        errors.append("存在 verify.py，但 config.json 未声明 verify_script_file")
+
+    return (config if not errors else None), errors
+
+
+def _task_metadata(case_dir: Path, config: dict[str, Any]) -> dict[str, Any]:
+    """Describe the exact fixture used by a run."""
+    verify_name = config.get("verify_script_file")
+    verify_path = case_dir / verify_name if verify_name else None
+    return {
+        "case_id": case_dir.name,
+        "task_version": config.get("task_version", 1),
+        "config_sha256": _sha256_file(case_dir / "config.json"),
+        "baseline_sha256": _sha256_tree(case_dir / "baseline"),
+        "verify_sha256": _sha256_file(verify_path) if verify_path else None,
+    }
+
+
+def _write_run_manifest(
+    version: str, run_id: str, case_dirs: list[Path], configs: dict[str, dict[str, Any]],
+) -> dict[str, Any]:
+    """Persist enough provenance to reproduce and interpret a result directory."""
+    tasks = [_task_metadata(case_dir, configs[case_dir.name]) for case_dir in case_dirs]
+    suite_digest = hashlib.sha256(
+        json.dumps(tasks, sort_keys=True).encode("utf-8")
+    ).hexdigest()
+    metadata: dict[str, Any] = {
+        "run_id": run_id,
+        "version_label": version,
+        "created_at_utc": datetime.now(timezone.utc).isoformat(),
+        "agent": _git_metadata(),
+        "eval_runner": {"path": str(Path(__file__).relative_to(BASE_DIR))},
+        "environment": {
+            "python": platform.python_version(),
+            "platform": platform.platform(),
+        },
+        "task_suite_sha256": suite_digest,
+        "tasks": tasks,
+    }
+    report_dir = OUTPUT_ROOT / version
+    report_dir.mkdir(parents=True, exist_ok=True)
+    manifest_path = report_dir / f"run_manifest_{run_id}.json"
+    manifest_path.write_text(
+        json.dumps(metadata, indent=2, ensure_ascii=False), encoding="utf-8"
+    )
+    print(f"  💾 运行元数据已归档: {manifest_path.relative_to(BASE_DIR)}")
+    return metadata
+
+
 # ═══════════════════════════════════════════════════════════════
 # Trace 搜寻
 # ═══════════════════════════════════════════════════════════════
@@ -137,7 +259,7 @@ def _find_latest_trace(workspace: Path) -> Optional[Path]:
 # ═══════════════════════════════════════════════════════════════
 
 def _compute_metrics(trace_data: dict) -> dict:
-    """从原始 trace 中解析 5 维工业级度量指标。"""
+    """Compute process metrics; definitions live in local evaluation_evolution.md."""
     turns = trace_data.get("turns", [])
     total_tool_calls = 0
     success_tool_calls = 0
@@ -188,12 +310,19 @@ def _prepare_sandbox(baseline_dir: Path) -> None:
 
     if baseline_dir.is_dir():
         for item in baseline_dir.iterdir():
+            if item.name in {"node_modules", "__pycache__"}:
+                continue
             dst = SHADOW_WORKSPACE / item.name
             if item.is_file():
                 shutil.copy2(item, dst)
             elif item.is_dir():
                 shutil.copytree(item, dst)
-        file_count = sum(1 for _ in baseline_dir.rglob("*") if _.is_file())
+        file_count = sum(
+            1 for p in baseline_dir.rglob("*")
+            if p.is_file() and not {"node_modules", "__pycache__"}.intersection(
+                p.relative_to(baseline_dir).parts
+            )
+        )
         print(f"  📁 baseline 已复制 ({file_count} files)")
 
 
@@ -227,7 +356,13 @@ def _run_agent(prompt: str) -> tuple[Optional[Path], float]:
 # 单 Case 运行器
 # ═══════════════════════════════════════════════════════════════
 
-def run_case(case_dir: Path, version: str, run_idx: int = 1, total_runs: int = 1) -> dict[str, Any]:
+def run_case(
+    case_dir: Path,
+    version: str,
+    run_metadata: dict[str, Any],
+    run_idx: int = 1,
+    total_runs: int = 1,
+) -> dict[str, Any]:
     """运行单个评测 case，返回结果字典。"""
     case_id = case_dir.name
     config_file = case_dir / "config.json"
@@ -311,6 +446,8 @@ def run_case(case_dir: Path, version: str, run_idx: int = 1, total_runs: int = 1
             metrics = _compute_metrics(trace_data)
 
             # 注入 5 维工业级度量指标（不覆盖原生字段 total_tokens/total_turns）
+            # 字段定义与统计口径见本地 docs/evolution/evaluation_evolution.md。
+            trace_data["evaluation_metadata"] = run_metadata
             trace_data["eval_result"] = verify_status
             trace_data["total_latency_seconds"] = total_latency
             trace_data["tool_call_precision"] = metrics.get("tool_call_precision", 1.0)
@@ -440,15 +577,35 @@ def main() -> None:
             sys.exit(1)
         print(f"  🔧 任务过滤: {', '.join(sorted(task_filter))} → 匹配 {len(case_dirs)} 个")
 
-    print(f"  📋 扫描到 {len(case_dirs)} 个 case\n")
+    task_configs: dict[str, dict[str, Any]] = {}
+    invalid_tasks: list[str] = []
+    for case_dir in case_dirs:
+        config, errors = _validate_task(case_dir)
+        if errors:
+            invalid_tasks.append(f"{case_dir.name}: {'；'.join(errors)}")
+        else:
+            task_configs[case_dir.name] = config  # type: ignore[assignment]
+    if invalid_tasks:
+        print("  ❌ 任务契约校验失败:")
+        for error in invalid_tasks:
+            print(f"     - {error}")
+        sys.exit(1)
+
+    print(f"  📋 扫描到 {len(case_dirs)} 个有效 case\n")
     if args.runs > 1:
         print(f"  🔧 每任务运行 {args.runs} 次\n")
+
+    run_id = datetime.now(timezone.utc).strftime("%Y%m%dT%H%M%SZ")
+    run_metadata = _write_run_manifest(version, run_id, case_dirs, task_configs)
 
     results: list[dict[str, Any]] = []
     for case_dir in case_dirs:
         for run_idx in range(1, args.runs + 1):
             try:
-                result = run_case(case_dir, version, run_idx=run_idx, total_runs=args.runs)
+                result = run_case(
+                    case_dir, version, run_metadata,
+                    run_idx=run_idx, total_runs=args.runs,
+                )
                 results.append(result)
             except Exception as exc:
                 print(f"  ❌ Case [{case_dir.name}] 崩溃: {exc}")

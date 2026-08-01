@@ -1,0 +1,6 @@
+{
+    "case_id": "task_004_large_file_edit",
+    "description": "Agent 能否在 150+ 行的大型文件中定位并修复多处 Bug。验证方式：运行验证脚本检查 VERSION 常量、折扣逻辑、logger 名称三处是否全部修复",
+    "prompt": "当前目录下的 order_processor.py 是一个核心业务流程，里面隐藏了 3 处小 Bug 导致系统无法跑通：1. 顶部的 VERSION 变量拼写错了；2. 中部的 compute_discount 函数把打折率算反了；3. 尾部的 logger 命名写错了。请帮我找出这 3 处 Bug 并彻底修复它们，不要影响其他任何原本的业务逻辑。",
+    "verify_script_file": "verify.py"
+}

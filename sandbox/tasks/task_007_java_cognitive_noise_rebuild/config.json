@@ -1,0 +1,11 @@
+{
+    "case_id": "task_007_java_cognitive_noise_rebuild",
+    "description": "测试在 Java 复杂多级目录下，Agent 能否利用 list_files(max_depth=2) 的短视防御隔离 target/等Token黑洞，并通过合并后的 search_code(count_only=true) 精准断言符号残留，防止大文件 write_file 全文默写带来的覆盖损毁。",
+    "prompt": "当前工作区是一个刚初始化的 Java 项目。由于底层依赖环境发生故障，目前严禁在终端运行任何系统级 Bash 探测命令（如 `ls`, `dir`, `find`, `grep` 等，运行会导致沙箱物理崩溃报错）。\n\n请完全通过原生的结构探索工具摸清项目架构，并完成以下重构任务：\n\n1. 首先统计整个项目中，变量名、参数名或字符串中包含 `user_token` 这一符号的总出现次数（要求使用最轻量、不带代码内容的统计方式以节省上下文 Token）。\n2. 找到 `UserContext.java` 文件，将其中的成员变量、构造函数参数、以及 Setter 方法参数名中的 `user_id` 或 `user_token` 统一精细化重构为 `session_token`。\n3. 找到 `AuthService.java` 文件，将 `validateSession` 方法签名中接收的第二个参数名由 `user_token` 修改为 `session_token`，并同步修改方法体内部的引用。\n4. 重构完成后，请再次统计项目中还剩下多少个 `user_token` 残留符号，并给出最终确认报告。\n\n【铁律约束】不允许对文件进行全文重写或重构无关模块（如 AppConfig.java 中的字符串常量绝对不准修改）。请进行精准局部修改。",
+  "expected_files": [
+        "src/main/java/com/app/config/AppConfig.java",
+        "src/main/java/com/app/model/UserContext.java",
+        "src/main/java/com/app/service/AuthService.java"
+  ],
+  "verify_script_file": "verify.py"
+}

@@ -1,0 +1,6 @@
+{
+    "case_id": "task_005_non_unique_context",
+    "description": "Agent 能否在存在相似代码段（多个 reset_ 函数）的环境中准确定位目标函数。验证方式：验证 order_processor_v2.py 中 reset_order_status 函数的常量是否正确修改",
+    "prompt": "当前目录下的 order_processor_v2.py 是一个订单处理业务流程。文件中存在一处需要修改的代码：在 reset_order_status 函数（尾部附近）中，有一行代码 self.orders_db[order_id][\"status\"] = \"PENDING\"。请将这一行的 \"PENDING\" 改为 \"PROCESSING\"。\n\n⚠️ 特别注意：文件头部 __init__ 方法中也有一行相似的代码 self.status = \"PENDING\"（约第30行）。请务必不要修改那一行！\n\n你必须在调用 edit_file 时提供足够长的上下文，确保 SEARCH 片段在文件中是唯一的，避免误伤头部代码。修改完成后请运行 python verify.py 验证结果。",
+    "verify_script_file": "verify.py"
+}

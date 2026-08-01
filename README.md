@@ -206,13 +206,7 @@ CLI
 
 ## 文档
 
-- [工具重复调用的演进记录](docs/evolution/tool_deduplication.md)：从同轮去重、跨轮软提示，到 LoopGuard 和语义级失败策略识别
-- [edit_file 演进记录](docs/evolution/edit_tool.md)：批量事务、匹配归一化、近似定位和原子写盘
-- [验证策略演进记录](docs/evolution/validation_strategy.md)：从增强验证到按风险选择最低充分验证
-- [上下文管理演进记录](docs/evolution/context_management.md)：读取输出、压缩和 Token 成本之间的取舍
-- `docs/evolution/`：按主题维护 Agent 可靠性、工具设计、上下文管理和评测优化的演进记录
-
-项目文档刻意保持精简；每个主题只维护一份演进记录，当前代码、测试和对应主题文档是主要参考资料。
+项目的主题演进记录保存在本地 `docs/evolution/`，不纳入 Git；每个方向只维护一份文档。当前代码、测试和对应主题文档是主要参考资料。
 
 ## 已知问题与边界
 

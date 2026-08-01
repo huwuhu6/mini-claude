@@ -1,0 +1,6 @@
+{
+  "case_id": "task_012_repo_context",
+  "description": "Repo-level Context Awareness - 接口废弃与迁移：Agent 能否在跨多文件、多层目录结构中将旧缓存接口 LocalCache 迁移到 RedisClient，并正确处理 API 差异（新增 ttl 参数）。",
+  "prompt": "当前目录下有一个小型微服务项目的代码库，包含以下结构：\n\n```\ncache/\n  __init__.py\n  local_cache.py      (旧接口，已废弃)\n  redis_client.py     (新接口，统一使用此接口)\nservices/\n  __init__.py\n  user_service.py     (业务层，当前使用 LocalCache)\n  product_service.py  (业务层，当前使用 LocalCache)\n  order_service.py    (业务层，当前使用 LocalCache)\nmain.py               (项目入口，初始化 LocalCache 并注入)\n```\n\n你的任务：将项目中**所有**使用 `LocalCache` 的地方迁移到 `RedisClient`。\n\n具体要求：\n1. **import 路径修改**：所有 `from cache.local_cache import LocalCache` 改为 `from cache.redis_client import RedisClient`\n2. **类名替换**：所有 `LocalCache` 的引用改为 `RedisClient`（包括构造函数参数类型注解、变量初始化等）\n3. **方法调用调整**：`cache.set(key, value)` 必须改为 `redis.set(key, value, ttl=300)`，注意新增 `ttl=300` 参数\n4. **main.py 修改**：`LocalCache()` 初始化改为 `RedisClient()`\n5. **变量名统一**：建议将 `cache` 变量名改为 `redis`，但这不是强制的\n6. 确保修改后所有文件语法正确，项目能正常运行\n\n⚠️ 注意事项：\n- RedisClient 的 `set` 方法与 LocalCache 不同，多了一个 `ttl` 参数（默认 300 秒），所有调用处都必须补上 `ttl=300`\n- 不要修改 redis_client.py 本身的实现\n- 不要修改函数的对外行为（get/set/delete 的逻辑语义保持不变）\n- 修改完成后请运行 `python verify.py` 验证结果\n\n这是一个典型的代码库级上下文理解任务，考验你能否在多文件中追踪依赖关系、理解接口差异并完成一致性迁移。",
+  "verify_script_file": "verify.py"
+}

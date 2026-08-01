@@ -1,0 +1,6 @@
+{
+    "case_id": "task_011_http_client",
+    "description": "Code Generation - API 封装：Agent 能否根据函数签名和 Docstring 实现带重试机制的 HTTP GET 封装。验证方式：使用 unittest.mock 模拟网络请求，运行 4 组单元测试。",
+    "prompt": "请完成 http_client.py 文件中的 fetch_with_retry 函数。我已经写好了函数签名和文档注释，你只需要实现函数体。要求：1) 使用 requests 库；2) 失败时等待 1 秒后重试；3) 正确处理非 200 状态码；4) 不要修改函数签名和文档注释；5) 不要添加任何额外的打印语句。",
+    "verify_script_file": "verify.py"
+}
