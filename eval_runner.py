@@ -8,6 +8,7 @@ eval_runner.py — WF-2 工业级沙箱评测引擎
   py eval_runner.py -v baseline               # -v 是 --version 的简写
   py eval_runner.py -t task_001              # 只跑指定任务（快速调试）
   py eval_runner.py -t task_001,task_002     # 逗号分隔多个任务
+  py eval_runner.py --validate-only          # 只校验任务契约，不启动 Agent
 
 工作流:
   1. 解析 CLI 参数（argparse --version/-v），确定版本名称
@@ -44,8 +45,6 @@ BASE_DIR = Path(__file__).resolve().parent
 _src = str(BASE_DIR / "src")
 if _src not in sys.path:
     sys.path.insert(0, _src)
-
-from agent.mini_claude_agent import MiniClaudeAgent
 
 # ═══════════════════════════════════════════════════════════════
 # 路径向内锁死 —— 所有评测行为路由到 sandbox/ 内部
@@ -328,6 +327,9 @@ def _prepare_sandbox(baseline_dir: Path) -> None:
 
 def _run_agent(prompt: str) -> tuple[Optional[Path], float]:
     """实例化 Agent 并执行 prompt，返回 (最新_trace_path, agent执行耗时)。"""
+    # 延迟导入，使 --validate-only 不依赖 LLM、tiktoken 或 API 环境。
+    from agent.mini_claude_agent import MiniClaudeAgent
+
     agent = None
     try:
         agent = MiniClaudeAgent(
@@ -544,6 +546,10 @@ def main() -> None:
         "--runs", "-r", type=int, default=1,
         help="每个任务运行次数（默认: 1）。多运行时 trace 文件会标注运行序号",
     )
+    parser.add_argument(
+        "--validate-only", action="store_true",
+        help="只校验任务契约，不启动 Agent 或写入评测结果",
+    )
     args = parser.parse_args()
     version = args.version
     task_filter: set[str] | None = None if not args.task else {t.strip() for t in args.task.split(",")}
@@ -592,6 +598,10 @@ def main() -> None:
         sys.exit(1)
 
     print(f"  📋 扫描到 {len(case_dirs)} 个有效 case\n")
+    if args.validate_only:
+        print("  ✅ 任务契约校验通过，未启动 Agent。")
+        return
+
     if args.runs > 1:
         print(f"  🔧 每任务运行 {args.runs} 次\n")
 
