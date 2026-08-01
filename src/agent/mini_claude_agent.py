@@ -314,6 +314,56 @@ class MiniClaudeAgent:
                 logger.warning(f"创建提供者 '{llm.provider}' 失败: {e}")
                 logger.info("正在无提供者模式下运行（功能受限）")
 
+    def _get_platform_prompt(self) -> str:
+        """Return a platform-specific command constraints block.
+
+        Uses sys.platform at runtime so the agent gets accurate guidance
+        about which shell commands are available vs forbidden on the
+        current OS. Replaces the old hardcoded Windows-only block.
+        """
+        plat = sys.platform
+
+        if plat == "win32":
+            return (
+                "CRITICAL RULES FOR CURRENT ENVIRONMENT (Windows CMD):\n"
+                "1. NO INLINE SCRIPTS: Never use `python -c \"...\"` or `node -e \"...\"` "
+                "in bash — CMD cannot handle nested quotes and newlines properly.\n"
+                "2. SCRIPT WORKFLOW: If you need to run complex logic or multi-line code, "
+                "you MUST first use `write_file` to save the code to a temporary file, "
+                "and then use `bash` to execute that file.\n"
+                "3. USE SEARCH_CODE FOR FILE SEARCHING: Do NOT call grep, "
+                "findstr, or Select-String via bash for content searching.\n"
+                "4. FORBIDDEN COMMANDS (Linux/macOS only): grep, ls, cat, rm -rf, "
+                "mv, cp, find, ps, kill, chmod, sudo, curl|bash, wget|sh, & background.\n"
+            )
+        elif plat == "linux":
+            return (
+                "CRITICAL RULES FOR CURRENT ENVIRONMENT (Linux bash):\n"
+                "1. NATIVE COMMANDS: grep, find, ls, cat, mv, cp, rm, ps, kill, chmod, "
+                "curl, wget are all available.\n"
+                "2. FORBIDDEN COMMANDS (Windows CMD only): dir, type, findstr, del, "
+                "copy, cd /d, D: drive paths, 2>nul, chcp, if exist.\n"
+                "3. USE SEARCH_CODE FOR FILE SEARCHING instead of complex grep pipelines "
+                "— it is more reliable and path-safe.\n"
+                "4. Prefer Python scripts over complex shell pipelines for multi-step logic.\n"
+            )
+        elif plat == "darwin":
+            return (
+                "CRITICAL RULES FOR CURRENT ENVIRONMENT (macOS zsh):\n"
+                "1. NOTE: macOS ships BSD tools — some GNU flags may not work "
+                "(e.g., `grep -P`, `find -name` syntax differs).\n"
+                "2. FORBIDDEN COMMANDS (Windows CMD only): dir, type, findstr, del, "
+                "copy, cd /d, D: drive paths, 2>nul, chcp, if exist.\n"
+                "3. USE SEARCH_CODE FOR FILE SEARCHING instead of grep/find.\n"
+                "4. Prefer Python scripts over complex shell pipelines.\n"
+            )
+        else:
+            return (
+                f"CRITICAL RULES FOR CURRENT ENVIRONMENT ({plat}):\n"
+                "1. USE SEARCH_CODE FOR FILE SEARCHING instead of shell grep/find.\n"
+                "2. Prefer Python scripts over complex shell pipelines.\n"
+            )
+
     def _load_system_prompt(self):
         """Load or generate the system prompt.v
 
@@ -339,20 +389,7 @@ class MiniClaudeAgent:
         "You can use tools to read/write files, run commands, and manage tasks.\n"
         "\n"
         # ── Layer 2: Critical rules (promoted — before skills) ─
-        "CRITICAL RULES FOR WINDOWS ENVIRONMENT:\n"
-        "1. NO INLINE SCRIPTS: Never use `python -c \"...\"` or `node -e \"...\"` "
-        "in the bash tool. Windows CMD cannot handle nested quotes and newlines properly.\n"
-        "2. SCRIPT WORKFLOW: If you need to run complex logic or multi-line code, "
-        "you MUST first use `write_file` to save the code to a temporary file "
-        "(e.g., script.py), and then use `bash` to execute that file "
-        "(e.g., `python script.py`).\n"
-        "3. VERIFY RESULTS STRICTLY: Do not assume a task is complete just because "
-        "a file exists or an exit code is 0. Verify the content or check the latest "
-        "modification timestamp to ensure your action actually succeeded.\n"
-        "4. USE SEARCH_CODE FOR FILE SEARCHING: When you need to search for patterns "
-        "in code or files, always use the `search_code` tool. Do NOT call grep, "
-        "findstr, or Select-String via the bash tool for file content searching.\n"
-        "\n"
+    ) + self._get_platform_prompt() + "\n" + (
         # ── Layer 3: Planning rule ───────────────────────────────
         "PLANNING RULE:"
         " Do not assume runtime testing is required."
@@ -482,10 +519,16 @@ class MiniClaudeAgent:
 
     def _get_llm_tools(self) -> List[Dict[str, Any]]:
         """Get tool definitions filtered by feature flags."""
+        _platform_label = {
+            'win32': 'Windows (CMD)',
+            'linux': 'Linux (bash)',
+            'darwin': 'macOS (zsh)',
+        }.get(sys.platform, sys.platform)
+
         all_tools = [
             {
                 'name': 'bash',
-                'description': 'Run a shell command.',
+                'description': f'Run a shell command. Platform: {_platform_label}.',
                 'input_schema': {
                     'type': 'object',
                     'properties': {

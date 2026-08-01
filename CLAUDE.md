@@ -4,13 +4,10 @@ This file provides guidance to Claude Code when working in this repository.
 
 ## Documentation Map (CRITICAL)
 
-当需要理解系统设计或历史决策时，严禁盲目扫描整个项目。请根据任务按需读取以下精简文档：
+当需要理解系统设计或历史决策时，严禁盲目扫描整个项目。请优先读取以下精简文档：
 
-- **静态架构快照**（当前包结构、环境约束）: [docs/architecture.md](docs/architecture.md)
+- **当前架构、入口和运行方式**: [README.md](README.md)
 - **技术演进历史**（防重复调用、FI 发展史）: [docs/evolution/tool_deduplication.md](docs/evolution/tool_deduplication.md)
-- **架构决策记录**（所有的 Proposed/Accepted ADR）: [docs/decision_log.md](docs/decision_log.md)
-- **基准评测指标与对照记录** : [docs/benchmarks.md](docs/benchmarks.md)
-- **优先级路线图**: [docs/roadmap.md](docs/roadmap.md)
 
 ## Language Rules
 

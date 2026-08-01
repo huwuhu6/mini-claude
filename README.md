@@ -1,228 +1,227 @@
-# mini-claude — Local Multi-Agent Runtime
+# mini-claude
 
-> **具备工业级沙箱隔离、并发控制与故障注入评测基座的本地多智能体底座。**
->
-> 不是一个 API Wrapper，不是 LangChain 的配置胶水，也不是堆砌 UI 的前端玩具。
-> 这是一个从**架构正确性**出发设计的 Agent Engine —— 关注隔离性、容错性、可观测性与可测试性。
+一个面向本地代码仓库的 coding agent runtime。项目从 `s_full.py` 的单文件原型演进而来，目前的主实现位于 `src/`，重点探索以下问题：
 
----
+- Agent 如何绑定并约束自己的 workspace
+- 如何安全地读写文件、执行 shell 命令并保持工作目录状态
+- 如何处理工具调用失败、重复调用、上下文压缩和有限重试
+- 如何记录结构化 trace，并用评测任务观察 Agent 的执行质量
+- 如何在单机环境中组织任务、子 Agent、队友和后台任务
 
-## Architecture Highlights
+这是一个以学习、架构实验和秋招面试展示为目标的项目，不是生产级的 Claude Code 替代品。
 
-### 1. Shadow Workspace + Two-Phase Commit（沙箱隔离与两阶段提交）
+## 当前入口
 
-子代理（SubAgent）的所有文件操作均在隔离的 **影子工作区**（`.claude/shadow/<task_id>/`）中执行，而非直接触碰主工作目录。
+推荐使用模块化 CLI：
 
-```
-主工作区                    影子工作区                  结果
-=======                    ==========                  ====
-                           subagent writes
-                           files in isolation
-                              │
-                    ┌───────┴───────┐
-                    │               │
-                 SUCCESS          FAILURE
-                    │               │
-                    ▼               ▼
-               COMMIT           ROLLBACK
-           copy2() merge     rmtree() + context
-           to main workdir   rollback to checkpoint
+```text
+mini-claude [path] [-y|--yes]
 ```
 
-- **COMMIT 阶段**：子代理成功后，`shutil.copy2()` 将产物合并回主工作区，保证原子性
-- **ROLLBACK 阶段**：子代理失败时，影子目录被完整销毁（`shutil.rmtree`），LLM 上下文回退到子代理调用前的 checkpoint，杜绝部分脏数据泄露
-- **防泄露验证**：评测任务 I 专门验证——子代理中途失败后，其写入的文件在主工作区不可见
+`path` 是 Agent 要操作的 workspace，省略时使用当前目录。启动时 CLI 会解析路径，并在需要时请求 workspace 确认。
 
-### 2. MessageBus with RLock Concurrency Control（线程安全消息总线）
+`s_full.py` 是早期的单体参考实现，适合对照设计演进，不是当前推荐入口。
 
-消息总线是所有代理间通信的唯一通道，**所有关键路径**（`send`、`broadcast`、`read_inbox`、`subscribe`）均由 `threading.Lock()` 保护。
+## 主要能力
 
-```
-Teammate A ──→ MessageBus (RLock) ──→ Teammate B
-                    │
-                    ├── 持久化到磁盘（JSON）
-                    ├── 通知订阅者回调
-                    └── 读取后自动清理（防止磁盘泄漏）
-```
+### Runtime 与工具
 
-- 支持 **4 种消息类型**：DIRECT / BROADCAST / SYSTEM / TASK_UPDATE
-- 支持 **4 级优先级**：LOW / NORMAL / HIGH / CRITICAL
-- 消息读取后自动删除持久化文件，防止磁盘泄漏
-- 重启后可恢复未读消息
+- `WorkspaceAuthority` 和 `RuntimeContext`：集中管理 workspace、路径解析、shell 会话和命令策略
+- 文件工具：读取、写入、编辑和搜索代码
+- shell 工具：在受控 workspace 中执行命令，并维护当前工作目录
+- 工具调用循环：支持多轮 LLM 响应、工具执行和结果回传
 
-### 3. Fault-Injection Evaluation Harness（故障注入评测基座）
+### Agent 可靠性
 
-内置 `eval_runner.py` 提供 9 个基准评测任务（A-I），覆盖 6 大容错维度：
+- `LoopController`、`LoopGuard`：对重复工具调用和异常循环进行限制
+- `Failure Intelligence`：对失败进行分类，记录策略指纹，并决定是否升级或终止
+- `Compressor`：对长对话进行上下文压缩
+- `TraceManager`：把任务、轮次和工具调用写入 `.traces/`
 
-| 任务 | 名称 | 测试维度 |
-|------|------|---------|
-| A | File I/O | 基础工具调用正确性 |
-| B | 环境探针 | 系统环境交互能力 |
-| C | 容错测试 | 异常文件路径的优雅处理 |
-| D | 长上下文记忆与压缩容错 | Token 压缩后关键信息保持 |
-| E | 子代理委托测试 | SubAgent 隔离执行正确性 |
-| F | 底层异常与重试容错 | **故障注入**——工具调用中途崩溃后的自愈 |
-| G | 多轮对话退化测试 | 多轮交互中记忆持久性 |
-| H | 参数幻觉自愈测试 | LLM 幻觉参数后的自我纠正 |
-| I | 回滚状态防泄露测试 | Shadow Workspace 2PC 回滚完整性 |
+### 扩展能力
 
-评测框架支持：
-- **故障注入**（`fault_inject`）：通过 `unittest.mock` 在工具调用中途注入崩溃，验证 Agent 的重试与自愈逻辑
-- **多轮对话模式**（`prompts` 列表）：在同一 Agent 实例上连续发送多条消息
-- **后置初始化钩子**（`post_agent_init`）：在评测前动态修改 Agent 行为（如强制子代理快速失败）
-- 所有结果自动追加到 `logs/eval_results.csv`
+- DeepSeek 和 Anthropic provider 抽象及 provider manager
+- JSON 文件持久化的任务和队友状态
+- 子 Agent、MessageBus、后台任务和 skills loader
+- `eval_runner.py`：基于 `sandbox/tasks/` 的隔离评测运行器
+- `compare_reports.py`：比较历史评测 trace 并生成报告
 
-### 4. Pluggable Feature System with Dependency Resolution
+这些模块的成熟度不完全相同。CLI、runtime context、工具循环、trace 和评测代码属于当前主线；队友、后台任务、skills 和部分历史兼容逻辑更适合视为实验性或扩展模块。
 
-功能管理器支持运行时动态启用/禁用模块，并提供**依赖解析**：
+## 快速开始
 
-```python
-FeatureDefinition(
-    name='subagent',
-    enabled=True,
-    dependencies=[
-        FeatureDependency(feature='tasks', required=True),   # 依赖任务系统启用
-        FeatureDependency(feature='background', required=False),  # 可选依赖
-    ]
-)
-```
+### 环境
 
-### 5. Dict-Based Tool Dispatch（字典路由模式）
+- Python 3.10+
+- 一个可用的 DeepSeek 或 Anthropic API key
+- Windows、macOS、Linux 均可运行；shell 命令策略会随平台产生差异
 
-遵循 s_full.py 的核心设计原则——**永不使用硬编码 if/elif 链**：
-
-```python
-self.tool_dispatcher = {
-    "bash":       self._handle_bash,
-    "read_file":  self._handle_read_file,
-    "write_file": self._handle_write_file,
-    "edit_file":  self._handle_edit_file,
-    "task":       self._handle_task,
-    ...
-}
-```
-
-符合开闭原则（Open/Closed Principle）：新增工具只需注册键值对，无需修改路由逻辑。
-
-### 6. Multi-Provider Failover
-
-支持 Deepseek（OpenAI 兼容 API）和 Anthropic（原生 SDK）双提供者，提供健康检查、自动故障转移与 Provider Manager 统一路由。
-
----
-
-## What it IS
-
-- **一个 Agent Runtime Engine**：定义了 Agent 的工具调度、子代理沙箱、消息通信、任务编排的完整生命周期
-- **一个架构参考实现**：展示了如何用 ~3000 行 Python 构建一个正确、隔离、可测试的多智能体系统
-- **一个可评测的 Agent 基座**：内置故障注入评测框架，可以量化和验证 Agent 的容错能力
-- **高信噪比**：每个模块都有明确的单一职责，没有为"看起来功能多"而堆砌代码
-
-## What it is NOT
-
-- ❌ 不是 LangChain / AutoGPT 的包装器或配置胶水
-- ❌ 不是带 UI 的 Chatbot 前端应用
-- ❌ 不是生产级分布式系统（当前为单机本地运行时）
-- ❌ 不是万能工具箱——它是一个**引擎**，不是应用商店
-
----
-
-## Project Structure
-
-```
-mini-claude/
-├── src/
-│   ├── agent/
-│   │   ├── mini_claude_agent.py   # 主 Agent：集成所有系统（~1300 行）
-│   │   └── minimal_agent.py       # 最小化 Agent（用于测试）
-│   ├── core/
-│   │   ├── tools/base_tools.py    # 安全工具：bash / read / write / edit
-│   │   ├── subagent.py            # 子代理系统 + 故障注入
-│   │   ├── messaging/bus.py       # 消息总线（RLock 并发控制）
-│   │   ├── background.py          # 异步命令执行器
-│   │   ├── compression.py         # 上下文压缩（tiktoken）
-│   │   ├── console.py             # REPL 命令系统
-│   │   ├── teammate_manager.py    # 队友生命周期管理
-│   │   └── features/manager.py    # 可插拔功能管理 + 依赖解析
-│   ├── models/
-│   │   ├── config.py              # 配置数据类 + YAML 加载
-│   │   ├── task.py                # 任务模型 + 依赖管理
-│   │   ├── teammate.py            # 队友数据模型
-│   │   └── todo.py                # 短期待办管理器
-│   ├── providers/
-│   │   ├── base.py                # LLM Provider 抽象基类
-│   │   ├── deepseek.py            # Deepseek API 实现
-│   │   ├── anthropic.py           # Anthropic API 实现
-│   │   └── manager.py             # Provider 管理器 + 故障转移
-│   └── skills/loader.py           # 技能发现与加载器
-├── configs/default.yaml           # 默认配置
-├── skills/                        # 可加载技能模块（PDF / Git / Python）
-├── eval_runner.py                 # 评测基座（9 个基准任务 + 故障注入）
-├── s_full.py                      # 原始单体参考实现
-└── tests/
-    └── integration/
-        └── test_all_modules.py    # 85 个集成测试
-```
-
----
-
-## Quick Start
-
-### 环境要求
-
-- Python 3.10+（本项目使用 `py` 启动器，Python 3.14）
-- Windows / macOS / Linux
-
-### 1. 安装依赖
+### 安装
 
 ```bash
-pip install -r requirements.txt
+python -m venv .venv
+
+# Windows PowerShell
+.\.venv\Scripts\Activate.ps1
+
+# macOS / Linux
+# source .venv/bin/activate
+
+python -m pip install -r requirements-dev.txt
+python -m pip install -e .
 ```
 
-### 2. 配置 API 密钥
+复制环境变量模板并填写 API key：
 
 ```bash
-cp .env.example .env
-# 编辑 .env，填入 DEEPSEEK_API_KEY 和/或 ANTHROPIC_API_KEY
+# Windows PowerShell
+Copy-Item .env.example .env
+
+# macOS / Linux
+# cp .env.example .env
 ```
 
-### 3. 运行 Agent
+至少配置以下变量之一：
+
+```dotenv
+DEEPSEEK_API_KEY=your_key
+ANTHROPIC_API_KEY=your_key
+```
+
+默认 provider、模型、功能开关和运行时目录可在 `configs/default.yaml` 中查看。部分配置也会从环境变量读取。
+
+### 启动 CLI
 
 ```bash
-# 主 Agent（交互式 REPL）
-py s_full.py
+# 当前目录
+mini-claude
 
-# 运行评测基座
-py eval_runner.py
-
-# 运行集成测试
-py -m pytest tests/integration/test_all_modules.py -v
+# 指定 workspace，并跳过交互确认
+mini-claude . --yes
+mini-claude path/to/project -y
 ```
 
-### 4. REPL 命令
+也可以在仓库根目录直接运行模块入口：
 
-| 命令 | 功能 |
-|------|------|
-| `/tasks` | 列出所有任务 |
+```bash
+python -m cli.entrypoint . --yes
+```
+
+### REPL 命令
+
+常用内置命令包括：
+
+| 命令 | 作用 |
+| --- | --- |
+| `/help` | 查看可用命令 |
+| `/tasks` | 查看任务 |
 | `/team` | 查看队友状态 |
-| `/inbox` | 读取代理间消息 |
-| `/compact` | 手动压缩对话上下文 |
-| `/help` | 显示所有命令 |
+| `/inbox` | 查看 Agent 消息 |
+| `/compact` | 手动压缩上下文 |
+| `/status` | 查看当前运行状态 |
 | `/exit` | 退出 |
 
----
+具体命令以 `src/core/console.py` 和运行时 `/help` 输出为准。
 
-## Key Design Decisions
+## 测试与评测
 
-| 决策 | 选择 | 理由 |
-|------|------|------|
-| 工具调度 | Dict 路由 | 开闭原则，易扩展，避免 if/elif 脆弱链 |
-| 子代理隔离 | Shadow Workspace + 2PC | 文件系统级隔离，失败零泄漏 |
-| 代理间通信 | MessageBus + RLock | 线程安全，解耦代理实例 |
-| 任务持久化 | 文件系统 JSON | 零依赖，可审计，重启不丢状态 |
-| LLM 提供者 | 抽象基类 + 工厂注册 | 多模型支持，故障自动转移 |
-| 功能管理 | 依赖解析的特征开关 | 运行时动态配置，避免条件编译 |
-| 评测框架 | 故障注入 + 多轮脚本 | 不仅测"对"，更测"错了之后能不能恢复" |
+运行集成测试：
 
----
+```bash
+python -m pytest tests/integration -q
+```
 
-*Built as an open-source portfolio project demonstrating Agent architecture design, fault tolerance patterns, and systems thinking.*
+运行评测任务：
+
+```bash
+python eval_runner.py
+python eval_runner.py --version local_experiment
+python eval_runner.py --task task_001
+```
+
+评测任务位于 `sandbox/tasks/`，结果默认写入 `sandbox/eval_results/<version>/`。评测会创建 shadow workspace，避免直接修改任务的 baseline 文件。
+
+比较历史结果：
+
+```bash
+python compare_reports.py
+```
+
+评测依赖真实 provider 时需要 API key。测试环境还需要能正常初始化 `tiktoken` 的编码资源；当前仓库对此存在已知的首次加载问题，见下方“已知问题”。
+
+## 目录结构
+
+```text
+mini-claude/
+├── src/
+│   ├── cli/                 CLI、workspace 确认与权限边界
+│   ├── agent/               MiniClaudeAgent 与精简 Agent
+│   ├── core/
+│   │   ├── runtime_context/ workspace、路径、shell、命令策略
+│   │   ├── tools/            文件和 shell 工具
+│   │   ├── tracing/          结构化 trace
+│   │   ├── failure_intelligence/ 失败分类与恢复策略
+│   │   ├── evaluation/      trace 指标
+│   │   ├── messaging/       MessageBus
+│   │   └── ...               任务、子 Agent、后台和功能管理
+│   ├── models/               配置、任务、队友和 todo 数据模型
+│   ├── providers/            LLM provider 抽象及实现
+│   └── skills/               skills 发现与加载
+├── configs/default.yaml      默认配置
+├── tests/integration/        集成测试
+├── sandbox/tasks/            评测任务 baseline 与验证脚本
+├── eval_runner.py            评测运行器
+├── compare_reports.py        评测结果比较工具
+├── s_full.py                 历史单文件参考实现
+└── docs/                     架构、决策、测试和演进记录
+```
+
+运行后可能出现以下目录：
+
+- `.tasks/`：持久化任务
+- `.team/`：队友状态
+- `.traces/`：任务 trace
+- `logs/`：运行日志或评测汇总
+- `sandbox/eval_results/`：评测归档结果
+
+这些目录大多是运行时产物，不应当作为源码阅读入口。
+
+## 架构主线
+
+```text
+CLI
+  -> workspace confirmation / authority
+  -> MiniClaudeAgent
+      -> ProviderManager
+      -> RuntimeContext
+          -> PathResolver / ShellSession / CommandPolicy
+      -> BaseTools
+      -> LoopController / LoopGuard
+      -> Failure Intelligence
+      -> TraceManager
+      -> optional: SubAgent / Team / Background / Skills
+```
+
+工具调用的核心循环是：LLM 响应 -> 解析 tool calls -> 执行工具 -> 写入 trace -> 把结果交回 LLM。失败时，系统会结合工具错误、循环保护和失败分类决定重试、升级或结束任务。
+
+## 文档
+
+- [工具重复调用的演进记录](docs/evolution/tool_deduplication.md)：从同轮去重、跨轮软提示，到 LoopGuard 和语义级失败策略识别
+- [edit_file 演进记录](docs/evolution/edit_tool.md)：批量事务、匹配归一化、近似定位和原子写盘
+- [验证策略演进记录](docs/evolution/validation_strategy.md)：从增强验证到按风险选择最低充分验证
+- [上下文管理演进记录](docs/evolution/context_management.md)：读取输出、压缩和 Token 成本之间的取舍
+- `docs/evolution/`：按主题维护 Agent 可靠性、工具设计、上下文管理和评测优化的演进记录
+
+项目文档刻意保持精简；每个主题只维护一份演进记录，当前代码、测试和对应主题文档是主要参考资料。
+
+## 已知问题与边界
+
+- 项目仍是单机、单进程为主的 runtime，不承诺生产级并发、分布式队列或多租户隔离。
+- 当前对话状态主要保存在进程内；进程异常退出后，完整 LLM 对话上下文不会自动恢复。
+- `s_full.py`、`minimal_agent.py`、模块化 Agent 和评测脚本并存，历史兼容代码仍增加了一定维护成本。
+- `src/core/compression.py` 会尝试初始化 `tiktoken`。即使 Python 包已安装，首次初始化也可能尝试联网下载编码资源；在受限网络环境中会导致测试收集失败。
+- 评测结果中的过程指标用于工程分析，不等同于通用 Agent 能力排名。
+
+## 适合展示的工程主题
+
+这个项目最适合用来讨论 Agent runtime 的工程问题：workspace 边界、工具调用循环、失败恢复、循环防护、trace/evaluation、模块化 provider，以及从单文件原型迁移到分层架构时的取舍。
