@@ -10,6 +10,7 @@ from compare_reports import (
     _include_manifest_cases,
     _include_result_cases,
     _load_all_metrics,
+    _fmt_cell,
     _render_coverage_notes,
     _render_provenance,
 )
@@ -147,6 +148,9 @@ def test_report_keeps_failed_case_without_trace():
 
     assert matrix["task_crashed"]["version"]["eval_result"] == "CRASHED"
     assert matrix["task_crashed"]["version"]["_trace_status"] == "MISSING"
+    assert "case_exception:RuntimeError" in _fmt_cell(matrix["task_crashed"]["version"] | {
+        "_failure_reason": "case_exception:RuntimeError: boom"
+    })
 
 
 def test_report_exposes_declared_but_missing_cases():

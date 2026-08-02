@@ -408,6 +408,7 @@ def _include_result_cases(
                 "eval_result": result.get("verify_status", "FAILED"),
                 "_trace_status": result.get("trace_status", "MISSING"),
                 "total_latency_seconds": result.get("total_latency_s"),
+                "_failure_reason": result.get("failure_reason"),
             }
 
 
@@ -603,7 +604,9 @@ def _fmt_cell(metrics: dict[str, Any]) -> str:
 
     if metrics.get("_trace_status") in {"MISSING", "INVALID"}:
         trace_label = "无 Trace" if metrics["_trace_status"] == "MISSING" else "Trace 无效"
-        return f"❌ {result} · {trace_label}"
+        reason = metrics.get("_failure_reason")
+        reason_label = f": {str(reason).replace('|', '/')}" if reason else ""
+        return f"❌ {result} · {trace_label}{reason_label}"
 
     turns_raw = metrics.get("total_turns")
     if isinstance(turns_raw, float):

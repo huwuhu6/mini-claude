@@ -328,8 +328,8 @@ def _prepare_sandbox(baseline_dir: Path) -> None:
         print(f"  📁 baseline 已复制 ({file_count} files)")
 
 
-def _run_agent(prompt: str) -> tuple[Optional[Path], float]:
-    """实例化 Agent 并执行 prompt，返回 (最新_trace_path, agent执行耗时)。"""
+def _run_agent(prompt: str) -> tuple[Optional[Path], float, str | None]:
+    """实例化 Agent 并执行 prompt，返回 trace、耗时和异常原因。"""
     # 延迟导入，使 --validate-only 不依赖 LLM、tiktoken 或 API 环境。
     from agent.mini_claude_agent import MiniClaudeAgent
 
@@ -345,10 +345,10 @@ def _run_agent(prompt: str) -> tuple[Optional[Path], float]:
         agent.chat(prompt)
         elapsed = round(time.perf_counter() - t0, 2)
         print(f"  ✅ Agent 执行完毕，耗时 {elapsed}s")
-        return _find_latest_trace(SHADOW_WORKSPACE), elapsed
+        return _find_latest_trace(SHADOW_WORKSPACE), elapsed, None
     except Exception as exc:
         print(f"  ❌ Agent 异常: {exc}")
-        return None, 0.0
+        return None, 0.0, f"agent_exception:{type(exc).__name__}: {exc}"
     finally:
         if agent:
             try:
@@ -393,10 +393,11 @@ def run_case(
     _prepare_sandbox(baseline_dir)
 
     # ── Step 2: 启动 Agent ───────────────────────────────
-    trace_path, agent_duration = _run_agent(prompt)
+    trace_path, agent_duration, agent_error = _run_agent(prompt)
 
     # ── Step 3: 动态路由断言（黄雀在后验证） ───────────────
     verify_status = "FAILED"
+    failure_reason = agent_error
     if verify_script_name and trace_path:
         script_src = case_dir / verify_script_name
         if script_src.exists():
@@ -425,21 +426,27 @@ def run_case(
                 if err.strip():
                     print(f"  → verify stderr:\n{err}")
                 verify_status = "SUCCESS" if result.returncode == 0 else "FAILED"
+                if result.returncode != 0:
+                    failure_reason = f"verify_exit_code:{result.returncode}"
                 print(f"  {'✅' if verify_status == 'SUCCESS' else '❌'} verify: {verify_status} (rc={result.returncode})")
             except subprocess.TimeoutExpired:
                 print("  ❌ verify 超时 (120s)")
                 verify_status = "FAILED"
+                failure_reason = "verify_timeout"
             except Exception as exc:
                 print(f"  ❌ verify 异常: {exc}")
                 verify_status = "CRASHED"
+                failure_reason = f"verify_exception:{type(exc).__name__}: {exc}"
         else:
             print(f"  ⚠ verify_script_file='{verify_script_name}' 不存在于 case 目录")
+            failure_reason = "verify_script_missing"
     elif not verify_script_name:
         print("  ⏭ verify_script_file 为 null，跳过验证")
         verify_status = "SKIPPED"
     else:
         print("  ⚠ verify_script_file 已定义但 trace 未生成，跳过验证")
         verify_status = "FAILED"
+        failure_reason = failure_reason or "trace_missing_before_verify"
 
     # ── Step 4: 核心对账 —— 黄雀在后解析器 ─────────────────
     total_latency = round(time.perf_counter() - t_start, 2)
@@ -485,6 +492,7 @@ def run_case(
         except Exception as exc:
             print(f"  ❌ Trace 对账异常: {exc}")
             trace_status = "INVALID"
+            failure_reason = f"trace_processing_error:{type(exc).__name__}: {exc}"
     else:
         print("  ⚠ 未找到 Trace JSON，跳过指标对账与归档")
 
@@ -506,6 +514,7 @@ def run_case(
         "loop_guard_blocking_rate": trace_data.get("loop_guard_blocking_rate"),
         "final_status": trace_data.get("final_status"),
         "trace_status": trace_status,
+        "failure_reason": failure_reason,
     }
 
 
@@ -654,6 +663,7 @@ def main() -> None:
                     "agent_duration_s": 0.0,
                     "total_latency_s": 0.0,
                     "trace_status": "MISSING",
+                    "failure_reason": f"case_exception:{type(exc).__name__}: {exc}",
                 })
 
     write_run_results(version, run_metadata, results)
