@@ -165,6 +165,9 @@ def _validate_task(case_dir: Path) -> tuple[dict[str, Any] | None, list[str]]:
     except (OSError, json.JSONDecodeError) as exc:
         return None, [f"config.json 无法读取: {exc}"]
 
+    if not isinstance(config, dict):
+        return None, ["config.json 顶层必须是 JSON 对象"]
+
     if config.get("case_id") != case_dir.name:
         errors.append("case_id 必须与任务目录名一致")
     if not isinstance(config.get("prompt"), str) or not config["prompt"].strip():

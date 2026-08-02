@@ -52,6 +52,15 @@ def test_verify_script_cannot_escape_task_directory():
     assert "verify_script_file 不得越出任务目录" in errors
 
 
+def test_config_must_be_a_json_object():
+    case_dir = TASKS_ROOT / "task_001_db_port"
+
+    with patch("eval_runner.Path.read_text", return_value="[]"):
+        _, errors = _validate_task(case_dir)
+
+    assert errors == ["config.json 顶层必须是 JSON 对象"]
+
+
 def test_fixture_hash_ignores_generated_directories():
     baseline = TASKS_ROOT / "task_007_java_cognitive_noise_rebuild" / "baseline"
     digest = hashlib.sha256()
