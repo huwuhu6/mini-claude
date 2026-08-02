@@ -134,20 +134,41 @@ python -m pytest tests/integration -q
 运行评测任务：
 
 ```bash
-python eval_runner.py
-python eval_runner.py --version local_experiment
-python eval_runner.py --task task_001
+python eval_runner.py --validate-only
+python eval_runner.py --version baseline
+python eval_runner.py --version local_experiment --task task_001 --runs 3
 ```
 
-评测任务位于 `sandbox/tasks/`，结果默认写入 `sandbox/eval_results/<version>/`。评测会创建 shadow workspace，避免直接修改任务的 baseline 文件。
+`--validate-only` 只检查任务契约，不启动 Agent。正式运行时，评测任务位于 `sandbox/tasks/`，每个任务由 `config.json`、`baseline/` 和可选的 `verify.py` 组成。评测会创建 shadow workspace，避免直接修改任务的 baseline 文件。
+
+每次运行会在 `sandbox/eval_results/<version>/` 生成：
+
+- `run_manifest_<run_id>.json`：Agent commit、运行环境、任务集哈希和 fixture 哈希；
+- `run_results_<run_id>.json`：每个 case 的执行状态、verify 诊断和 Trace 状态；
+- `trace_<case>.json` 或带 `_rNN` 后缀的多次运行 Trace。
 
 比较历史结果：
 
 ```bash
-python compare_reports.py
+python compare_reports.py --versions baseline,local_experiment --detail
+python compare_reports.py --tasks task_001_db_port,task_004_large_file_edit
 ```
 
+报告会展示运行条件、任务集一致性、用例覆盖、成功率、轮数、Token、工具调用和失败原因。不同任务集、历史结果缺少 manifest、无 Trace 或 Trace 无效时，报告会明确告警。
+
 评测依赖真实 provider 时需要 API key。测试环境还需要能正常初始化 `tiktoken` 的编码资源；当前仓库对此存在已知的首次加载问题，见下方“已知问题”。
+
+### 用评测结果优化 harness
+
+建议固定一个任务子集和运行次数，先建立基线，再一次只改一个 harness 机制：
+
+1. 运行 `--validate-only`，确认任务契约没有问题。
+2. 用 `--runs 3` 或更多重复运行，记录成功率、平均轮数、Token 和耗时。
+3. 用 `compare_reports.py --detail` 对比基线和改造版本。
+4. 先看是否改变任务成功率，再看轮数和 Token；最后结合 Trace、LoopGuard、压缩次数和 verify 输出定位原因。
+5. 将结论和失败样本记录到本地 `docs/evolution/`，再决定下一轮只改 runtime、工具、上下文或可靠性策略中的一个方向。
+
+不要把“工具调用更少”直接等同于更好：必须同时确认成功率没有下降，并检查是否出现未覆盖、无 Trace 或 verify 失败。
 
 ## 目录结构
 

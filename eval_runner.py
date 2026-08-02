@@ -58,6 +58,23 @@ _CONFIG_PATH = BASE_DIR / "configs" / "default.yaml"
 _BASH_LIKE_TOOLS = frozenset({"bash", "execute_command", "run_command"})
 
 
+def _positive_int(value: str) -> int:
+    try:
+        parsed = int(value)
+    except ValueError as exc:
+        raise argparse.ArgumentTypeError("必须是正整数") from exc
+    if parsed < 1:
+        raise argparse.ArgumentTypeError("必须是正整数")
+    return parsed
+
+
+def _version_label(value: str) -> str:
+    label = value.strip()
+    if not label or label in {".", ".."} or "/" in label or "\\" in label:
+        raise argparse.ArgumentTypeError("版本名必须是非空的单级目录名")
+    return label
+
+
 # ═══════════════════════════════════════════════════════════════
 # 暴力毁灭现场 —— 针对 Windows 句柄锁的多级强删
 # ═══════════════════════════════════════════════════════════════
@@ -593,7 +610,7 @@ def main() -> None:
         description="WF-2 沙箱评测引擎 — 工业级沙箱评测与多维指标对账",
     )
     parser.add_argument(
-        "--version", "-v", type=str, default="baseline",
+        "--version", "-v", type=_version_label, default="baseline",
         help="版本名称，产物归档到 sandbox/eval_results/{version}/（默认: baseline）",
     )
     parser.add_argument(
@@ -601,7 +618,7 @@ def main() -> None:
         help="只运行指定任务（逗号分隔多个，如 task_001,task_002）。不指定则运行全部。",
     )
     parser.add_argument(
-        "--runs", "-r", type=int, default=1,
+        "--runs", "-r", type=_positive_int, default=1,
         help="每个任务运行次数（默认: 1）。多运行时 trace 文件会标注运行序号",
     )
     parser.add_argument(

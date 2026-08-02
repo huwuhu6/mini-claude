@@ -2,10 +2,20 @@
 
 import json
 import hashlib
+from argparse import ArgumentTypeError
 from unittest.mock import patch
 from pathlib import Path
 
-from eval_runner import TASKS_ROOT, _sha256_tree, _truncate_output, _validate_task
+import pytest
+
+from eval_runner import (
+    TASKS_ROOT,
+    _positive_int,
+    _sha256_tree,
+    _truncate_output,
+    _validate_task,
+    _version_label,
+)
 from compare_reports import (
     _include_manifest_cases,
     _include_result_cases,
@@ -69,6 +79,15 @@ def test_verify_output_is_bounded_and_keeps_tail():
     assert output.startswith("...<truncated>...")
     assert output.endswith("a" * 10)
     assert _truncate_output("") is None
+
+
+def test_eval_cli_rejects_invalid_run_count_and_version_path():
+    with pytest.raises(ArgumentTypeError):
+        _positive_int("0")
+    with pytest.raises(ArgumentTypeError):
+        _version_label("../outside")
+    assert _positive_int("3") == 3
+    assert _version_label("local_experiment") == "local_experiment"
 
 
 def test_fixture_hash_ignores_generated_directories():
