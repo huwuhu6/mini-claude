@@ -8,6 +8,7 @@ from pathlib import Path
 from eval_runner import TASKS_ROOT, _sha256_tree, _validate_task
 from compare_reports import (
     _include_manifest_cases,
+    _include_result_cases,
     _load_all_metrics,
     _render_coverage_notes,
     _render_provenance,
@@ -125,6 +126,27 @@ def test_report_ignores_traces_from_an_older_run():
 
     assert set(matrix) == {"task_current"}
     assert matrix["task_current"]["version"]["total_turns"] == 3
+
+
+def test_report_keeps_failed_case_without_trace():
+    matrix = {}
+    versions = [("version", Path("unused"))]
+    manifests = {"version": {"run_id": "run-1"}}
+    results = {
+        "version": {
+            "run_id": "run-1",
+            "results": [{
+                "case_id": "task_crashed",
+                "verify_status": "CRASHED",
+                "trace_status": "MISSING",
+            }],
+        }
+    }
+
+    _include_result_cases(matrix, versions, manifests, results)
+
+    assert matrix["task_crashed"]["version"]["eval_result"] == "CRASHED"
+    assert matrix["task_crashed"]["version"]["_trace_status"] == "MISSING"
 
 
 def test_report_exposes_declared_but_missing_cases():

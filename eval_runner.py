@@ -375,7 +375,8 @@ def run_case(
 
     if not config_file.exists():
         return {"case_id": case_id, "verify_status": "NO_CONFIG",
-                "agent_duration_s": 0.0, "total_latency_s": 0.0}
+                "agent_duration_s": 0.0, "total_latency_s": 0.0,
+                "trace_status": "MISSING"}
 
     config = json.loads(config_file.read_text(encoding="utf-8"))
     prompt = config["prompt"]
@@ -444,6 +445,7 @@ def run_case(
     total_latency = round(time.perf_counter() - t_start, 2)
     metrics: dict[str, Any] = {}
     trace_data: dict[str, Any] = {}
+    trace_status = "MISSING"
 
     if trace_path and trace_path.exists():
         try:
@@ -476,11 +478,13 @@ def run_case(
                 encoding="utf-8",
             )
             print(f"  💾 Trace 已归档: {dest.relative_to(BASE_DIR)}")
+            trace_status = "ARCHIVED"
 
             # 删除原始 trace，避免沙箱残留
             trace_path.unlink(missing_ok=True)
         except Exception as exc:
             print(f"  ❌ Trace 对账异常: {exc}")
+            trace_status = "INVALID"
     else:
         print("  ⚠ 未找到 Trace JSON，跳过指标对账与归档")
 
@@ -501,6 +505,7 @@ def run_case(
         "self_healing_convergence_speed": trace_data.get("self_healing_convergence_speed"),
         "loop_guard_blocking_rate": trace_data.get("loop_guard_blocking_rate"),
         "final_status": trace_data.get("final_status"),
+        "trace_status": trace_status,
     }
 
 
@@ -525,6 +530,23 @@ def print_summary(results: list[dict], version: str) -> None:
     skipped = sum(1 for r in results if r["verify_status"] == "SKIPPED")
     print(f"\n  🏆 {passed}/{len(results)} 通过 | ❌ {failed} 失败 | "
           f"⏭ {skipped} 跳过")
+
+
+def write_run_results(version: str, run_metadata: dict[str, Any], results: list[dict]) -> Path:
+    """归档每个 case 的执行状态，覆盖没有生成 trace 的失败路径。"""
+    report_dir = OUTPUT_ROOT / version
+    report_dir.mkdir(parents=True, exist_ok=True)
+    output_path = report_dir / f"run_results_{run_metadata['run_id']}.json"
+    payload = {
+        "run_id": run_metadata["run_id"],
+        "version_label": version,
+        "results": results,
+    }
+    output_path.write_text(
+        json.dumps(payload, indent=2, ensure_ascii=False), encoding="utf-8"
+    )
+    print(f"  💾 Case 执行结果已归档: {output_path.relative_to(BASE_DIR)}")
+    return output_path
 
 
 # ═══════════════════════════════════════════════════════════════
@@ -631,8 +653,10 @@ def main() -> None:
                     "verify_status": "CRASHED",
                     "agent_duration_s": 0.0,
                     "total_latency_s": 0.0,
+                    "trace_status": "MISSING",
                 })
 
+    write_run_results(version, run_metadata, results)
     print_summary(results, version)
 
 

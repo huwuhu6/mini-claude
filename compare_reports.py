@@ -360,6 +360,57 @@ def _load_version_manifests(
     return {version: _load_latest_manifest(version_dir) for version, version_dir in versions}
 
 
+def _load_latest_results(version_dir: Path) -> dict[str, Any] | None:
+    """读取最近一次 run 的 case 状态归档。"""
+    result_files = sorted(
+        version_dir.glob("run_results_*.json"),
+        key=lambda path: path.stat().st_mtime,
+        reverse=True,
+    )
+    if not result_files:
+        return None
+    try:
+        data = json.loads(result_files[0].read_text(encoding="utf-8"))
+    except (OSError, json.JSONDecodeError) as exc:
+        return {"_error": f"无法读取 {result_files[0].name}: {exc}"}
+    return data if isinstance(data, dict) else {"_error": "run results 顶层结构不是对象"}
+
+
+def _load_version_results(
+    versions: list[tuple[str, Path]],
+) -> dict[str, dict[str, Any] | None]:
+    return {version: _load_latest_results(version_dir) for version, version_dir in versions}
+
+
+def _include_result_cases(
+    matrix: dict[str, dict[str, dict[str, Any]]],
+    versions: list[tuple[str, Path]],
+    manifests: dict[str, dict[str, Any] | None],
+    results_by_version: dict[str, dict[str, Any] | None],
+) -> None:
+    """将没有 trace 的 case 状态补入矩阵，避免执行结果消失。"""
+    for version, _ in versions:
+        results = results_by_version.get(version)
+        if not results or results.get("_error"):
+            continue
+        manifest = manifests.get(version)
+        expected_run_id = manifest.get("run_id") if manifest and not manifest.get("_error") else None
+        if expected_run_id and results.get("run_id") != expected_run_id:
+            continue
+        for result in results.get("results", []):
+            if not isinstance(result, dict) or not result.get("case_id"):
+                continue
+            case_id = str(result["case_id"])
+            version_metrics = matrix.setdefault(case_id, {}).get(version)
+            if version_metrics:
+                continue
+            matrix[case_id][version] = {
+                "eval_result": result.get("verify_status", "FAILED"),
+                "_trace_status": result.get("trace_status", "MISSING"),
+                "total_latency_seconds": result.get("total_latency_s"),
+            }
+
+
 def _manifest_case_ids(manifest: dict[str, Any] | None) -> set[str]:
     if not manifest or manifest.get("_error"):
         return set()
@@ -393,6 +444,7 @@ def _render_coverage_notes(
         observed = {
             case_id for case_id, case_data in matrix.items()
             if case_data.get(version)
+            and case_data[version].get("_trace_status") not in {"MISSING", "INVALID"}
         }
         missing = sorted(declared - observed)
         unexpected = sorted(observed - declared)
@@ -548,6 +600,10 @@ def _fmt_cell(metrics: dict[str, Any]) -> str:
         rate_prefix = ""
 
     result = metrics.get("eval_result", "—")
+
+    if metrics.get("_trace_status") in {"MISSING", "INVALID"}:
+        trace_label = "无 Trace" if metrics["_trace_status"] == "MISSING" else "Trace 无效"
+        return f"❌ {result} · {trace_label}"
 
     turns_raw = metrics.get("total_turns")
     if isinstance(turns_raw, float):
@@ -965,6 +1021,8 @@ def main() -> None:
 
     manifests = _load_version_manifests(versions)
     matrix = _load_all_metrics(versions, manifests)
+    results_by_version = _load_version_results(versions)
+    _include_result_cases(matrix, versions, manifests, results_by_version)
     _include_manifest_cases(matrix, manifests)
 
     # ── 用例过滤 ──────────────────────────────────────────
