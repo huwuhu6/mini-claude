@@ -139,6 +139,15 @@ python eval_runner.py --version baseline
 python eval_runner.py --version local_experiment --task task_001 --runs 3
 ```
 
+在 PowerShell 中需要使用反引号 `` ` `` 换行：
+
+```powershell
+py eval_runner.py `
+  --version local_experiment `
+  --task task_001 `
+  --runs 3
+```
+
 `--validate-only` 只检查任务契约，不启动 Agent。正式运行时，评测任务位于 `sandbox/tasks/`，每个任务由 `config.json`、`baseline/` 和可选的 `verify.py` 组成。评测会创建 shadow workspace，避免直接修改任务的 baseline 文件。
 
 每次运行会在 `sandbox/eval_results/<version>/` 生成：
