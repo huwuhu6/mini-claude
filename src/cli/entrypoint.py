@@ -1,22 +1,15 @@
-"""
-CLI Entrypoint for mini-claude.
+"""Command-line entry point for mini-claude."""
 
-Usage:
-    mini-claude                    # defaults to Path.cwd()
-    mini-claude .
-    mini-claude ./project
-    mini-claude /abs/path
-    mini-claude . --yes            # skip confirmation (CI/automation)
-    mini-claude . -y               # same as --yes
-"""
 from __future__ import annotations
+
 import argparse
 import logging
 import sys
 from pathlib import Path
 from typing import Optional
 
-# Ensure src is importable when running via `python -m cli.entrypoint`
+
+# Allow ``python -m cli.entrypoint`` to work directly from a source checkout.
 _src = Path(__file__).resolve().parent.parent
 if str(_src) not in sys.path:
     sys.path.insert(0, str(_src))
@@ -28,72 +21,64 @@ logger = logging.getLogger(__name__)
 
 
 def parse_args(argv: Optional[list[str]] = None) -> argparse.Namespace:
-    """Parse CLI arguments."""
     parser = argparse.ArgumentParser(
-        description="Mini-Claude Runtime — workspace-bound AI agent",
+        description="Mini-Claude Runtime - workspace-bound AI agent",
     )
     parser.add_argument(
-        "path", nargs="?", default=".",
+        "path",
+        nargs="?",
+        default=".",
         help="Workspace directory path (default: current directory)",
     )
     parser.add_argument(
-        "-y", "--yes", action="store_true",
-        help="跳过工作区确认（用于 CI / 自动化场景）",
+        "-y",
+        "--yes",
+        action="store_true",
+        help="Skip workspace confirmation (for CI and automation)",
     )
     return parser.parse_args(argv)
 
 
 def _run_repl(agent: MiniClaudeAgent) -> None:
-    """Interactive REPL loop — same as the original agent main()."""
-    print(f"\n=== {agent.config.agent.name} v{agent.config.agent.version} ===")
-    print("输入 'exit' 或 '/exit' 退出，'/help' 查看命令\n")
-    agent.print_status()
+    print(f"\n{agent.config.agent.name} v{agent.config.agent.version}")
+    print("输入 exit 退出，输入 /help 查看命令。\n")
 
     while True:
         try:
-            user_input = input("\n你: ").strip()
+            user_input = input("> ").strip()
             if not user_input:
                 continue
             if user_input.lower() in ("exit", "quit"):
-                print("再见！")
+                print("再见。")
                 break
+
             response = agent.chat(user_input)
             if response:
-                print(f"\n代理: {response}")
+                print(f"\n{response}")
         except (KeyboardInterrupt, EOFError):
-            print("\n\n再见！")
+            print("\n再见。")
             break
         except SystemExit:
             break
-        except Exception as e:
-            print(f"\n错误: {e}")
-            logger.exception("主循环出错")
+        except Exception as exc:
+            print(f"\n错误：{exc}")
+            logger.exception("REPL failed")
 
     agent.shutdown()
 
 
 def main(argv: Optional[list[str]] = None) -> None:
-    """Entrypoint: resolve workspace, confirm, launch agent."""
     args = parse_args(argv)
-
-    # ── Resolve workspace path ──────────────────────────────────
     workspace = Path(args.path).resolve()
 
-    # ── Non-interactive guard ───────────────────────────────────
     if not sys.stdin.isatty() and not args.yes:
-        print(
-            "Non-interactive environment requires --yes",
-            file=sys.stderr,
-        )
-        sys.exit(1)
+        print("非交互环境需要使用 --yes。", file=sys.stderr)
+        raise SystemExit(1)
 
-    # ── Runtime Ownership Boundary ──────────────────────────────
-    confirmed = args.yes or confirm_workspace(workspace)
-    if not confirmed:
-        print("Runtime 未启动。")
-        sys.exit(0)
+    if not (args.yes or confirm_workspace(workspace)):
+        print("未启动。")
+        raise SystemExit(0)
 
-    # ── Launch agent ────────────────────────────────────────────
     agent = MiniClaudeAgent(
         workspace_root=workspace,
         workspace_confirmed=True,

@@ -3,6 +3,7 @@ Mini Claude Agent - Unified agent integrating all systems.
 """
 from __future__ import annotations
 import logging
+from logging.handlers import RotatingFileHandler
 import os
 import sys
 import json
@@ -220,13 +221,21 @@ class MiniClaudeAgent:
         log_file = self.workdir / self.config.logging.file
 
         log_file.parent.mkdir(parents=True, exist_ok=True)
+        # Runtime diagnostics belong in the workspace log, not in the chat UI.
+        # force=True prevents a previous agent instance from keeping an old
+        # workspace's FileHandler when tests create multiple agents.
         logging.basicConfig(
             level=log_level,
             format=self.config.logging.format,
             handlers=[
-                logging.FileHandler(str(log_file), encoding='utf-8'),
-                logging.StreamHandler(sys.stdout),
-            ]
+                RotatingFileHandler(
+                    str(log_file),
+                    maxBytes=5 * 1024 * 1024,
+                    backupCount=3,
+                    encoding='utf-8',
+                ),
+            ],
+            force=True,
         )
 
         # Suppress verbose third-party logs

@@ -86,7 +86,6 @@ class TaskManager:
 
     def __init__(self, storage_dir: Path):
         self.storage_dir = storage_dir
-        self.storage_dir.mkdir(parents=True, exist_ok=True)
 
     def _task_path(self, task_id: str) -> Path:
         return self.storage_dir / f"task_{task_id}.json"
@@ -218,6 +217,7 @@ class TaskManager:
     # ── Persistence helper ────────────────────────────────────
 
     def _save(self, task: Task) -> None:
+        self.storage_dir.mkdir(parents=True, exist_ok=True)
         path = self._task_path(task.id)
         with open(path, 'w', encoding='utf-8') as f:
             json.dump(task.to_dict(), f, indent=2, ensure_ascii=False)

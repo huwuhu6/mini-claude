@@ -32,7 +32,6 @@ class TeammateManager:
         self._lock = threading.RLock()
         self._status_listeners: List[Callable[[str, TeammateStatus], None]] = []
         self._storage_dir = Path(config.directory)
-        self._storage_dir.mkdir(parents=True, exist_ok=True)
         self._load_teammates()
 
     # ── CRUD ─────────────────────────────────────────────────
@@ -188,6 +187,7 @@ class TeammateManager:
         return self._storage_dir / f"teammate_{teammate_id}.json"
 
     def _save(self, teammate: Teammate) -> None:
+        self._storage_dir.mkdir(parents=True, exist_ok=True)
         path = self._teammate_path(teammate.id)
         with open(path, 'w', encoding='utf-8') as f:
             json.dump(teammate.to_dict(), f, indent=2, ensure_ascii=False)

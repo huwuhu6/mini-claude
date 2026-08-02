@@ -451,6 +451,7 @@ class Compressor:
             path = self._transcript_dir / f"transcript_{transcript.id}.json"
             transcript.store_path = str(path)
             try:
+                self._transcript_dir.mkdir(parents=True, exist_ok=True)
                 with open(path, 'w', encoding='utf-8') as f:
                     json.dump(transcript.to_dict(), f, indent=2)
             except Exception as e:
