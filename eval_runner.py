@@ -503,7 +503,6 @@ def run_case(
             # 注入 5 维工业级度量指标（不覆盖原生字段 total_tokens/total_turns）
             # 字段定义与统计口径见本地 docs/evolution/evaluation_evolution.md。
             trace_data["evaluation_metadata"] = run_metadata
-            trace_data["eval_result"] = verify_status
             trace_data["total_latency_seconds"] = total_latency
             trace_data["tool_call_precision"] = metrics.get("tool_call_precision", 1.0)
             trace_data["loop_guard_blocking_rate"] = metrics.get("loop_guard_blocking_rate", 0.0)
@@ -512,6 +511,14 @@ def run_case(
             runtime_error = trace_data.get("runtime_error", "")
             if runtime_error:
                 failure_reason = f"agent_runtime_error: {runtime_error}"
+
+            final_status = trace_data.get("final_status", "")
+            eval_result = verify_status
+            if verify_status == "SUCCESS" and final_status not in ("", "SUCCESS"):
+                eval_result = "FAILED"
+                if not runtime_error:
+                    failure_reason = f"agent_final_status: {final_status}"
+            trace_data["eval_result"] = eval_result
 
             print(f"  📊 指标对账完成 — "
                   f"precision={trace_data['tool_call_precision']}, "
@@ -558,6 +565,7 @@ def run_case(
         "self_healing_convergence_speed": trace_data.get("self_healing_convergence_speed"),
         "loop_guard_blocking_rate": trace_data.get("loop_guard_blocking_rate"),
         "final_status": trace_data.get("final_status"),
+        "eval_result": trace_data.get("eval_result", verify_status),
         "runtime_error": trace_data.get("runtime_error", ""),
         "trace_status": trace_status,
         "failure_reason": failure_reason,

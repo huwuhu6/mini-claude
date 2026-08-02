@@ -404,7 +404,10 @@ def _include_result_cases(
 
         for case_id, case_results in grouped.items():
             version_metrics = matrix.setdefault(case_id, {}).get(version)
-            statuses = [item.get("verify_status", "FAILED") for item in case_results]
+            statuses = [
+                item.get("eval_result", item.get("verify_status", "FAILED"))
+                for item in case_results
+            ]
             pass_count = sum(status == "SUCCESS" for status in statuses)
             trace_statuses = [item.get("trace_status", "MISSING") for item in case_results]
             missing_trace_count = sum(status != "ARCHIVED" for status in trace_statuses)
