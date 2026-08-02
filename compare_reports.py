@@ -272,6 +272,7 @@ def _aggregate_metrics(all_metrics: list[dict]) -> dict[str, Any]:
 
 def _load_all_metrics(
     versions: list[tuple[str, Path]],
+    manifests: dict[str, dict[str, Any] | None] | None = None,
 ) -> dict[str, dict[str, dict[str, Any]]]:
     """返回 {case_id: {version: metrics_dict}}。
 
@@ -281,7 +282,21 @@ def _load_all_metrics(
     # 先按 (version, case_id) 分组，收集所有 run
     raw_groups: dict[tuple[str, str], list[dict]] = {}
     for ver_name, ver_dir in versions:
+        manifest = (manifests or {}).get(ver_name)
+        expected_run_id = (
+            manifest.get("run_id")
+            if manifest and not manifest.get("_error")
+            else None
+        )
         for tf in sorted(ver_dir.glob("trace_*.json")):
+            if expected_run_id:
+                try:
+                    trace_data = json.loads(tf.read_text(encoding="utf-8"))
+                except (OSError, json.JSONDecodeError):
+                    continue
+                trace_run_id = trace_data.get("evaluation_metadata", {}).get("run_id")
+                if trace_run_id != expected_run_id:
+                    continue
             case_id, _ = _parse_trace_filename(tf)
             metrics = _load_trace_metrics(tf)
             raw_groups.setdefault((ver_name, case_id), []).append(metrics)
@@ -896,7 +911,8 @@ def main() -> None:
     for vn, _ in versions:
         print(f"     - {vn}")
 
-    matrix = _load_all_metrics(versions)
+    manifests = _load_version_manifests(versions)
+    matrix = _load_all_metrics(versions, manifests)
 
     # ── 用例过滤 ──────────────────────────────────────────
     if args.tasks:
@@ -913,7 +929,6 @@ def main() -> None:
     print(f"  📋 共 {total_cases} 个用例")
 
     descriptions = _load_task_descriptions()
-    manifests = _load_version_manifests(versions)
     report = _render_report(
         versions,
         matrix,

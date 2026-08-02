@@ -6,7 +6,7 @@ from unittest.mock import patch
 from pathlib import Path
 
 from eval_runner import TASKS_ROOT, _sha256_tree, _validate_task
-from compare_reports import _render_provenance
+from compare_reports import _load_all_metrics, _render_provenance
 
 
 def test_all_task_contracts_are_valid():
@@ -69,3 +69,45 @@ def test_report_marks_versions_without_manifest_as_incomplete():
 
     report = "\n".join(report_lines)
     assert "缺少可追溯的 run manifest" in report
+
+
+def test_report_ignores_traces_from_an_older_run():
+    class FakeTrace:
+        def __init__(self, name, data):
+            self.name = name
+            self._data = data
+
+        def read_text(self, encoding):
+            return json.dumps(self._data)
+
+        def __lt__(self, other):
+            return self.name < other.name
+
+    class FakeVersionDir:
+        def glob(self, pattern):
+            return [
+                FakeTrace(
+                    "trace_task_old_r02.json",
+                    {
+                        "evaluation_metadata": {"run_id": "old-run"},
+                        "eval_result": "SUCCESS",
+                        "total_turns": 99,
+                    },
+                ),
+                FakeTrace(
+                    "trace_task_current.json",
+                    {
+                        "evaluation_metadata": {"run_id": "current-run"},
+                        "eval_result": "SUCCESS",
+                        "total_turns": 3,
+                    },
+                ),
+            ]
+
+    matrix = _load_all_metrics(
+        [("version", FakeVersionDir())],
+        {"version": {"run_id": "current-run"}},
+    )
+
+    assert set(matrix) == {"task_current"}
+    assert matrix["task_current"]["version"]["total_turns"] == 3
