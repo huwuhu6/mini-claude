@@ -1214,18 +1214,18 @@ class MiniClaudeAgent:
 
                 if not tool_calls:
                     self.messages.append(Message(role='assistant', content=content))
-                    if require_tool_call and not tool_call_seen and no_tool_retry_count == 0:
-                        no_tool_retry_count += 1
-                        self.messages.append(Message(
-                            role='user',
-                            content=(
-                                "请继续执行任务，不要只描述计划。请立即调用合适的工具，"
-                                "完成用户要求后再给出总结。"
-                            ),
-                        ))
-                        logger.warning("首轮未产生工具调用，已追加一次执行纠偏")
-                        continue
-                    if require_tool_call:
+                    if require_tool_call and not tool_call_seen:
+                        if no_tool_retry_count == 0:
+                            no_tool_retry_count += 1
+                            self.messages.append(Message(
+                                role='user',
+                                content=(
+                                    "请继续执行任务，不要只描述计划。请立即调用合适的工具，"
+                                    "完成用户要求后再给出总结。"
+                                ),
+                            ))
+                            logger.warning("首轮未产生工具调用，已追加一次执行纠偏")
+                            continue
                         self.trace.end_task("FAILED")
                         return content
                     self.trace.end_task("SUCCESS")
