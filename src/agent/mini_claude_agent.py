@@ -1250,7 +1250,6 @@ class MiniClaudeAgent:
                     fn = tc.get('function', {})
                     tname = fn.get('name', '')
                     args_raw = fn.get('arguments', '{}')
-                    args = json.loads(args_raw) if isinstance(args_raw, str) else args_raw
 
                     # Duplicate detection within same LLM response
                     sig = (tname, args_raw)
@@ -1258,6 +1257,33 @@ class MiniClaudeAgent:
                         logger.warning(f"检测到重复工具调用【{tname}】，已自动跳过")
                         continue
                     seen_tool_sigs.add(sig)
+
+                    try:
+                        args = json.loads(args_raw) if isinstance(args_raw, str) else args_raw
+                    except (json.JSONDecodeError, TypeError) as exc:
+                        # A malformed model argument should become tool feedback,
+                        # not terminate the entire agent task.
+                        result_text = f"工具参数 JSON 无效，请重新生成合法 JSON: {exc}"
+                        args_hash = canonicalize_args({"raw_arguments": str(args_raw)})
+                        self.trace.record_tool_call(
+                            tool_name=tname,
+                            args_hash=args_hash,
+                            success=False,
+                            error_message=result_text[:200],
+                            result_preview=result_text[:200],
+                            failure_category="INVALID_ARGUMENTS",
+                            recoverability="SELF_HEALABLE",
+                            cwd=str(self.runtime_context.cwd),
+                            workspace_root=str(self.runtime_context.workspace_root),
+                            session_id=self.runtime_context.shell_session.session_id,
+                        )
+                        self.messages.append(Message(
+                            role='tool',
+                            content=result_text,
+                            tool_call_id=tc.get('id', ''),
+                        ))
+                        logger.warning(f"工具参数解析失败【{tname}】，已反馈给 Agent: {exc}")
+                        continue
 
                     if tname == "TodoWrite":
                         used_todo = True
