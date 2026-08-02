@@ -1140,6 +1140,7 @@ class MiniClaudeAgent:
             user_prompt=self._current_user_prompt,
             workspace_root=str(self.runtime_context.workspace_root),
             workspace_confirmed=self._workspace_confirmed,
+            require_tool_call=require_tool_call,
         )
         self.runtime_context.current_task_id = tid
         self.failure_memory.set_task(tid)
@@ -1217,6 +1218,7 @@ class MiniClaudeAgent:
                     if require_tool_call and not tool_call_seen:
                         if no_tool_retry_count == 0:
                             no_tool_retry_count += 1
+                            self.trace.record_no_tool_retry(no_tool_retry_count)
                             self.messages.append(Message(
                                 role='user',
                                 content=(

@@ -50,7 +50,8 @@ class TraceManager:
 
     def start_task(self, task_id: str = "", user_prompt: str = "",
                     workspace_root: str = "",
-                    workspace_confirmed: bool = False) -> str:
+                    workspace_confirmed: bool = False,
+                    require_tool_call: bool = False) -> str:
         """Begin a new task-level trace.  Returns task_id."""
         tid = task_id or str(uuid.uuid4())[:8]
         self.current_task = TaskTrace(
@@ -58,10 +59,16 @@ class TraceManager:
             user_prompt=user_prompt[:500],
             workspace_root=workspace_root,
             workspace_confirmed=workspace_confirmed,
+            require_tool_call=require_tool_call,
         )
         self.current_turn = None
         logger.debug(f"Trace: task started [{tid}]")
         return tid
+
+    def record_no_tool_retry(self, count: int) -> None:
+        """Record the bounded retry caused by a missing tool call."""
+        if self.current_task is not None:
+            self.current_task.no_tool_retry_count = count
 
     def end_task(self, status: str) -> str:
         """Close the current task and write to disk.

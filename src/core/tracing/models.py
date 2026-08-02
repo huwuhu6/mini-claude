@@ -114,6 +114,8 @@ class TaskTrace:
     user_prompt: str = ""
     workspace_root: str = ""
     workspace_confirmed: bool = False
+    require_tool_call: bool = False
+    no_tool_retry_count: int = 0
     turns: List[TurnTrace] = field(default_factory=list)
 
     def to_dict(self) -> Dict[str, Any]:
@@ -133,5 +135,7 @@ class TaskTrace:
             'user_prompt': self.user_prompt,
             'workspace_root': self.workspace_root,
             'workspace_confirmed': self.workspace_confirmed,
+            'require_tool_call': self.require_tool_call,
+            'no_tool_retry_count': self.no_tool_retry_count,
             'turns': [t.to_dict() for t in self.turns],
         }

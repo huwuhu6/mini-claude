@@ -277,6 +277,15 @@ class TestTraceRuntimeContextFields:
         assert tm.current_task.workspace_root == "/project"
         tm.end_task("SUCCESS")
 
+    def test_trace_records_tool_call_guard_diagnostics(self):
+        tm = TraceManager(trace_dir=None)
+        tm.start_task(require_tool_call=True)
+        tm.record_no_tool_retry(1)
+        data = tm.current_task.to_dict()
+        assert data["require_tool_call"] is True
+        assert data["no_tool_retry_count"] == 1
+        tm.end_task("FAILED")
+
     def test_trace_manager_passes_runtime_fields_to_tooltrace(self):
         """Verify record_tool_call stores cwd/workspace_root/session_id."""
         tm = TraceManager(trace_dir=None)
