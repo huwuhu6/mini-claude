@@ -1,6 +1,6 @@
 {
-    "case_id": "task_006_cross_file_drift",
-    "description": "Agent 能否进行跨文件的参数重命名重构，保持调用链一致性。验证方式：跨模块导入并验证函数签名和调用链完整",
-    "prompt": "当前目录下有 3 个互相依赖的 Python 文件：db.py（数据访问层）、service.py（业务逻辑层）、controller.py（控制器层）。\n\n请完成以下重构任务：将核心函数中的参数名 `user_id` 统一改为 `uid`，将 `user_ids` 统一改为 `uids`。\n\n具体要求：\n1. db.py：修改 `get_user_by_id` 函数的参数名 `user_id` → `uid`\n2. service.py：修改以下函数的参数名：\n   - `get_user_service`: `user_id` → `uid`\n   - `get_user_profile`: `user_id` → `uid`\n   - `validate_user_permission`: `user_id` → `uid`\n   - `batch_get_users_service`: `user_ids` → `uids`\n3. controller.py：修改以下函数的参数名：\n   - `get_user`: `user_id` → `uid`\n   - `check_user_exists`: `user_id` → `uid`\n   - `get_user_profile`: `user_id` → `uid`\n   - `check_user_permission`: `user_id` → `uid`\n   - `batch_get_users`: `user_ids` → `uids`\n   - 以及对应的 api_* 全局函数\n\n⚠️ 注意：\n- 修改参数名时，必须同时修改函数体内对该参数的所有引用\n- 修改 `batch_get_users_service` 时，注意内部循环变量 `uid` 不要和参数名 `uids` 冲突\n- 确保修改后所有文件的语法正确，且相互调用能正常工作\n- 修改完成后请运行 `python verify.py` 验证结果\n\n这是一个典型的跨文件重构任务，考验你处理多文件依赖的能力。",
-    "verify_script_file": "verify.py"
+  "case_id": "task_006_cross_file_drift",
+  "description": "跨文件参数重命名：保持 db、service、controller 的调用链一致。验证脚本会精确检查指定函数签名、旧参数引用和代表性调用。",
+  "prompt": "当前目录有 3 个相互依赖的 Python 文件：db.py（数据访问层）、service.py（业务逻辑层）、controller.py（控制器层）。请完成一次有范围的参数重命名：将指定核心函数中的 user_id 改为 uid，将 user_ids 改为 uids，并同步修改这些函数体内的引用和跨文件调用。\n\n要求：\n1. db.py：只需修改 get_user_by_id 的参数及其函数体引用。\n2. service.py：修改 get_user_service、get_user_profile、validate_user_permission 的 user_id -> uid；修改 batch_get_users_service 的 user_ids -> uids。\n3. controller.py：修改 UserController.get_user、check_user_exists、get_user_profile、check_user_permission 的 user_id -> uid；修改 UserController.batch_get_users 的 user_ids -> uids；同步修改 api_get_user、api_check_user_exists、api_get_user_profile、api_batch_get_users 的参数和调用。\n4. 保持其他未列出的旧接口不变。修改 batch 函数时，内部循环变量可以继续使用 uid，但不要与参数 uids 混淆。\n5. 确保 Python 语法正确，跨文件调用可以正常运行。完成后根据实际代码判断是否还需要额外验证，不要修改评测脚本。",
+  "verify_script_file": "verify.py"
 }
