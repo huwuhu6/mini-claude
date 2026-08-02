@@ -360,6 +360,54 @@ def _load_version_manifests(
     return {version: _load_latest_manifest(version_dir) for version, version_dir in versions}
 
 
+def _manifest_case_ids(manifest: dict[str, Any] | None) -> set[str]:
+    if not manifest or manifest.get("_error"):
+        return set()
+    return {
+        str(task["case_id"])
+        for task in manifest.get("tasks", [])
+        if isinstance(task, dict) and task.get("case_id")
+    }
+
+
+def _include_manifest_cases(
+    matrix: dict[str, dict[str, dict[str, Any]]],
+    manifests: dict[str, dict[str, Any] | None],
+) -> None:
+    """保留 manifest 声明但没有 trace 的用例，让报告显示缺失覆盖。"""
+    for manifest in manifests.values():
+        for case_id in _manifest_case_ids(manifest):
+            matrix.setdefault(case_id, {})
+
+
+def _render_coverage_notes(
+    versions: list[tuple[str, Path]],
+    matrix: dict[str, dict[str, dict[str, Any]]],
+    manifests: dict[str, dict[str, Any] | None],
+) -> list[str]:
+    lines: list[str] = []
+    for version, _ in versions:
+        declared = _manifest_case_ids(manifests.get(version))
+        if not declared:
+            continue
+        observed = {
+            case_id for case_id, case_data in matrix.items()
+            if case_data.get(version)
+        }
+        missing = sorted(declared - observed)
+        unexpected = sorted(observed - declared)
+        if missing:
+            lines.append(
+                f"> ⚠ `{version}` 的 manifest 声明了 {len(declared)} 个用例，"
+                f"但只发现 {len(observed)} 个有效 trace；未覆盖: {', '.join(missing)}"
+            )
+        if unexpected:
+            lines.append(
+                f"> ⚠ `{version}` 发现了 manifest 未声明的 trace: {', '.join(unexpected)}"
+            )
+    return lines
+
+
 def _short_sha(value: Any) -> str:
     if not value:
         return "-"
@@ -851,6 +899,10 @@ def _render_report(
 
     if manifests is not None:
         lines.extend(_render_provenance(versions, manifests))
+        coverage_notes = _render_coverage_notes(versions, matrix, manifests)
+        lines.extend(coverage_notes)
+        if coverage_notes:
+            lines.append("")
 
     lines.extend(_render_global_board(versions, matrix))
 
@@ -913,6 +965,7 @@ def main() -> None:
 
     manifests = _load_version_manifests(versions)
     matrix = _load_all_metrics(versions, manifests)
+    _include_manifest_cases(matrix, manifests)
 
     # ── 用例过滤 ──────────────────────────────────────────
     if args.tasks:

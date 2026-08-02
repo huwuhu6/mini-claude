@@ -6,7 +6,12 @@ from unittest.mock import patch
 from pathlib import Path
 
 from eval_runner import TASKS_ROOT, _sha256_tree, _validate_task
-from compare_reports import _load_all_metrics, _render_provenance
+from compare_reports import (
+    _include_manifest_cases,
+    _load_all_metrics,
+    _render_coverage_notes,
+    _render_provenance,
+)
 
 
 def test_all_task_contracts_are_valid():
@@ -111,3 +116,15 @@ def test_report_ignores_traces_from_an_older_run():
 
     assert set(matrix) == {"task_current"}
     assert matrix["task_current"]["version"]["total_turns"] == 3
+
+
+def test_report_exposes_declared_but_missing_cases():
+    versions = [("version", Path("unused"))]
+    manifests = {"version": {"tasks": [{"case_id": "task_missing"}]}}
+    matrix = {"task_done": {"version": {"eval_result": "SUCCESS"}}}
+
+    _include_manifest_cases(matrix, manifests)
+    notes = _render_coverage_notes(versions, matrix, manifests)
+
+    assert "task_missing" in matrix
+    assert "未覆盖: task_missing" in "\n".join(notes)
