@@ -284,6 +284,8 @@ class TestTraceRuntimeContextFields:
         data = tm.current_task.to_dict()
         assert data["require_tool_call"] is True
         assert data["no_tool_retry_count"] == 1
+        tm.record_runtime_error("invalid tool call shape")
+        assert tm.current_task.to_dict()["runtime_error"] == "invalid tool call shape"
         tm.end_task("FAILED")
 
     def test_trace_manager_passes_runtime_fields_to_tooltrace(self):

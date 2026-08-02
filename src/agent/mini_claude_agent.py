@@ -1378,6 +1378,7 @@ class MiniClaudeAgent:
             except Exception as e:
                 self.last_metrics["api_errors"] += 1
                 logger.error(f"LLM 循环出错: {e}")
+                self.trace.record_runtime_error(str(e))
                 self.trace.end_task("FAILED")
                 return f"错误: {str(e)}"
 

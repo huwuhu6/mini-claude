@@ -70,6 +70,11 @@ class TraceManager:
         if self.current_task is not None:
             self.current_task.no_tool_retry_count = count
 
+    def record_runtime_error(self, error: str) -> None:
+        """Record the terminal exception from the agent loop."""
+        if self.current_task is not None:
+            self.current_task.runtime_error = error[:500]
+
     def end_task(self, status: str) -> str:
         """Close the current task and write to disk.
 
