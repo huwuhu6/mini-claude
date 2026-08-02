@@ -509,6 +509,10 @@ def run_case(
             trace_data["loop_guard_blocking_rate"] = metrics.get("loop_guard_blocking_rate", 0.0)
             trace_data["self_healing_convergence_speed"] = metrics.get("self_healing_convergence_speed", 0)
 
+            runtime_error = trace_data.get("runtime_error", "")
+            if runtime_error:
+                failure_reason = f"agent_runtime_error: {runtime_error}"
+
             print(f"  📊 指标对账完成 — "
                   f"precision={trace_data['tool_call_precision']}, "
                   f"block_rate={trace_data['loop_guard_blocking_rate']}, "
@@ -554,6 +558,7 @@ def run_case(
         "self_healing_convergence_speed": trace_data.get("self_healing_convergence_speed"),
         "loop_guard_blocking_rate": trace_data.get("loop_guard_blocking_rate"),
         "final_status": trace_data.get("final_status"),
+        "runtime_error": trace_data.get("runtime_error", ""),
         "trace_status": trace_status,
         "failure_reason": failure_reason,
         "verify_exit_code": verify_exit_code,
