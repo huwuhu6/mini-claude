@@ -490,21 +490,21 @@ class MiniClaudeAgent:
     # Main Agent Loop
     # ═══════════════════════════════════════════════════════════
 
-    def run(self, user_input: str) -> str:
+    def run(self, user_input: str, require_tool_call: bool = False) -> str:
         """Process user input and return agent response."""
         self._current_user_prompt = user_input
         # Check for compressed mode
         if not self.feature_manager.is_enabled('tasks'):
-            return self._run_simple(user_input)
+            return self._run_simple(user_input, require_tool_call=require_tool_call)
 
-        return self._run_with_tasks(user_input)
+        return self._run_with_tasks(user_input, require_tool_call=require_tool_call)
 
-    def _run_simple(self, user_input: str) -> str:
+    def _run_simple(self, user_input: str, require_tool_call: bool = False) -> str:
         """Simple execution without task management."""
         self.messages.append(Message(role='user', content=user_input))
-        return self._llm_tool_cycle()
+        return self._llm_tool_cycle(require_tool_call=require_tool_call)
 
-    def _run_with_tasks(self, user_input: str) -> str:
+    def _run_with_tasks(self, user_input: str, require_tool_call: bool = False) -> str:
         """Execution with task management."""
         self.messages.append(Message(role='user', content=user_input))
 
@@ -515,7 +515,7 @@ class MiniClaudeAgent:
             elif self.compressor.should_microcompact(self.messages):
                 self.messages = self.compressor.microcompact(self.messages)
 
-        return self._llm_tool_cycle()
+        return self._llm_tool_cycle(require_tool_call=require_tool_call)
 
     def _get_llm_tools(self) -> List[Dict[str, Any]]:
         """Get tool definitions filtered by feature flags."""
@@ -1114,7 +1114,9 @@ class MiniClaudeAgent:
 
     # ── Core LLM + Tool Cycle ──────────────────────────────────────
 
-    def _llm_tool_cycle(self, max_iterations: int =50) -> str:
+    def _llm_tool_cycle(
+        self, max_iterations: int = 50, require_tool_call: bool = False,
+    ) -> str:
         """Core LLM + tool execution cycle, looping tools back to LLM (s_full.py s02 pattern).
 
         Args:
@@ -1143,6 +1145,8 @@ class MiniClaudeAgent:
         self.failure_memory.set_task(tid)
         self.loop_controller.clear()
 
+        no_tool_retry_count = 0
+        tool_call_seen = False
         for iteration in range(max_iterations):
             try:
                 # ── Start turn-level trace for this iteration ──
@@ -1209,12 +1213,26 @@ class MiniClaudeAgent:
                 self.trace.record_tokens(usage.get('total_tokens', 0))
 
                 if not tool_calls:
-                    # Store final assistant response
                     self.messages.append(Message(role='assistant', content=content))
+                    if require_tool_call and not tool_call_seen and no_tool_retry_count == 0:
+                        no_tool_retry_count += 1
+                        self.messages.append(Message(
+                            role='user',
+                            content=(
+                                "请继续执行任务，不要只描述计划。请立即调用合适的工具，"
+                                "完成用户要求后再给出总结。"
+                            ),
+                        ))
+                        logger.warning("首轮未产生工具调用，已追加一次执行纠偏")
+                        continue
+                    if require_tool_call:
+                        self.trace.end_task("FAILED")
+                        return content
                     self.trace.end_task("SUCCESS")
                     return content
 
                 # ── Store assistant message with tool calls ──
+                tool_call_seen = True
                 self.messages.append(Message(
                     role='assistant',
                     content=content,
@@ -1527,14 +1545,14 @@ class MiniClaudeAgent:
     # High-Level API
     # ═══════════════════════════════════════════════════════════
 
-    def chat(self, message: str) -> str:
+    def chat(self, message: str, require_tool_call: bool = False) -> str:
         """Simple chat interface (auto-detects console commands)."""
         # Check for console command
         if message.startswith('/'):
             result = self.console.execute(message, {'agent': self})
             return result
 
-        return self.run(message)
+        return self.run(message, require_tool_call=require_tool_call)
 
     def create_task(self, title: str, description: str = "",
                     priority: int = 1) -> Task:

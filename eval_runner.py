@@ -354,7 +354,9 @@ def _prepare_sandbox(baseline_dir: Path) -> None:
         print(f"  📁 baseline 已复制 ({file_count} files)")
 
 
-def _run_agent(prompt: str) -> tuple[Optional[Path], float, str | None]:
+def _run_agent(
+    prompt: str, require_tool_call: bool = False,
+) -> tuple[Optional[Path], float, str | None]:
     """实例化 Agent 并执行 prompt，返回 trace、耗时和异常原因。"""
     # 延迟导入，使 --validate-only 不依赖 LLM、tiktoken 或 API 环境。
     from agent.mini_claude_agent import MiniClaudeAgent
@@ -368,7 +370,7 @@ def _run_agent(prompt: str) -> tuple[Optional[Path], float, str | None]:
         )
         print("  🤖 Agent 已初始化，正在执行 prompt…")
         t0 = time.perf_counter()
-        agent.chat(prompt)
+        agent.chat(prompt, require_tool_call=require_tool_call)
         elapsed = round(time.perf_counter() - t0, 2)
         print(f"  ✅ Agent 执行完毕，耗时 {elapsed}s")
         return _find_latest_trace(SHADOW_WORKSPACE), elapsed, None
@@ -419,7 +421,9 @@ def run_case(
     _prepare_sandbox(baseline_dir)
 
     # ── Step 2: 启动 Agent ───────────────────────────────
-    trace_path, agent_duration, agent_error = _run_agent(prompt)
+    trace_path, agent_duration, agent_error = _run_agent(
+        prompt, require_tool_call=bool(verify_script_name),
+    )
 
     # ── Step 3: 动态路由断言（黄雀在后验证） ───────────────
     verify_status = "FAILED"
