@@ -153,6 +153,33 @@ def test_report_keeps_failed_case_without_trace():
     })
 
 
+def test_report_uses_attempt_count_when_some_runs_have_no_trace():
+    matrix = {"task_partial": {"version": {
+        "eval_result": "SUCCESS",
+        "total_turns": 4,
+    }}}
+    versions = [("version", Path("unused"))]
+    manifests = {"version": {"run_id": "run-1"}}
+    results = {
+        "version": {
+            "run_id": "run-1",
+            "results": [
+                {"case_id": "task_partial", "verify_status": "SUCCESS", "trace_status": "ARCHIVED"},
+                {"case_id": "task_partial", "verify_status": "FAILED", "trace_status": "MISSING", "failure_reason": "trace_missing_before_verify"},
+                {"case_id": "task_partial", "verify_status": "SUCCESS", "trace_status": "ARCHIVED"},
+            ],
+        }
+    }
+
+    _include_result_cases(matrix, versions, manifests, results)
+
+    metrics = matrix["task_partial"]["version"]
+    assert metrics["_run_count"] == 3
+    assert metrics["_pass_count"] == 2
+    assert metrics["_missing_trace_count"] == 1
+    assert "2/3" in _fmt_cell(metrics)
+
+
 def test_report_exposes_declared_but_missing_cases():
     versions = [("version", Path("unused"))]
     manifests = {"version": {"tasks": [{"case_id": "task_missing"}]}}

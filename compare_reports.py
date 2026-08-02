@@ -397,18 +397,41 @@ def _include_result_cases(
         expected_run_id = manifest.get("run_id") if manifest and not manifest.get("_error") else None
         if expected_run_id and results.get("run_id") != expected_run_id:
             continue
+        grouped: dict[str, list[dict[str, Any]]] = {}
         for result in results.get("results", []):
-            if not isinstance(result, dict) or not result.get("case_id"):
-                continue
-            case_id = str(result["case_id"])
+            if isinstance(result, dict) and result.get("case_id"):
+                grouped.setdefault(str(result["case_id"]), []).append(result)
+
+        for case_id, case_results in grouped.items():
             version_metrics = matrix.setdefault(case_id, {}).get(version)
+            statuses = [item.get("verify_status", "FAILED") for item in case_results]
+            pass_count = sum(status == "SUCCESS" for status in statuses)
+            trace_statuses = [item.get("trace_status", "MISSING") for item in case_results]
+            missing_trace_count = sum(status != "ARCHIVED" for status in trace_statuses)
+            reasons = list(dict.fromkeys(
+                str(item["failure_reason"])
+                for item in case_results
+                if item.get("failure_reason")
+            ))
+
             if version_metrics:
+                # Trace 提供指标，run results 提供真实尝试次数和通过率。
+                version_metrics["_run_count"] = len(case_results)
+                version_metrics["_pass_count"] = pass_count
+                if missing_trace_count:
+                    version_metrics["_missing_trace_count"] = missing_trace_count
+                    version_metrics["_failure_reasons"] = reasons
                 continue
+
             matrix[case_id][version] = {
-                "eval_result": result.get("verify_status", "FAILED"),
-                "_trace_status": result.get("trace_status", "MISSING"),
-                "total_latency_seconds": result.get("total_latency_s"),
-                "_failure_reason": result.get("failure_reason"),
+                "eval_result": max(set(statuses), key=statuses.count),
+                "_trace_status": (
+                    "INVALID" if "INVALID" in trace_statuses else "MISSING"
+                ),
+                "_run_count": len(case_results),
+                "_pass_count": pass_count,
+                "_missing_trace_count": missing_trace_count,
+                "_failure_reason": "; ".join(reasons) if reasons else None,
             }
 
 
@@ -606,7 +629,9 @@ def _fmt_cell(metrics: dict[str, Any]) -> str:
         trace_label = "无 Trace" if metrics["_trace_status"] == "MISSING" else "Trace 无效"
         reason = metrics.get("_failure_reason")
         reason_label = f": {str(reason).replace('|', '/')}" if reason else ""
-        return f"❌ {result} · {trace_label}{reason_label}"
+        missing_count = metrics.get("_missing_trace_count")
+        missing_label = f" ({missing_count} 次)" if missing_count and missing_count > 1 else ""
+        return f"{rate_prefix}❌ {result} · {trace_label}{missing_label}{reason_label}"
 
     turns_raw = metrics.get("total_turns")
     if isinstance(turns_raw, float):
