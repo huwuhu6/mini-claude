@@ -5,7 +5,7 @@ import hashlib
 from unittest.mock import patch
 from pathlib import Path
 
-from eval_runner import TASKS_ROOT, _sha256_tree, _validate_task
+from eval_runner import TASKS_ROOT, _sha256_tree, _truncate_output, _validate_task
 from compare_reports import (
     _include_manifest_cases,
     _include_result_cases,
@@ -61,6 +61,14 @@ def test_config_must_be_a_json_object():
         _, errors = _validate_task(case_dir)
 
     assert errors == ["config.json 顶层必须是 JSON 对象"]
+
+
+def test_verify_output_is_bounded_and_keeps_tail():
+    output = _truncate_output("a" * 20, limit=10)
+
+    assert output.startswith("...<truncated>...")
+    assert output.endswith("a" * 10)
+    assert _truncate_output("") is None
 
 
 def test_fixture_hash_ignores_generated_directories():

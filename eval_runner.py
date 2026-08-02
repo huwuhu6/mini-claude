@@ -300,6 +300,15 @@ def _compute_metrics(trace_data: dict) -> dict:
     }
 
 
+def _truncate_output(text: str, limit: int = 4000) -> str | None:
+    """保留验证输出的尾部，避免 run results 被异常日志无限膨胀。"""
+    if not text:
+        return None
+    if len(text) <= limit:
+        return text
+    return f"...<truncated>...\n{text[-limit:]}"
+
+
 # ═══════════════════════════════════════════════════════════════
 # 沙箱生命周期
 # ═══════════════════════════════════════════════════════════════
@@ -398,11 +407,16 @@ def run_case(
     # ── Step 3: 动态路由断言（黄雀在后验证） ───────────────
     verify_status = "FAILED"
     failure_reason = agent_error
+    verify_exit_code: int | None = None
+    verify_stdout: str | None = None
+    verify_stderr: str | None = None
+    verify_duration_s: float | None = None
     if verify_script_name and trace_path:
         script_src = case_dir / verify_script_name
         if script_src.exists():
             script_dst = SHADOW_WORKSPACE / verify_script_name
             try:
+                script_dst.parent.mkdir(parents=True, exist_ok=True)
                 shutil.copy2(script_src, script_dst)
                 print(f"  📄 verify 脚本已复制: {verify_script_name}")
             except Exception as exc:
@@ -412,6 +426,7 @@ def run_case(
             try:
                 if sys.platform == "win32":
                     subprocess.run(["chcp", "65001"], capture_output=True, shell=True)
+                verify_started = time.perf_counter()
                 result = subprocess.run(
                     [sys.executable or "python", verify_script_name],
                     cwd=str(SHADOW_WORKSPACE),
@@ -419,8 +434,12 @@ def run_case(
                     env=_env,
                     timeout=120,
                 )
+                verify_duration_s = round(time.perf_counter() - verify_started, 2)
+                verify_exit_code = result.returncode
                 out = result.stdout.decode("utf-8", errors="replace")
                 err = result.stderr.decode("utf-8", errors="replace")
+                verify_stdout = _truncate_output(out)
+                verify_stderr = _truncate_output(err)
                 if out.strip():
                     print(f"  → verify stdout:\n{out}")
                 if err.strip():
@@ -433,6 +452,7 @@ def run_case(
                 print("  ❌ verify 超时 (120s)")
                 verify_status = "FAILED"
                 failure_reason = "verify_timeout"
+                verify_duration_s = round(time.perf_counter() - verify_started, 2)
             except Exception as exc:
                 print(f"  ❌ verify 异常: {exc}")
                 verify_status = "CRASHED"
@@ -515,6 +535,10 @@ def run_case(
         "final_status": trace_data.get("final_status"),
         "trace_status": trace_status,
         "failure_reason": failure_reason,
+        "verify_exit_code": verify_exit_code,
+        "verify_stdout": verify_stdout,
+        "verify_stderr": verify_stderr,
+        "verify_duration_s": verify_duration_s,
     }
 
 
