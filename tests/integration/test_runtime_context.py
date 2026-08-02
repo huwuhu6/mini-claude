@@ -90,8 +90,12 @@ class TestCommandPolicy:
         assert self.policy.check("echo $(whoami)") is not None
         assert self.policy.check("echo `whoami`") is not None
 
-    def test_powershell_blocked(self):
-        assert self.policy.check("powershell -Command Invoke-WebRequest") is not None
+    def test_powershell_read_only_command_allowed(self):
+        assert self.policy.check("powershell -Command Get-ChildItem") is None
+
+    def test_powershell_dynamic_execution_blocked(self):
+        assert self.policy.check("powershell -EncodedCommand AAAA") is not None
+        assert self.policy.check("pwsh -Command Invoke-Expression $x") is not None
 
     def test_empty_command_blocked(self):
         assert self.policy.check("") is not None

@@ -325,16 +325,21 @@ class MiniClaudeAgent:
 
         if plat == "win32":
             return (
-                "CRITICAL RULES FOR CURRENT ENVIRONMENT (Windows CMD):\n"
+                "CRITICAL RULES FOR CURRENT ENVIRONMENT (Windows CMD, despite the tool name `bash`):\n"
                 "1. NO INLINE SCRIPTS: Never use `python -c \"...\"` or `node -e \"...\"` "
-                "in bash — CMD cannot handle nested quotes and newlines properly.\n"
+                "in the shell tool — CMD cannot handle nested quotes and newlines reliably.\n"
                 "2. SCRIPT WORKFLOW: If you need to run complex logic or multi-line code, "
                 "you MUST first use `write_file` to save the code to a temporary file, "
-                "and then use `bash` to execute that file.\n"
+                "and then run it with `python script.py` through the shell tool.\n"
                 "3. USE SEARCH_CODE FOR FILE SEARCHING: Do NOT call grep, "
                 "findstr, or Select-String via bash for content searching.\n"
-                "4. FORBIDDEN COMMANDS (Linux/macOS only): grep, ls, cat, rm -rf, "
-                "mv, cp, find, ps, kill, chmod, sudo, curl|bash, wget|sh, & background.\n"
+                "4. WINDOWS SHELL: Do NOT use `cd /d`, Unix commands such as `find` or `pwd`, "
+                "or shell chaining/background syntax with `&`. Use the session cwd and relative paths.\n"
+                "5. POWERSHELL: Read-only commands such as `Get-ChildItem`, `Get-Content`, "
+                "`Test-Path`, and `Select-String` are allowed when useful. Do not use encoded "
+                "commands or `Invoke-Expression`; prefer file tools for edits.\n"
+                "6. FORBIDDEN COMMANDS (Linux/macOS only): grep, ls, cat, rm -rf, "
+                "mv, cp, find, ps, kill, chmod, sudo, curl|bash, wget|sh.\n"
             )
         elif plat == "linux":
             return (
@@ -404,9 +409,10 @@ class MiniClaudeAgent:
         "   - Logic changes, bug fixes, new features: may need runtime verification.\n"
         "\n"
         "2. FOR STRUCTURAL CHANGES, USE STATIC VERIFICATION ONLY:\n"
-        "   Use language-native tools for syntax validation: "
-        "``python -c \"import ast; ast.parse(open('file.py').read())\"`` / "
-        "``javac File.java`` / ``npx tsc --noEmit`` / ``go vet`` / ``cargo check``.\n"
+        "   Use language-native tools for syntax validation. On Windows, write a small "
+        "temporary Python checker with `write_file`, then run `python checker.py`; never use "
+        "`python -c`. On Unix, `python -c` is allowed. Other examples: ``javac File.java`` / "
+        "``npx tsc --noEmit`` / ``go vet`` / ``cargo check``.\n"
         "   - `count_occurrences` to confirm old patterns are gone (especially non‑Python).\n"
         "   - When these all pass, the task is COMPLETE. Stop immediately – no further actions.\n"
         "\n"

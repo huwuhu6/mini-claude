@@ -14,7 +14,7 @@ Replaces the blanket shell-control-character ban with targeted rules:
     rm -rf /          — destructive filesystem operation
     fork bomb         — resource exhaustion
     background &      — process backgrounding (single &)
-    powershell/wmic   — high-risk executors
+    encoded PowerShell / Invoke-Expression — command obfuscation or execution bypass
 
 Design: pure regex rules, no AST parser.
 """
@@ -28,7 +28,6 @@ class CommandPolicy:
 
     # ── Blocked executor patterns (same as original BaseTools) ──────
     HIGH_RISK_EXECUTORS: list[re.Pattern] = [
-        re.compile(r'\bpowershell\b'), re.compile(r'\bpwsh\b'),
         re.compile(r'\bwmic\b'),
         re.compile(r'\bcmd\s+/c\b'), re.compile(r'\bcmd\.exe\s+/c\b'),
         re.compile(r'\bstart\s+/\w'), re.compile(r'\brunas\b'),
@@ -52,6 +51,13 @@ class CommandPolicy:
         re.compile(r'curl\s+.*?\|.*?\b(bash|sh|zsh|python|perl)\b'),
         re.compile(r'wget\s+.*?\|.*?\b(bash|sh|zsh|python|perl)\b'),
         re.compile(r'Invoke-WebRequest.*?\|.*?\b(bash|sh)\b'),
+    ]
+
+    # PowerShell is useful on Windows, but these forms can hide or bypass
+    # the command policy and are not needed for ordinary workspace work.
+    POWERSHELL_BYPASS: list[re.Pattern] = [
+        re.compile(r'\b(?:powershell|pwsh)\b.*(?:-encodedcommand|-enc\b)'),
+        re.compile(r'\b(?:powershell|pwsh)\b.*\b(?:invoke-expression|iex)\b'),
     ]
 
     # ── Background single-ampersand (block &, allow &&) ────────────
@@ -88,11 +94,16 @@ class CommandPolicy:
             if pat.search(cmd_lower):
                 return "错误: 禁止从远程 URL 直接管道到 Shell"
 
-        # 4. Background single-ampersand (allow &&)
+        # 4. PowerShell obfuscation / dynamic execution
+        for pat in self.POWERSHELL_BYPASS:
+            if pat.search(cmd_lower):
+                return "错误: 禁止使用编码或动态执行的 PowerShell 命令"
+
+        # 5. Background single-ampersand (allow &&)
         if self.BACKGROUND.search(command):
             return "错误: 禁止后台运行 (&)"
 
-        # 5. Shell substitution ($() or backticks)
+        # 6. Shell substitution ($() or backticks)
         if self.SUBSTITUTION.search(command):
             return "错误: 禁止使用命令替换 ($() 或 ``)"
 
