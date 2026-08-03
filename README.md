@@ -8,7 +8,7 @@
 - 如何记录结构化 trace，并用评测任务观察 Agent 的执行质量
 - 如何在单机环境中组织任务、子 Agent、队友和后台任务
 
-这是一个以学习、架构实验和秋招面试展示为目标的项目，不是生产级的 Claude Code 替代品。
+这是一个用于学习和架构实验的项目，不是生产级的 Claude Code 替代品。
 
 ## 当前入口
 
@@ -206,15 +206,19 @@ mini-claude/
 └── docs/                     架构、决策、测试和演进记录
 ```
 
-运行后可能出现以下目录：
+运行时数据默认写入工作区之外的项目级目录：
 
-- `.tasks/`：持久化任务
-- `.team/`：队友状态
-- `.traces/`：任务 trace
-- `logs/`：运行日志或评测汇总
-- `sandbox/eval_results/`：评测归档结果
+```text
+D:\02_study\code\mini-claude-project-data\<project-name>-<short-hash>\
+├── sessions/       每次 CLI 会话的 JSONL 记录
+├── traces/         任务级 Trace 和评测过程数据
+├── tasks/          持久化任务
+├── team/           队友状态
+├── inbox/          队友消息
+└── transcripts/    上下文压缩摘要
+```
 
-这些目录大多是运行时产物，不应当作为源码阅读入口。
+评测结果仍归档在 `sandbox/eval_results/`。仓库中残留的 `.tasks/`、`.team/`、`.traces/` 和 `logs/` 是历史运行产物，新代码不会继续写入它们。
 
 ## 架构主线
 
@@ -246,7 +250,7 @@ CLI
 - `src/core/compression.py` 会尝试初始化 `tiktoken`。即使 Python 包已安装，首次初始化也可能尝试联网下载编码资源；在受限网络环境中会导致测试收集失败。
 - 评测结果中的过程指标用于工程分析，不等同于通用 Agent 能力排名。
 
-## 适合展示的工程主题
+## 工程讨论主题
 
 这个项目最适合用来讨论 Agent runtime 的工程问题：workspace 边界、工具调用循环、失败恢复、循环防护、trace/evaluation、模块化 provider，以及从单文件原型迁移到分层架构时的取舍。
 ## 运行时数据与调试
