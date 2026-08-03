@@ -19,20 +19,39 @@ class SessionRecorder:
         self.sessions_dir = sessions_dir
         self.path = sessions_dir / f"session_{self.session_id}.jsonl"
         self._lock = threading.Lock()
+        self._round_id = 0
+        self._step = 0
+
+    def start_round(self) -> int:
+        """Start one user -> agent completion interaction."""
+        with self._lock:
+            self._round_id += 1
+            self._step = 0
+            return self._round_id
 
     def record(self, event_type: str, **data: Any) -> None:
-        event = {
-            "time": time.strftime("%Y-%m-%dT%H:%M:%S%z"),
-            "timestamp": time.time(),
-            "session_id": self.session_id,
-            "type": event_type,
-            **data,
-        }
         try:
             self.sessions_dir.mkdir(parents=True, exist_ok=True)
-            with self._lock, self.path.open("a", encoding="utf-8") as handle:
-                json.dump(event, handle, ensure_ascii=False, separators=(",", ":"))
-                handle.write("\n")
+            with self._lock:
+                if self._round_id:
+                    self._step += 1
+                    round_id = self._round_id
+                    step = self._step
+                else:
+                    round_id = None
+                    step = None
+                event = {
+                    "time": time.strftime("%Y-%m-%dT%H:%M:%S%z"),
+                    "timestamp": time.time(),
+                    "session_id": self.session_id,
+                    "round_id": round_id,
+                    "step": step,
+                    "type": event_type,
+                    **data,
+                }
+                with self.path.open("a", encoding="utf-8") as handle:
+                    json.dump(event, handle, ensure_ascii=False, separators=(",", ":"))
+                    handle.write("\n")
         except OSError:
             # Observability must not break the Agent task.
             pass

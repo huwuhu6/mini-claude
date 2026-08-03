@@ -70,6 +70,7 @@ class MiniClaudeAgent:
                  workdir: Optional[Path] = None,
                  workspace_confirmed: bool = False):
         self._ui_event_handler: Optional[Callable[[str, Dict[str, Any]], None]] = None
+        self._last_assistant_note: Optional[str] = None
         # ── Resolve workspace root (explicit > legacy > cwd fallback) ──
         if workspace_root is not None:
             self.workdir = Path(workspace_root).resolve()
@@ -1187,6 +1188,7 @@ class MiniClaudeAgent:
 
         no_tool_retry_count = 0
         tool_call_seen = False
+        self._last_assistant_note = None
         for iteration in range(max_iterations):
             try:
                 self._emit_ui_event("thinking", iteration=iteration + 1)
@@ -1244,11 +1246,11 @@ class MiniClaudeAgent:
                 content = parsed.get('content', '')
                 tool_calls = parsed.get('tool_calls', [])
 
-                if content:
+                if content and tool_calls:
                     logger.info("LLM_NOTE[%s]: %s", iteration + 1, content)
                     self.session_recorder.record("assistant_note", turn=iteration + 1, content=content)
-                    if tool_calls:
-                        self._emit_ui_event("assistant_note", text=content)
+                    self._last_assistant_note = content
+                    self._emit_ui_event("assistant_note", text=content)
                 logger.info(
                     "LLM_TURN_RESULT: iteration=%s tool_calls=%s",
                     iteration + 1,
@@ -1288,6 +1290,10 @@ class MiniClaudeAgent:
 
                 # ── Store assistant message with tool calls ──
                 tool_call_seen = True
+                # Provider response IDs are preserved. The fallback only
+                # protects the message chain if a compatible provider omits it.
+                for call_index, tc in enumerate(tool_calls, start=1):
+                    tc.setdefault("id", f"local_{iteration + 1}_{call_index}")
                 self.messages.append(Message(
                     role='assistant',
                     content=content,
@@ -1336,6 +1342,21 @@ class MiniClaudeAgent:
                             content=result_text,
                             tool_call_id=tc.get('id', ''),
                         ))
+                        self.session_recorder.record(
+                            "tool_call",
+                            call_id=tc.get("id"),
+                            tool=tname,
+                            args={"raw_arguments": str(args_raw)},
+                            argument_error=True,
+                        )
+                        self.session_recorder.record(
+                            "tool_result",
+                            call_id=tc.get("id"),
+                            tool=tname,
+                            success=False,
+                            blocked=False,
+                            result=result_text,
+                        )
                         logger.warning(f"工具参数解析失败【{tname}】，已反馈给 Agent: {exc}")
                         continue
 
@@ -1345,7 +1366,12 @@ class MiniClaudeAgent:
                         summary=self._tool_event_summary(tname, args),
                     )
                     logger.info("TOOL_CALL: name=%s args=%s", tname, args)
-                    self.session_recorder.record("tool_call", tool=tname, args=args)
+                    self.session_recorder.record(
+                        "tool_call",
+                        call_id=tc.get("id"),
+                        tool=tname,
+                        args=args,
+                    )
 
                     if tname == "TodoWrite":
                         used_todo = True
@@ -1454,6 +1480,7 @@ class MiniClaudeAgent:
                     )
                     self.session_recorder.record(
                         "tool_result",
+                        call_id=tc.get("id"),
                         tool=tname,
                         success=t_success,
                         blocked=bool(v3_block_msg),
@@ -1662,6 +1689,7 @@ class MiniClaudeAgent:
 
     def chat(self, message: str, require_tool_call: bool = False) -> str:
         """Simple chat interface (auto-detects console commands)."""
+        self.session_recorder.start_round()
         logger.info("USER_INPUT: %s", message)
         self.session_recorder.record("user_input", content=message)
         # Check for console command
@@ -1675,7 +1703,12 @@ class MiniClaudeAgent:
         logger.info("AGENT_RESPONSE: %s", result)
         # A final model response only means the conversation turn ended; the
         # benchmark trace remains the authority for task success.
-        self.session_recorder.record("final", status="RESPONSE", content=result)
+        final_event = {"status": "RESPONSE"}
+        if result == self._last_assistant_note:
+            final_event["content_reused"] = True
+        else:
+            final_event["content"] = result
+        self.session_recorder.record("final", **final_event)
         return result
 
     def create_task(self, title: str, description: str = "",
