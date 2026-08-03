@@ -3,7 +3,6 @@ Mini Claude Agent - Unified agent integrating all systems.
 """
 from __future__ import annotations
 import logging
-from logging.handlers import RotatingFileHandler
 import os
 import sys
 import json
@@ -13,7 +12,7 @@ import time
 import shutil
 from collections import Counter
 from pathlib import Path
-from typing import List, Dict, Any, Optional
+from typing import Callable, List, Dict, Any, Optional
 
 # Ensure src is in path
 _project_root = Path(__file__).parent.parent.parent
@@ -40,6 +39,8 @@ from core.compression import Compressor
 from core.loop_guard import LoopGuard, canonicalize_args
 from core.loop_controller import LoopController, RuntimeEscalationException, CommandNormalizer
 from core.tracing import TraceManager
+from core.runtime_data import RuntimeDataPaths
+from core.session_recorder import SessionLogHandler, SessionRecorder
 from core.failure_intelligence import FailureAnalyzer, FailureMemory, FailureEscalationPolicy, build_escalation_message
 from core.runtime_context import RuntimeContext
 from cli.authority import WorkspaceAuthority
@@ -68,6 +69,7 @@ class MiniClaudeAgent:
                  workspace_root: Optional[Path] = None,
                  workdir: Optional[Path] = None,
                  workspace_confirmed: bool = False):
+        self._ui_event_handler: Optional[Callable[[str, Dict[str, Any]], None]] = None
         # ── Resolve workspace root (explicit > legacy > cwd fallback) ──
         if workspace_root is not None:
             self.workdir = Path(workspace_root).resolve()
@@ -82,8 +84,15 @@ class MiniClaudeAgent:
         # Config must be loaded first (used by _setup_logging)
         self.config_manager = ConfigManager(config_path)
         self.config = self.config_manager.get_config()
+        self.data_paths = RuntimeDataPaths.for_workspace(self.workdir)
+        self.session_recorder = SessionRecorder(self.data_paths.sessions)
 
         self._setup_logging()
+        self.session_recorder.record(
+            "session_start",
+            workspace=str(self.workdir),
+            data_root=str(self.data_paths.root),
+        )
         logger.info(f"正在初始化 MiniClaudeAgent v{self.config.agent.version}")
 
         # Workspace Authority — unified permission boundary
@@ -126,20 +135,18 @@ class MiniClaudeAgent:
         self._setup_providers()
 
         # Task management
-        tasks_dir = self.workdir / self.config.tasks.directory
-        self.task_manager = TaskManager(tasks_dir)
+        self.task_manager = TaskManager(self.data_paths.tasks)
 
         # Team management
         team_config = TeammateConfig(
-            directory=str(self.workdir / self.config.team.directory),
+            directory=str(self.data_paths.team),
             idle_timeout=self.config.team.idle_timeout,
             auto_claim_tasks=self.config.team.auto_claim_tasks,
         )
         self.team_manager = TeammateManager(team_config)
 
         # Message bus
-        bus_dir = self.workdir / ".inbox"
-        self.message_bus = MessageBus(storage_dir=bus_dir)
+        self.message_bus = MessageBus(storage_dir=self.data_paths.inbox)
 
         # Background processing
         self.background = BackgroundProcessor(
@@ -170,7 +177,7 @@ class MiniClaudeAgent:
             'token_threshold': self.config.compression.token_threshold,
             'max_transcripts': self.config.compression.max_transcripts,
             'microcompact_threshold': self.config.compression.microcompact_threshold,
-            'transcript_dir': str(self.workdir / '.transcripts'),
+            'transcript_dir': str(self.data_paths.root / 'transcripts'),
         }
         self.compressor = Compressor(compression_config)
 
@@ -196,7 +203,7 @@ class MiniClaudeAgent:
         # Legacy loop guard kept for backward compatibility (trace schema)
         self.loop_guard = LoopGuard()
         # Runtime trace system — append-only, hook-based observability
-        self.trace = TraceManager(trace_dir=self.workdir / ".traces")
+        self.trace = TraceManager(trace_dir=self.data_paths.traces)
         # Benchmark metrics — reset each _llm_tool_cycle call
         self.last_metrics: Dict[str, int] = {"turns": 0, "total_tokens": 0, "api_errors": 0}
         # Tracks consecutive identical command executions for soft prompting
@@ -218,23 +225,12 @@ class MiniClaudeAgent:
     def _setup_logging(self):
         """Configure logging based on config."""
         log_level = getattr(logging, self.config.logging.level.upper(), logging.INFO)
-        log_file = self.workdir / self.config.logging.file
-
-        log_file.parent.mkdir(parents=True, exist_ok=True)
-        # Runtime diagnostics belong in the workspace log, not in the chat UI.
+        # Runtime diagnostics belong in the session JSONL, not in the chat UI.
         # force=True prevents a previous agent instance from keeping an old
         # workspace's FileHandler when tests create multiple agents.
         logging.basicConfig(
             level=log_level,
-            format=self.config.logging.format,
-            handlers=[
-                RotatingFileHandler(
-                    str(log_file),
-                    maxBytes=5 * 1024 * 1024,
-                    backupCount=3,
-                    encoding='utf-8',
-                ),
-            ],
+            handlers=[SessionLogHandler(self.session_recorder)],
             force=True,
         )
 
@@ -515,6 +511,32 @@ class MiniClaudeAgent:
             return self._run_simple(user_input, require_tool_call=require_tool_call)
 
         return self._run_with_tasks(user_input, require_tool_call=require_tool_call)
+
+    def set_ui_event_handler(
+        self, handler: Optional[Callable[[str, Dict[str, Any]], None]]
+    ) -> None:
+        """Attach a presentation callback without coupling the runtime to a UI."""
+        self._ui_event_handler = handler
+
+    def _emit_ui_event(self, event: str, **data: Any) -> None:
+        if self._ui_event_handler is None:
+            return
+        try:
+            self._ui_event_handler(event, data)
+        except Exception:
+            logger.exception("UI event handler failed: %s", event)
+
+    @staticmethod
+    def _tool_event_summary(name: str, args: Dict[str, Any]) -> str:
+        """Return a short human-readable summary for the terminal UI."""
+        if not isinstance(args, dict):
+            return ""
+        if name == "bash":
+            return str(args.get("command", ""))[:120].replace("\n", " ")
+        if name in {"read_file", "write_file", "edit_file", "list_files", "search_code"}:
+            target = args.get("path") or args.get("pattern") or args.get("query")
+            return str(target)[:100] if target else ""
+        return ""
 
     def _run_simple(self, user_input: str, require_tool_call: bool = False) -> str:
         """Simple execution without task management."""
@@ -839,7 +861,7 @@ class MiniClaudeAgent:
         checkpoint = len(self.messages)
 
         # ── Create Shadow Workspace ────────────────────────
-        shadow_root = self.workdir / ".claude" / "shadow"
+        shadow_root = self.data_paths.root / "shadow"
         shadow_root.mkdir(parents=True, exist_ok=True)
         task_id = str(uuid.uuid4())[:8]
         shadow_dir = shadow_root / task_id
@@ -1167,6 +1189,9 @@ class MiniClaudeAgent:
         tool_call_seen = False
         for iteration in range(max_iterations):
             try:
+                self._emit_ui_event("thinking", iteration=iteration + 1)
+                self.session_recorder.record("thinking", turn=iteration + 1)
+                logger.info("LLM_TURN_START: iteration=%s messages=%s", iteration + 1, len(self.messages))
                 # ── Start turn-level trace for this iteration ──
                 self.trace.start_turn(iteration)
                 # ── Pre-LLM: compression pipeline (s_full.py s06) ──
@@ -1218,6 +1243,17 @@ class MiniClaudeAgent:
                 parsed = self._parse_response(provider, response)
                 content = parsed.get('content', '')
                 tool_calls = parsed.get('tool_calls', [])
+
+                if content:
+                    logger.info("LLM_NOTE[%s]: %s", iteration + 1, content)
+                    self.session_recorder.record("assistant_note", turn=iteration + 1, content=content)
+                    if tool_calls:
+                        self._emit_ui_event("assistant_note", text=content)
+                logger.info(
+                    "LLM_TURN_RESULT: iteration=%s tool_calls=%s",
+                    iteration + 1,
+                    len(tool_calls),
+                )
 
                 # ── Trace: record assistant content ──
                 self.trace.record_assistant_content(content)
@@ -1274,6 +1310,7 @@ class MiniClaudeAgent:
                         logger.warning(f"检测到重复工具调用【{tname}】，已自动跳过")
                         continue
                     seen_tool_sigs.add(sig)
+                    logger.info("TOOL_REQUEST: name=%s raw_args=%s", tname, args_raw)
 
                     try:
                         args = json.loads(args_raw) if isinstance(args_raw, str) else args_raw
@@ -1302,6 +1339,14 @@ class MiniClaudeAgent:
                         logger.warning(f"工具参数解析失败【{tname}】，已反馈给 Agent: {exc}")
                         continue
 
+                    self._emit_ui_event(
+                        "tool_start",
+                        name=tname,
+                        summary=self._tool_event_summary(tname, args),
+                    )
+                    logger.info("TOOL_CALL: name=%s args=%s", tname, args)
+                    self.session_recorder.record("tool_call", tool=tname, args=args)
+
                     if tname == "TodoWrite":
                         used_todo = True
 
@@ -1317,6 +1362,7 @@ class MiniClaudeAgent:
 
                         if v3_block_msg:
                             result_text = v3_block_msg
+                            logger.warning("TOOL_BLOCKED: name=%s reason=%s", tname, result_text)
                             # Compatibility: record in legacy guard as well
                             self.loop_guard.record(tname, args)
                         else:
@@ -1383,7 +1429,7 @@ class MiniClaudeAgent:
 
                     t_end = time.time()
 
-                    t_success = not v3_block_msg
+                    t_success = not v3_block_msg and not self._is_tool_error(result_text)
                     self.trace.record_tool_call(
                         tool_name=tname, args_hash=args_hash,
                         success=t_success, loop_guard_blocked=bool(v3_block_msg),
@@ -1398,6 +1444,26 @@ class MiniClaudeAgent:
                         cwd=str(self.runtime_context.cwd),
                         workspace_root=str(self.runtime_context.workspace_root),
                         session_id=self.runtime_context.shell_session.session_id,
+                    )
+
+                    logger.info(
+                        "TOOL_RESULT: name=%s success=%s result=%s",
+                        tname,
+                        t_success,
+                        result_text,
+                    )
+                    self.session_recorder.record(
+                        "tool_result",
+                        tool=tname,
+                        success=t_success,
+                        blocked=bool(v3_block_msg),
+                        result=result_text,
+                    )
+                    self._emit_ui_event(
+                        "tool_result",
+                        name=tname,
+                        success=t_success,
+                        blocked=bool(v3_block_msg),
                     )
 
                     # Log with clean format
@@ -1420,6 +1486,9 @@ class MiniClaudeAgent:
 
             except Exception as e:
                 self.last_metrics["api_errors"] += 1
+                logger.exception("LLM_TURN_ERROR: iteration=%s", iteration + 1)
+                self._emit_ui_event("runtime_error", message=str(e)[:200])
+                self.session_recorder.record("runtime_error", message=str(e))
                 logger.error(f"LLM 循环出错: {e}")
                 self.trace.record_runtime_error(str(e))
                 self.trace.end_task("FAILED")
@@ -1593,12 +1662,21 @@ class MiniClaudeAgent:
 
     def chat(self, message: str, require_tool_call: bool = False) -> str:
         """Simple chat interface (auto-detects console commands)."""
+        logger.info("USER_INPUT: %s", message)
+        self.session_recorder.record("user_input", content=message)
         # Check for console command
         if message.startswith('/'):
             result = self.console.execute(message, {'agent': self})
+            logger.info("COMMAND_RESULT: command=%s result=%s", message, result)
+            self.session_recorder.record("command_result", command=message, result=result)
             return result
 
-        return self.run(message, require_tool_call=require_tool_call)
+        result = self.run(message, require_tool_call=require_tool_call)
+        logger.info("AGENT_RESPONSE: %s", result)
+        # A final model response only means the conversation turn ended; the
+        # benchmark trace remains the authority for task success.
+        self.session_recorder.record("final", status="RESPONSE", content=result)
+        return result
 
     def create_task(self, title: str, description: str = "",
                     priority: int = 1) -> Task:

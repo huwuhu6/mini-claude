@@ -249,3 +249,28 @@ CLI
 ## 适合展示的工程主题
 
 这个项目最适合用来讨论 Agent runtime 的工程问题：workspace 边界、工具调用循环、失败恢复、循环防护、trace/evaluation、模块化 provider，以及从单文件原型迁移到分层架构时的取舍。
+## 运行时数据与调试
+
+工作区保持干净。运行时数据默认保存在工作区之外：
+
+```text
+D:\02_study\code\mini-claude-project-data\<project-name>-<short-hash>\
+  sessions/   # per-session JSONL conversation and runtime events
+  traces/     # benchmark and task traces
+  tasks/      # persistent /task data
+  team/       # teammate state
+  inbox/      # teammate messages
+  transcripts/# compressed context summaries
+```
+
+可以设置 `MINI_CLAUDE_DATA_DIR` 使用其他数据根目录。
+
+不启动 LLM 也可以查看已记录的会话：
+
+```powershell
+mini-claude path/to/project --debug latest
+mini-claude path/to/project --debug errors
+mini-claude path/to/project --debug flow --session <session_id>
+```
+
+JSONL 文件是详细记录的来源；`--debug` 是人类阅读入口，用于查看流程、工具失败、循环防护和运行时错误。

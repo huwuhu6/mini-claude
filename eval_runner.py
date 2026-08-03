@@ -46,6 +46,8 @@ _src = str(BASE_DIR / "src")
 if _src not in sys.path:
     sys.path.insert(0, _src)
 
+from core.runtime_data import RuntimeDataPaths
+
 # ═══════════════════════════════════════════════════════════════
 # 路径向内锁死 —— 所有评测行为路由到 sandbox/ 内部
 # ═══════════════════════════════════════════════════════════════
@@ -261,8 +263,8 @@ def _write_run_manifest(
 # ═══════════════════════════════════════════════════════════════
 
 def _find_latest_trace(workspace: Path) -> Optional[Path]:
-    """在 workspace/.traces/ 中按修改时间查找最新的 trace JSON 文件。"""
-    trace_dir = workspace / ".traces"
+    """在项目级运行时数据目录中按修改时间查找最新的 trace JSON 文件。"""
+    trace_dir = RuntimeDataPaths.for_workspace(workspace).traces
     if not trace_dir.is_dir():
         return None
     candidates = sorted(
@@ -551,6 +553,7 @@ def run_case(
     # ── Step 5: 垃圾回收 + 句柄缓冲 + 暴力毁灭现场 ────────
     gc.collect()
     time.sleep(0.5)
+    _hard_rmtree(RuntimeDataPaths.for_workspace(SHADOW_WORKSPACE).root)
     _hard_rmtree(SHADOW_WORKSPACE)
     print("  🧹 shadow_workspace 已清除")
 

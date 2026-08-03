@@ -8,14 +8,15 @@ import sys
 from pathlib import Path
 from typing import Optional
 
-
-# Allow ``python -m cli.entrypoint`` to work directly from a source checkout.
 _src = Path(__file__).resolve().parent.parent
 if str(_src) not in sys.path:
     sys.path.insert(0, str(_src))
 
-from cli.confirmation import confirm_workspace
 from agent.mini_claude_agent import MiniClaudeAgent
+from cli.confirmation import confirm_workspace
+from cli.ui import TerminalUI
+from core.debug_viewer import DebugViewer
+from core.runtime_data import RuntimeDataPaths
 
 logger = logging.getLogger(__name__)
 
@@ -24,28 +25,29 @@ def parse_args(argv: Optional[list[str]] = None) -> argparse.Namespace:
     parser = argparse.ArgumentParser(
         description="Mini-Claude Runtime - workspace-bound AI agent",
     )
+    parser.add_argument("path", nargs="?", default=".")
     parser.add_argument(
-        "path",
-        nargs="?",
-        default=".",
-        help="Workspace directory path (default: current directory)",
-    )
-    parser.add_argument(
-        "-y",
-        "--yes",
-        action="store_true",
+        "-y", "--yes", action="store_true",
         help="Skip workspace confirmation (for CI and automation)",
     )
+    parser.add_argument(
+        "--debug",
+        choices=("latest", "errors", "flow"),
+        help="View a recorded session without starting the Agent",
+    )
+    parser.add_argument("--session", help="Session id used with --debug")
     return parser.parse_args(argv)
 
 
 def _run_repl(agent: MiniClaudeAgent) -> None:
-    print(f"\n{agent.config.agent.name} v{agent.config.agent.version}")
-    print("输入 exit 退出，输入 /help 查看命令。\n")
+    ui = TerminalUI()
+    agent.set_ui_event_handler(ui.handle_event)
+    print(f"\n{ui._paint(agent.config.agent.name, ui._BLUE)} v{agent.config.agent.version}")
+    print(ui._paint("输入 exit 退出，输入 /help 查看命令。\n", ui._DIM))
 
     while True:
         try:
-            user_input = input("> ").strip()
+            user_input = input(ui.prompt()).strip()
             if not user_input:
                 continue
             if user_input.lower() in ("exit", "quit"):
@@ -54,7 +56,7 @@ def _run_repl(agent: MiniClaudeAgent) -> None:
 
             response = agent.chat(user_input)
             if response:
-                print(f"\n{response}")
+                ui.print_answer(response)
         except (KeyboardInterrupt, EOFError):
             print("\n再见。")
             break
@@ -70,6 +72,11 @@ def _run_repl(agent: MiniClaudeAgent) -> None:
 def main(argv: Optional[list[str]] = None) -> None:
     args = parse_args(argv)
     workspace = Path(args.path).resolve()
+
+    if args.debug:
+        paths = RuntimeDataPaths.for_workspace(workspace)
+        print(DebugViewer(paths.sessions).render(args.debug, args.session))
+        return
 
     if not sys.stdin.isatty() and not args.yes:
         print("非交互环境需要使用 --yes。", file=sys.stderr)

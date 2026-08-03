@@ -17,6 +17,7 @@ import logging
 from pathlib import Path
 from typing import Any, Dict, Optional
 
+from core.runtime_data import RuntimeDataPaths
 from .metrics import (
     compute_duplicate_tool_ratio,
     compute_avg_tools_per_turn,
@@ -34,7 +35,7 @@ class TraceAnalyzer:
 
     def __init__(self, workdir: Path):
         self.workdir = workdir
-        self.trace_dir = workdir / ".traces"
+        self.trace_dir = RuntimeDataPaths.for_workspace(workdir).traces
         self.trace_data: Optional[Dict[str, Any]] = None
 
     # ── Loading ─────────────────────────────────────────────────────────
