@@ -4,7 +4,10 @@ Background Processing System - Async command execution with notifications.
 from __future__ import annotations
 import copy
 import logging
+import os
 import queue
+import signal
+import tempfile
 import threading
 import time
 import subprocess
@@ -23,6 +26,7 @@ class BackgroundTaskStatus(Enum):
     COMPLETED = "completed"
     FAILED = "failed"
     CANCELLED = "cancelled"
+    KILLED = "killed"
 
 
 @dataclass
@@ -37,22 +41,30 @@ class BackgroundTask:
     completed_at: Optional[float] = None
     timeout: int = 120
     cwd: Optional[str] = None
+    pid: Optional[int] = None
+    started_at: Optional[float] = None
+    exit_code: Optional[int] = None
+    stdout_file: Optional[str] = None
+    stderr_file: Optional[str] = None
+    stop_requested: bool = False
     metadata: Dict[str, Any] = field(default_factory=dict)
 
 
 class BackgroundProcessor:
     """Manages asynchronous command execution."""
 
-    def __init__(self, max_concurrent: int = 5, notification_queue_size: int = 1000):
+    def __init__(self, max_concurrent: int = 5, notification_queue_size: int = 1000,
+                 output_dir: Optional[Path] = None):
         self.max_concurrent = max_concurrent
         self._tasks: Dict[str, BackgroundTask] = {}
-        self._queue: queue.Queue = queue.Queue()
-        self._notification_queue: queue.Queue = queue.Queue(maxsize=notification_queue_size)
+        self._notification_queue = queue.Queue(maxsize=notification_queue_size)
         self._lock = threading.Lock()
         self._running = False
-        self._workers: List[threading.Thread] = []
-        self._notifier: Optional[threading.Thread] = None
+        self._processes: Dict[str, subprocess.Popen] = {}
         self._completion_callbacks: List[Callable[[str], None]] = []
+        self.output_dir = Path(output_dir) if output_dir else (
+            Path(tempfile.gettempdir()) / "mini-claude-background"
+        )
 
     # ── Lifecycle ─────────────────────────────────────────────
 
@@ -60,22 +72,21 @@ class BackgroundProcessor:
         if self._running:
             return
         self._running = True
-        for i in range(self.max_concurrent):
-            t = threading.Thread(target=self._worker_loop, name=f"bg-worker-{i}", daemon=True)
-            t.start()
-            self._workers.append(t)
-        self._notifier = threading.Thread(target=self._notifier_loop, name="bg-notifier", daemon=True)
-        self._notifier.start()
-        logger.info(f"后台处理器已启动（{self.max_concurrent} 个工作线程）")
-
-    def stop(self) -> None:
-        self._running = False
-        logger.info("后台处理器已停止")
+        self.output_dir.mkdir(parents=True, exist_ok=True)
+        logger.info("后台处理器已启动")
 
     # ── Task Submission ───────────────────────────────────────
 
     def run(self, command: str, description: str = "", timeout: int = 120,
             cwd: Optional[str] = None, **metadata) -> str:
+        return self.launch(
+            command, description=description, timeout=timeout,
+            cwd=cwd, **metadata,
+        ).id
+
+    def launch(self, command: str, description: str = "", timeout: int = 120,
+               cwd: Optional[str] = None, **metadata) -> BackgroundTask:
+        """Start a detached process and return its initial task snapshot."""
         task_id = str(uuid.uuid4())[:8]
         task = BackgroundTask(
             id=task_id,
@@ -85,11 +96,48 @@ class BackgroundProcessor:
             cwd=cwd,
             metadata=metadata,
         )
+        self.output_dir.mkdir(parents=True, exist_ok=True)
+        stdout_file = self.output_dir / f"{task_id}.stdout.log"
+        stderr_file = self.output_dir / f"{task_id}.stderr.log"
+        task.stdout_file = str(stdout_file)
+        task.stderr_file = str(stderr_file)
+
+        try:
+            creationflags = getattr(subprocess, "CREATE_NEW_PROCESS_GROUP", 0)
+            with stdout_file.open("ab") as stdout, stderr_file.open("ab") as stderr:
+                process = subprocess.Popen(
+                    command,
+                    shell=True,
+                    cwd=cwd,
+                    stdin=subprocess.DEVNULL,
+                    stdout=stdout,
+                    stderr=stderr,
+                    creationflags=creationflags,
+                    start_new_session=(os.name != "nt"),
+                )
+        except Exception as exc:
+            task.status = BackgroundTaskStatus.FAILED
+            task.error = str(exc)
+            task.completed_at = time.time()
+            with self._lock:
+                self._tasks[task_id] = task
+            return task
+
+        task.status = BackgroundTaskStatus.RUNNING
+        task.pid = process.pid
+        task.started_at = time.time()
         with self._lock:
             self._tasks[task_id] = task
-        self._queue.put(task_id)
-        logger.info(f"后台任务 {task_id} 已加入队列: {description}")
-        return task_id
+            self._processes[task_id] = process
+        monitor = threading.Thread(
+            target=self._monitor_process,
+            args=(task_id, process),
+            name=f"bg-monitor-{task_id}",
+            daemon=True,
+        )
+        monitor.start()
+        logger.info("后台任务 %s 已启动 pid=%s: %s", task_id, process.pid, description)
+        return copy.deepcopy(task)
 
     def get(self, task_id: str) -> Optional[BackgroundTask]:
         with self._lock:
@@ -97,12 +145,44 @@ class BackgroundProcessor:
             return copy.deepcopy(task) if task else None
 
     def cancel(self, task_id: str) -> bool:
+        """Cancel a queued task. Running tasks use stop()."""
         with self._lock:
             task = self._tasks.get(task_id)
             if task and task.status == BackgroundTaskStatus.PENDING:
                 task.status = BackgroundTaskStatus.CANCELLED
                 return True
             return False
+
+    def stop(self, task_id: Optional[str] = None) -> bool:
+        """Stop accepting work, or explicitly stop one process tree.
+
+        Calling without a task id only stops the manager. It deliberately
+        does not terminate existing child processes.
+        """
+        if task_id is None:
+            self._running = False
+            logger.info("后台处理器已停止（保留已启动的外部进程）")
+            return True
+        with self._lock:
+            task = self._tasks.get(task_id)
+            process = self._processes.get(task_id)
+            if not task or task.status != BackgroundTaskStatus.RUNNING or not process:
+                return False
+            task.stop_requested = True
+
+        try:
+            if os.name == "nt":
+                subprocess.run(
+                    ["taskkill", "/PID", str(process.pid), "/T", "/F"],
+                    capture_output=True,
+                    timeout=10,
+                )
+            else:
+                os.killpg(process.pid, signal.SIGTERM)
+        except Exception as exc:
+            logger.warning("停止后台任务失败 %s: %s", task_id, exc)
+            return False
+        return True
 
     def list(self, status: Optional[BackgroundTaskStatus] = None) -> List[BackgroundTask]:
         with self._lock:
@@ -125,78 +205,68 @@ class BackgroundProcessor:
                 break
         return notifications
 
-    # ── Worker ────────────────────────────────────────────────
+    # ── Process monitoring ───────────────────────────────────
 
-    def _worker_loop(self) -> None:
-        while self._running:
-            try:
-                task_id = self._queue.get(timeout=1)
-            except queue.Empty:
-                continue
-
-            # Get the *real* shared task object for status mutation
+    def _monitor_process(self, task_id: str, process: subprocess.Popen) -> None:
+        try:
+            exit_code = process.wait()
             with self._lock:
                 task = self._tasks.get(task_id)
-            if not task or task.status == BackgroundTaskStatus.CANCELLED:
-                continue
-
-            with self._lock:
-                task.status = BackgroundTaskStatus.RUNNING
+                if not task:
+                    return
+                task.exit_code = exit_code
+                task.completed_at = time.time()
+                if task.stop_requested:
+                    task.status = BackgroundTaskStatus.KILLED
+                elif exit_code == 0:
+                    task.status = BackgroundTaskStatus.COMPLETED
+                else:
+                    task.status = BackgroundTaskStatus.FAILED
+                    task.error = self._read_tail(task.stderr_file, 50)
+                task.result = self._read_tail(task.stdout_file, 50)
+                self._processes.pop(task_id, None)
             try:
-                # Binary capture — same encoding fix as base_tools.py run_bash
-                r = subprocess.run(
-                    task.command,
-                    shell=True,
-                    capture_output=True,
-                    timeout=task.timeout,
-                    cwd=task.cwd,
-                )
-                raw_output = r.stdout + r.stderr
+                self._notification_queue.put_nowait(task_id)
+            except queue.Full:
+                logger.warning("后台任务通知队列已满，丢弃通知: %s", task_id)
+            for callback in self._completion_callbacks:
                 try:
-                    output_str = raw_output.decode('utf-8')
-                except UnicodeDecodeError:
-                    output_str = raw_output.decode('gbk', errors='replace')
-                output = output_str.strip()
-
-                with self._lock:
-                    if r.returncode == 0:
-                        task.status = BackgroundTaskStatus.COMPLETED
-                        task.result = output[:10000]
-                    else:
-                        task.status = BackgroundTaskStatus.FAILED
-                        task.error = output[:5000]
-                    task.completed_at = time.time()
-            except subprocess.TimeoutExpired:
-                with self._lock:
-                    task.status = BackgroundTaskStatus.FAILED
-                    task.error = f"Timeout after {task.timeout}s"
-                    task.completed_at = time.time()
-            except Exception as e:
-                with self._lock:
-                    task.status = BackgroundTaskStatus.FAILED
-                    task.error = str(e)
-                    task.completed_at = time.time()
-
-            # Notify (lock-free — queue.Queue is thread-safe)
-            self._notification_queue.put(task.id)
-            for cb in self._completion_callbacks:
-                try:
-                    cb(task.id)
-                except Exception as e:
-                    logger.error(f"完成回调失败: {e}")
-
-            # ── GC: prune old completed/failed tasks to prevent unbounded growth ──
+                    callback(task_id)
+                except Exception as exc:
+                    logger.error("完成回调失败: %s", exc)
             self._prune_old_tasks()
+        except Exception:
+            logger.exception("后台任务监控失败: %s", task_id)
 
-    def _notifier_loop(self) -> None:
-        while self._running:
-            time.sleep(0.5)
-            # Notifications handled via check_notifications
+    @staticmethod
+    def _read_tail(path: Optional[str], lines: int) -> str:
+        if not path:
+            return ""
+        try:
+            raw = Path(path).read_bytes()
+            try:
+                text = raw.decode("utf-8")
+            except UnicodeDecodeError:
+                text = raw.decode("gbk", errors="replace")
+            return "\n".join(text.splitlines()[-max(1, lines):])[-10000:]
+        except OSError:
+            return ""
+
+    def logs(self, task_id: str, tail: int = 50) -> Optional[Dict[str, Any]]:
+        task = self.get(task_id)
+        if not task:
+            return None
+        return {
+            "job_id": task.id,
+            "stdout": self._read_tail(task.stdout_file, tail),
+            "stderr": self._read_tail(task.stderr_file, tail),
+            "tail": tail,
+        }
 
     def _prune_old_tasks(self, max_retained: int = 1000) -> int:
         """Remove oldest terminal tasks beyond *max_retained* to prevent memory leak."""
         terminal = (BackgroundTaskStatus.COMPLETED, BackgroundTaskStatus.FAILED,
-                     BackgroundTaskStatus.CANCELLED)
+                    BackgroundTaskStatus.CANCELLED, BackgroundTaskStatus.KILLED)
         with self._lock:
             terminal_ids = [
                 tid for tid, t in self._tasks.items()
@@ -219,7 +289,7 @@ class BackgroundProcessor:
         tasks = self.list()
         return {
             'total': len(tasks),
-            'queued': self._queue.qsize(),
+            'queued': sum(1 for task in tasks if task.status == BackgroundTaskStatus.PENDING),
             'by_status': {
                 s.value: sum(1 for t in tasks if t.status == s)
                 for s in BackgroundTaskStatus

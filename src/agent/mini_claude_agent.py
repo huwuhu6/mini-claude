@@ -10,9 +10,12 @@ import re
 import uuid
 import time
 import shutil
+import socket
 from collections import Counter
 from pathlib import Path
 from typing import Callable, List, Dict, Any, Optional
+from urllib.error import HTTPError, URLError
+from urllib.request import urlopen
 
 # Ensure src is in path
 _project_root = Path(__file__).parent.parent.parent
@@ -115,6 +118,10 @@ class MiniClaudeAgent:
         self.tool_dispatcher = {
             "bash": self._handle_bash,
             "run_background": self._handle_run_background,
+            "get_background_status": self._handle_get_background_status,
+            "get_background_logs": self._handle_get_background_logs,
+            "stop_background": self._handle_stop_background,
+            "health_check": self._handle_health_check,
             "read_file": self._handle_read_file,
             "write_file": self._handle_write_file,
             "edit_file": self._handle_edit_file,
@@ -156,6 +163,7 @@ class MiniClaudeAgent:
         self.background = BackgroundProcessor(
             max_concurrent=self.config.background.max_concurrent,
             notification_queue_size=self.config.background.notification_queue_size,
+            output_dir=self.data_paths.root / "background",
         )
 
         # SubAgents
@@ -288,6 +296,11 @@ class MiniClaudeAgent:
         # Register tool→feature mapping for feature-aware tool filtering
         self.feature_manager.register_tool_for_feature('load_skill', 'skills')
         self.feature_manager.register_tool_for_feature('run_background', 'background')
+        for tool_name in (
+            'get_background_status', 'get_background_logs',
+            'stop_background', 'health_check',
+        ):
+            self.feature_manager.register_tool_for_feature(tool_name, 'background')
 
     def _setup_providers(self):
         """Setup LLM providers from config."""
@@ -600,9 +613,64 @@ class MiniClaudeAgent:
                     'properties': {
                         'command': {'type': 'string', 'description': 'The command to run asynchronously'},
                         'description': {'type': 'string', 'description': 'Short description of the background task'},
-                        'timeout': {'type': 'integer', 'description': 'Maximum runtime in seconds', 'default': 3600},
+                        'timeout': {
+                            'type': 'integer',
+                            'description': (
+                                'Compatibility field for the task record. Detached processes are not '
+                                'automatically killed when this time is reached.'
+                            ),
+                            'default': 3600,
+                        },
                     },
                     'required': ['command'],
+                },
+            },
+            {
+                'name': 'get_background_status',
+                'description': '查询后台任务的状态、PID、启动时间、工作目录和退出码。',
+                'input_schema': {
+                    'type': 'object',
+                    'properties': {
+                        'job_id': {'type': 'string', 'description': '后台任务 ID'},
+                    },
+                    'required': ['job_id'],
+                },
+            },
+            {
+                'name': 'get_background_logs',
+                'description': '读取后台任务最近的 stdout/stderr 行，不会把完整日志一次性放入上下文。',
+                'input_schema': {
+                    'type': 'object',
+                    'properties': {
+                        'job_id': {'type': 'string', 'description': '后台任务 ID'},
+                        'tail': {'type': 'integer', 'description': '每类输出读取的最近行数', 'default': 50},
+                    },
+                    'required': ['job_id'],
+                },
+            },
+            {
+                'name': 'stop_background',
+                'description': '显式停止一个正在运行的后台任务。Agent 退出时不会自动调用此工具。',
+                'input_schema': {
+                    'type': 'object',
+                    'properties': {
+                        'job_id': {'type': 'string', 'description': '后台任务 ID'},
+                    },
+                    'required': ['job_id'],
+                },
+            },
+            {
+                'name': 'health_check',
+                'description': '按本机端口或 HTTP URL 检查服务是否可用，可附带后台任务 ID。',
+                'input_schema': {
+                    'type': 'object',
+                    'properties': {
+                        'job_id': {'type': 'string', 'description': '可选的后台任务 ID'},
+                        'port': {'type': 'integer', 'description': '可选的本机 TCP 端口'},
+                        'url': {'type': 'string', 'description': '可选的 HTTP/HTTPS 健康检查地址'},
+                        'timeout': {'type': 'number', 'description': '检查超时时间（秒）', 'default': 3},
+                    },
+                    'required': [],
                 },
             },
             {
@@ -859,16 +927,103 @@ class MiniClaudeAgent:
         block_msg = self.command_policy.check(command)
         if block_msg:
             return block_msg
-        task_id = self.background.run(
+        task = self.background.launch(
             command,
             description=description,
             timeout=timeout,
             cwd=str(self.runtime_context.cwd),
         )
-        return (
-            f"后台任务已提交：{task_id}。命令不会阻塞当前 Agent，"
-            "请使用 bash 检查服务是否已经就绪。"
+        return json.dumps(
+            {
+                "status": "async_launched" if task.pid else "launch_failed",
+                "job_id": task.id,
+                "pid": task.pid,
+                "started_at": task.started_at,
+                "cwd": task.cwd,
+                "stdout_file": task.stdout_file,
+                "stderr_file": task.stderr_file,
+                "process_status": task.status.value,
+                "error": task.error or None,
+            },
+            ensure_ascii=False,
         )
+
+    @staticmethod
+    def _background_task_payload(task) -> Dict[str, Any]:
+        return {
+            "job_id": task.id,
+            "status": task.status.value,
+            "pid": task.pid,
+            "command": task.command,
+            "cwd": task.cwd,
+            "started_at": task.started_at,
+            "completed_at": task.completed_at,
+            "exit_code": task.exit_code,
+            "stdout_file": task.stdout_file,
+            "stderr_file": task.stderr_file,
+            "error": task.error or None,
+        }
+
+    def _handle_get_background_status(self, job_id: str) -> str:
+        task = self.background.get(job_id)
+        if not task:
+            return json.dumps({"status": "not_found", "job_id": job_id}, ensure_ascii=False)
+        return json.dumps(self._background_task_payload(task), ensure_ascii=False)
+
+    def _handle_get_background_logs(self, job_id: str, tail: int = 50) -> str:
+        logs = self.background.logs(job_id, tail=max(1, min(int(tail), 200)))
+        if logs is None:
+            return json.dumps({"status": "not_found", "job_id": job_id}, ensure_ascii=False)
+        return json.dumps(logs, ensure_ascii=False)
+
+    def _handle_stop_background(self, job_id: str) -> str:
+        stopped = self.background.stop(job_id)
+        task = self.background.get(job_id)
+        return json.dumps(
+            {
+                "job_id": job_id,
+                "stopped": stopped,
+                "status": task.status.value if task else "not_found",
+            },
+            ensure_ascii=False,
+        )
+
+    def _handle_health_check(self, job_id: str = "", port: int = None,
+                             url: str = "", timeout: float = 3) -> str:
+        checks: Dict[str, Any] = {}
+        if job_id:
+            task = self.background.get(job_id)
+            checks["job"] = (
+                self._background_task_payload(task)
+                if task else {"job_id": job_id, "status": "not_found"}
+            )
+
+        if port is not None:
+            try:
+                with socket.create_connection(("127.0.0.1", int(port)), timeout=float(timeout)):
+                    checks["port"] = {"port": int(port), "healthy": True}
+            except OSError as exc:
+                checks["port"] = {"port": int(port), "healthy": False, "error": str(exc)}
+
+        if url:
+            try:
+                with urlopen(url, timeout=float(timeout)) as response:
+                    checks["url"] = {
+                        "url": url,
+                        "healthy": 200 <= response.status < 400,
+                        "status_code": response.status,
+                    }
+            except HTTPError as exc:
+                checks["url"] = {
+                    "url": url, "healthy": False, "status_code": exc.code,
+                    "error": str(exc),
+                }
+            except (URLError, OSError) as exc:
+                checks["url"] = {"url": url, "healthy": False, "error": str(exc)}
+
+        health_checks = [value for key, value in checks.items() if key != "job" and isinstance(value, dict)]
+        healthy = bool(health_checks) and all(item.get("healthy") is True for item in health_checks)
+        return json.dumps({"healthy": healthy, "checks": checks}, ensure_ascii=False)
 
     def _handle_read_file(self, path: str, start_line: int = None, end_line: int = None) -> str:
         result = self.tools.read_file(path, start_line, end_line)

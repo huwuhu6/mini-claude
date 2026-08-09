@@ -12,6 +12,7 @@ With persistent shell session: <= 12 turns, no repeated cd needed.
 """
 from __future__ import annotations
 import sys
+import tempfile
 import time
 from pathlib import Path
 
@@ -25,6 +26,7 @@ import pytest
 from core.runtime_context import (
     RuntimeContext, PathResolver, ShellSession, CommandPolicy,
 )
+from core.background import BackgroundProcessor, BackgroundTaskStatus
 from core.tracing import ToolTrace, TaskTrace, TraceManager
 
 
@@ -109,6 +111,30 @@ class TestCommandPolicy:
     def test_empty_command_blocked(self):
         assert self.policy.check("") is not None
         assert self.policy.check("   ") is not None
+
+
+def test_background_launch_tracks_process_and_tail_logs():
+    """Async jobs expose a PID, terminal status, exit code, and tail logs."""
+    with tempfile.TemporaryDirectory() as temp_dir:
+        processor = BackgroundProcessor(output_dir=Path(temp_dir) / "background")
+        processor.start()
+        task = processor.launch("echo background-output", cwd=str(_PROJECT_ROOT))
+
+        deadline = time.time() + 5
+        current = processor.get(task.id)
+        while current and current.status == BackgroundTaskStatus.RUNNING and time.time() < deadline:
+            time.sleep(0.05)
+            current = processor.get(task.id)
+
+        logs = processor.logs(task.id, tail=5)
+        processor.stop()
+
+        assert current is not None
+        assert current.pid is not None
+        assert current.status == BackgroundTaskStatus.COMPLETED
+        assert current.exit_code == 0
+        assert logs is not None
+        assert "background-output" in logs["stdout"]
 
 
 # ═════════════════════════════════════════════════════════════════
