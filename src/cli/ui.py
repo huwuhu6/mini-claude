@@ -63,9 +63,13 @@ class TerminalUI:
             iteration = data.get("iteration", 0)
             self._write(self._paint(f"  · 分析中 · 第 {iteration} 轮", self._DIM))
         elif event == "assistant_note":
-            text = str(data.get("text", "")).strip().replace("\n", " ")
+            text = str(data.get("text", "")).strip()
             if text:
-                self._write(self._paint(f"  · {text[:240]}", self._DIM))
+                # Keep the complete intermediate note visible. The terminal
+                # itself handles visual wrapping; truncating here hides the
+                # reason behind the next tool call.
+                for line in text.splitlines() or [""]:
+                    self._write(self._paint(f"  · {line}", self._DIM))
         elif event == "tool_start":
             name = data.get("name", "tool")
             summary = data.get("summary", "")
