@@ -25,22 +25,14 @@ def build_loop_block_message(tool_name: str, args: Dict[str, Any]) -> str:
     """Generate the stern system warning injected as a simulated tool result."""
     args_display = json.dumps(args, ensure_ascii=False)
     return (
-        f"⛔ [系统安全拦截 — 防死循环保护]\n"
+        f"[重复操作提醒 — 本次调用未执行]\n"
         f"━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━\n"
         f"检测到你正在重复使用相同的工具和参数：\n"
         f"  工具名称: {tool_name}\n"
         f"  调用参数: {args_display}\n"
         f"\n"
-        f"该调用已被系统物理拦截——工具未被执行。\n"
-        f"请勿盲目重试！\n"
-        f"\n"
-        f"你必须在下一次回复中最先输出一个 <reflection> 标签，"
-        f"在其中深刻分析：\n"
-        f"  1. 为什么之前的尝试反复失败？\n"
-        f"  2. 当前策略的根本问题是什么？\n"
-        f"  3. 有哪些与之前完全不同的替代方案？\n"
-        f"\n"
-        f"完成反思后，请提出一个与之前所有尝试本质上不同的新策略。\n"
+        f"系统判断该操作与最近调用重复，因此本次调用未执行。\n"
+        f"请结合前面的工具结果自行判断是否需要调整策略或重试。\n"
         f"━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━"
     )
 

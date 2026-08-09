@@ -3,6 +3,15 @@
 from core.loop_controller import CommandNormalizer, NormalizedIntent
 
 
+def test_commands_with_same_flag_keep_executable_in_intent():
+    """Different executables must not collapse to the same -version intent."""
+    java = CommandNormalizer.normalize("bash", {"command": "java -version"})
+    maven = CommandNormalizer.normalize("bash", {"command": "mvn -version"})
+    assert java.to_key() != maven.to_key()
+    assert "java" in java.target
+    assert "mvn" in maven.target
+
+
 # ── read_file line range tests ─────────────────────────────────────────
 
 def test_read_file_no_line_range():
