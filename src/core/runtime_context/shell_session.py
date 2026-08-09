@@ -117,6 +117,15 @@ class ShellSession:
                 "success": False,
                 "cwd": str(self.cwd),
             }
+        except KeyboardInterrupt:
+            # Ctrl+C should cancel the current command, not tear down the
+            # whole Agent before it can close the trace and session record.
+            logger.warning("[ShellSession] 命令被用户中断")
+            return {
+                "content": "[用户中断] 命令已被用户取消。",
+                "success": False,
+                "cwd": str(self.cwd),
+            }
         except Exception as e:
             logger.error(f"[ShellSession] 错误: {e}")
             return {

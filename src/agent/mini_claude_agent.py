@@ -1395,6 +1395,46 @@ class MiniClaudeAgent:
                             result = self._execute_tool(tname, args)
                             result_text = str(result)
 
+                            if result_text.startswith("[用户中断]"):
+                                t_end = time.time()
+                                self.trace.record_tool_call(
+                                    tool_name=tname, args_hash=args_hash,
+                                    success=False, loop_guard_blocked=False,
+                                    error_message=result_text[:200],
+                                    result_preview=result_text[:200],
+                                    started_at=t_start, finished_at=t_end,
+                                    failure_category="USER_CANCELLED",
+                                    recoverability="NON_RECOVERABLE",
+                                    strategy_fingerprint="",
+                                    escalated=False,
+                                    circuit_breaker_triggered=False,
+                                    cwd=str(self.runtime_context.cwd),
+                                    workspace_root=str(self.runtime_context.workspace_root),
+                                    session_id=self.runtime_context.shell_session.session_id,
+                                )
+                                self.session_recorder.record(
+                                    "tool_result",
+                                    call_id=tc.get("id"),
+                                    tool=tname,
+                                    success=False,
+                                    blocked=False,
+                                    cancelled=True,
+                                    result=result_text,
+                                )
+                                self._emit_ui_event(
+                                    "tool_result",
+                                    name=tname,
+                                    success=False,
+                                    blocked=False,
+                                )
+                                self.session_recorder.record(
+                                    "runtime_cancelled",
+                                    reason="user_interrupt",
+                                    tool=tname,
+                                )
+                                self.trace.end_task("CANCELLED")
+                                return "已取消当前任务。"
+
                             # ── Failure Intelligence Analysis ──
                             if self._is_tool_error(result_text):
                                 failure_sig = self.failure_analyzer.analyze(

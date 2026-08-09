@@ -129,6 +129,7 @@ D:\python3.12.1\python.exe -m pytest tests/integration/test_eval_contract.py tes
 - 完整对话状态主要存在内存中，进程异常退出后不能自动恢复上下文。
 - Windows 测试环境可能出现 `.pytest_cache` 无权限警告；如果核心测试通过，不要把这个警告误判成业务失败。
 - `tiktoken` 首次加载可能需要编码资源，受限网络环境下测试收集可能失败。
+- 前台服务命令被 `Ctrl+C` 中断后会记录为 `CANCELLED`，而不是普通工具失败；服务启动和后台运行仍需要后续单独设计。
 
 ## 八、推荐的协作流程
 
