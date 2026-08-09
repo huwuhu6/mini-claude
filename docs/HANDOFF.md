@@ -85,7 +85,24 @@ D:\python3.12.1\python.exe -c "import agent.mini_claude_agent; print(agent.mini_
 启动：
 
 ```powershell
+# 日常交互：当前目录作为 workspace，并进行确认
+mini-claude
+
+# 已确认目录安全或用于自动化时：跳过确认
 mini-claude . --yes
+```
+
+安装依赖时，命令中的 `requirements.txt` 是相对当前终端目录解析的。如果终端不在项目根目录，先执行：
+
+```powershell
+Set-Location D:\02_study\code\AgentProject\mini-claude
+D:\python3.12.1\python.exe -m pip install -r requirements.txt
+```
+
+也可以从任意目录使用绝对路径：
+
+```powershell
+D:\python3.12.1\python.exe -m pip install -r D:\02_study\code\AgentProject\mini-claude\requirements.txt
 ```
 
 查看会话：
@@ -296,3 +313,23 @@ Trace 适合做 Benchmark 的统计，JSONL 适合还原一次真实对话的先
 ```
 
 小的拼写、类型或测试修复不需要单独写演进文档；只有改变 Agent 行为、评测口径或运行时结构时才记录。
+
+### 9.8 如何输入多行问题
+
+REPL 使用 `prompt-toolkit` 提供可编辑的多行输入框：
+
+```text
+你 > 第一行
+... > 第二行
+... > 第三行
+```
+
+按 Enter 换行，按 `Alt+Enter` 提交整段内容；如果终端不识别 `Alt+Enter`，可以按 `Esc` 后再按 Enter。粘贴多行文本后，内容会留在同一个输入框中，可以继续移动光标、修改和使用历史记录，不会因为第一处换行而提前调用 Agent。
+
+安装依赖：
+
+```powershell
+py -m pip install -r requirements.txt
+```
+
+如果因为环境限制没有安装 `prompt-toolkit`，CLI 会退回兼容模式：输入 `/paste`，粘贴内容，最后单独输入 `/end` 提交。

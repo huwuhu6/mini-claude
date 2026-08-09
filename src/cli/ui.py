@@ -21,6 +21,8 @@ class TerminalUI:
     def __init__(self, stream: TextIO = sys.stdout):
         self.stream = stream
         self.color = bool(getattr(stream, "isatty", lambda: False)()) and not os.getenv("NO_COLOR")
+        self._prompt_session = None
+        self.prompt_toolkit_available = False
 
     def _paint(self, text: str, color: str) -> str:
         if not self.color:
@@ -29,6 +31,28 @@ class TerminalUI:
 
     def prompt(self) -> str:
         return self._paint("你 > ", self._CYAN)
+
+    def multiline_prompt(self) -> str:
+        return self._paint("... > ", self._CYAN)
+
+    def read_input(self) -> str:
+        """Read an editable multiline prompt, with a stdlib fallback."""
+        if not getattr(sys.stdin, "isatty", lambda: False)():
+            return input(self.prompt())
+
+        try:
+            from prompt_toolkit import PromptSession
+        except ImportError:
+            return input(self.prompt())
+
+        if self._prompt_session is None:
+            self._prompt_session = PromptSession()
+        self.prompt_toolkit_available = True
+        return self._prompt_session.prompt(
+            "你 > ",
+            multiline=True,
+            prompt_continuation="... > ",
+        )
 
     def print_answer(self, text: str) -> None:
         print(self._paint("mini-claude", self._BLUE), file=self.stream)

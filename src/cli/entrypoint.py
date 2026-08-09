@@ -39,6 +39,17 @@ def parse_args(argv: Optional[list[str]] = None) -> argparse.Namespace:
     return parser.parse_args(argv)
 
 
+def _read_multiline(ui: TerminalUI, read_line=input) -> str:
+    """Read pasted text until the explicit ``/end`` marker."""
+    print(ui._paint("多行输入模式：粘贴或输入内容，单独输入 /end 提交。", ui._DIM))
+    lines: list[str] = []
+    while True:
+        line = read_line(ui.multiline_prompt())
+        if line.strip() == "/end":
+            return "\n".join(lines).strip()
+        lines.append(line)
+
+
 def _run_repl(agent: MiniClaudeAgent) -> None:
     ui = TerminalUI()
     agent.set_ui_event_handler(ui.handle_event)
@@ -47,7 +58,11 @@ def _run_repl(agent: MiniClaudeAgent) -> None:
 
     while True:
         try:
-            user_input = input(ui.prompt()).strip()
+            user_input = ui.read_input()
+            if not ui.prompt_toolkit_available and user_input.strip().lower() in ("/paste", "/multiline"):
+                user_input = _read_multiline(ui)
+            else:
+                user_input = user_input.strip()
             if not user_input:
                 continue
             if user_input.lower() in ("exit", "quit"):

@@ -71,6 +71,13 @@ python -m pip install -r requirements-dev.txt
 python -m pip install -e .
 ```
 
+如果当前终端不在项目根目录，需要先进入项目目录，或者使用依赖文件的绝对路径：
+
+```powershell
+Set-Location D:\02_study\code\AgentProject\mini-claude
+D:\python3.12.1\python.exe -m pip install -r requirements.txt
+```
+
 复制环境变量模板并填写 API key：
 
 ```bash
@@ -93,13 +100,15 @@ ANTHROPIC_API_KEY=your_key
 ### 启动 CLI
 
 ```bash
-# 当前目录
+# 在当前目录启动，交互式确认 workspace
 mini-claude
 
-# 指定 workspace，并跳过交互确认
+# 显式指定当前 workspace，并跳过确认
 mini-claude . --yes
 mini-claude path/to/project -y
 ```
+
+`mini-claude` 默认把当前目录作为 workspace，并会请求确认；因此日常交互使用直接输入 `mini-claude` 即可。`.` 和 `--yes` 不是必须的：`.` 只是显式表示当前目录，`--yes` 用于跳过确认，适合自动化或已经确认路径安全的场景。
 
 也可以在仓库根目录直接运行模块入口：
 
@@ -120,6 +129,8 @@ python -m cli.entrypoint . --yes
 | `/compact` | 手动压缩上下文 |
 | `/status` | 查看当前运行状态 |
 | `/exit` | 退出 |
+
+CLI 使用可编辑的多行输入框：Enter 换行，`Alt+Enter` 提交整段内容；也可以使用 `Esc` 后再按 Enter 提交。粘贴多行文本后可以继续移动光标和修改，不会按第一行提前发送。若没有安装 `prompt-toolkit`，才使用 `/paste` 加 `/end` 的兼容模式。
 
 具体命令以 `src/core/console.py` 和运行时 `/help` 输出为准。
 
