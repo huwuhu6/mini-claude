@@ -86,9 +86,18 @@ class TestCommandPolicy:
         """Single & for backgrounding should be blocked."""
         assert self.policy.check("python server.py &") is not None
 
-    def test_substitution_blocked(self):
-        assert self.policy.check("echo $(whoami)") is not None
-        assert self.policy.check("echo `whoami`") is not None
+    def test_windows_redirection_and_chaining_allowed(self):
+        """Common Windows redirection and command chaining are allowed."""
+        assert self.policy.check("java -version 2>&1") is None
+        assert self.policy.check("dir /b 2>nul") is None
+        assert self.policy.check("echo first & echo second") is None
+
+    def test_normal_shell_syntax_allowed(self):
+        """CommandPolicy should not reject ordinary shell syntax by default."""
+        assert self.policy.check("cmd /c echo hello") is None
+        assert self.policy.check("start /b redis-server.exe --port 6379") is None
+        assert self.policy.check("powershell -Command Write-Output $(Get-Date)") is None
+        assert self.policy.check("echo `whoami`") is None
 
     def test_powershell_read_only_command_allowed(self):
         assert self.policy.check("powershell -Command Get-ChildItem") is None

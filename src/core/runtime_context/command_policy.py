@@ -13,7 +13,7 @@ Replaces the blanket shell-control-character ban with targeted rules:
     wget|sh           — remote code execution via pipe
     rm -rf /          — destructive filesystem operation
     fork bomb         — resource exhaustion
-    background &      — process backgrounding (single &)
+    trailing &        — shell backgrounding; command chaining is allowed
     encoded PowerShell / Invoke-Expression — command obfuscation or execution bypass
 
 Design: pure regex rules, no AST parser.
@@ -28,9 +28,7 @@ class CommandPolicy:
 
     # ── Blocked executor patterns (same as original BaseTools) ──────
     HIGH_RISK_EXECUTORS: list[re.Pattern] = [
-        re.compile(r'\bwmic\b'),
-        re.compile(r'\bcmd\s+/c\b'), re.compile(r'\bcmd\.exe\s+/c\b'),
-        re.compile(r'\bstart\s+/\w'), re.compile(r'\brunas\b'),
+        re.compile(r'\brunas\b'),
     ]
 
     # ── Destructive filesystem operations ──────────────────────────
@@ -60,11 +58,11 @@ class CommandPolicy:
         re.compile(r'\b(?:powershell|pwsh)\b.*\b(?:invoke-expression|iex)\b'),
     ]
 
-    # ── Background single-ampersand (block &, allow &&) ────────────
-    BACKGROUND = re.compile(r'(?<![&])&(?![&])')
-
-    # ── Shell sub / command substitution ────────────────────────────
-    SUBSTITUTION = re.compile(r'\$\(|\x60')  # $(…) and backtick; allow $PATH etc.
+    # ── Background marker ──────────────────────────────────────────
+    # Keep normal Windows command chaining and redirection usable:
+    #   command 2>&1, command 2>nul, command-a & command-b
+    # Only a trailing single ampersand is treated as background syntax.
+    BACKGROUND = re.compile(r'(?<![&])&\s*$')
 
     def check(self, command: str) -> Optional[str]:
         """Validate a command string against the policy.
@@ -99,12 +97,9 @@ class CommandPolicy:
             if pat.search(cmd_lower):
                 return "错误: 禁止使用编码或动态执行的 PowerShell 命令"
 
-        # 5. Background single-ampersand (allow &&)
+        # 5. Trailing background marker. Infix '&' is valid command
+        # chaining on Windows and is also part of common redirections.
         if self.BACKGROUND.search(command):
-            return "错误: 禁止后台运行 (&)"
-
-        # 6. Shell substitution ($() or backticks)
-        if self.SUBSTITUTION.search(command):
-            return "错误: 禁止使用命令替换 ($() 或 ``)"
+            return "错误: 禁止未受控的后台运行（命令末尾的 &）"
 
         return None

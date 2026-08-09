@@ -43,6 +43,7 @@ from core.runtime_data import RuntimeDataPaths
 from core.session_recorder import SessionLogHandler, SessionRecorder
 from core.failure_intelligence import FailureAnalyzer, FailureMemory, FailureEscalationPolicy, build_escalation_message
 from core.runtime_context import RuntimeContext
+from core.runtime_context.command_policy import CommandPolicy
 from cli.authority import WorkspaceAuthority
 from skills import SkillLoader
 
@@ -108,10 +109,12 @@ class MiniClaudeAgent:
             authority=self.workspace_authority,
             shell_session=self.runtime_context.shell_session,
         )
+        self.command_policy = CommandPolicy()
 
         # Tool dispatcher — dict-based routing bound once at init (s_full.py TOOL_HANDLERS pattern)
         self.tool_dispatcher = {
             "bash": self._handle_bash,
+            "run_background": self._handle_run_background,
             "read_file": self._handle_read_file,
             "write_file": self._handle_write_file,
             "edit_file": self._handle_edit_file,
@@ -284,6 +287,7 @@ class MiniClaudeAgent:
         ))
         # Register tool→feature mapping for feature-aware tool filtering
         self.feature_manager.register_tool_for_feature('load_skill', 'skills')
+        self.feature_manager.register_tool_for_feature('run_background', 'background')
 
     def _setup_providers(self):
         """Setup LLM providers from config."""
@@ -337,15 +341,19 @@ class MiniClaudeAgent:
                 "2. SCRIPT WORKFLOW: If you need to run complex logic or multi-line code, "
                 "you MUST first use `write_file` to save the code to a temporary file, "
                 "and then run it with `python script.py` through the shell tool.\n"
-                "3. USE SEARCH_CODE FOR FILE SEARCHING: Do NOT call grep, "
-                "findstr, or Select-String via bash for content searching.\n"
-                "4. WINDOWS SHELL: Do NOT use `cd /d`, Unix commands such as `find` or `pwd`, "
-                "or shell chaining/background syntax with `&`. Use the session cwd and relative paths.\n"
-                "5. POWERSHELL: Read-only commands such as `Get-ChildItem`, `Get-Content`, "
+                "3. SEARCH_CODE is preferred for workspace content search because it is path-safe, "
+                "but ordinary platform search commands remain available when they are useful.\n"
+                "4. LONG-RUNNING SERVICES: Use `run_background` for Redis, Spring Boot, dev servers, "
+                "watchers, or any command that intentionally keeps running. It returns immediately; "
+                "then use `bash` to verify readiness. Do not add Linux-only daemon flags on Windows.\n"
+                "5. WINDOWS SHELL: Do not use `cd /d`; use the session cwd and relative paths. "
+                "Windows command chaining with `&`, and redirections such as `2>&1` and `2>nul`, "
+                "are allowed. Do not leave a standalone trailing `&` for background execution.\n"
+                "6. POWERSHELL: Read-only commands such as `Get-ChildItem`, `Get-Content`, "
                 "`Test-Path`, and `Select-String` are allowed when useful. Do not use encoded "
                 "commands or `Invoke-Expression`; prefer file tools for edits.\n"
-                "6. FORBIDDEN COMMANDS (Linux/macOS only): grep, ls, cat, rm -rf, "
-                "mv, cp, find, ps, kill, chmod, sudo, curl|bash, wget|sh.\n"
+                "7. PREFER native Windows commands when available and avoid destructive "
+                "or remote pipe-to-shell commands.\n"
             )
         elif plat == "linux":
             return (
@@ -534,6 +542,8 @@ class MiniClaudeAgent:
             return ""
         if name == "bash":
             return str(args.get("command", ""))[:120].replace("\n", " ")
+        if name == "run_background":
+            return str(args.get("command", ""))[:120].replace("\n", " ")
         if name in {"read_file", "write_file", "edit_file", "list_files", "search_code"}:
             target = args.get("path") or args.get("pattern") or args.get("query")
             return str(target)[:100] if target else ""
@@ -573,6 +583,24 @@ class MiniClaudeAgent:
                     'type': 'object',
                     'properties': {
                         'command': {'type': 'string', 'description': 'The command to run'},
+                    },
+                    'required': ['command'],
+                },
+            },
+            {
+                'name': 'run_background',
+                'description': (
+                    f'Run a long-lived command asynchronously on {_platform_label}. '
+                    'Use this for servers and development watchers that intentionally keep running '
+                    '(for example Redis, Spring Boot, or a frontend dev server). '
+                    'The tool returns immediately; verify readiness with bash afterward.'
+                ),
+                'input_schema': {
+                    'type': 'object',
+                    'properties': {
+                        'command': {'type': 'string', 'description': 'The command to run asynchronously'},
+                        'description': {'type': 'string', 'description': 'Short description of the background task'},
+                        'timeout': {'type': 'integer', 'description': 'Maximum runtime in seconds', 'default': 3600},
                     },
                     'required': ['command'],
                 },
@@ -808,19 +836,39 @@ class MiniClaudeAgent:
     # ── Tool Handler Methods (bound once in __init__.tool_dispatcher) ──
 
     def _handle_bash(self, command: str) -> str:
-        # Block direct grep/findstr/Select-String — redirect to search_code
-        cmd_stripped = command.strip().lower()
-        for blocked in ('grep ', 'findstr ', 'select-string '):
-            if cmd_stripped.startswith(blocked):
-                return (
-                    "[Tip: 请使用 search_code 工具进行文件内容搜索，"
-                    "而非 bash 命令中的 grep/findstr。\n"
-                    f"search_code 是跨平台纯 Python 实现，"
-                    f"且具有路径安全保护。\n"
-                    f"被拦截的命令: {command[:200]}]"
-                )
+        # Windows `start` launches another process/window but can still keep
+        # the parent shell waiting when called through subprocess.run. Route
+        # this narrow, explicit server-launch form through the background
+        # executor so the Agent can continue to health-check the service.
+        if sys.platform == "win32" and re.match(r"^\s*start(?:\s|$)", command, re.IGNORECASE):
+            return self._queue_background_command(
+                command,
+                description=f"Windows start: {command[:80]}",
+            )
         result = self.tools.run_bash(command)
         return result.content
+
+    def _handle_run_background(self, command: str, description: str = "",
+                               timeout: int = 3600) -> str:
+        """Queue a long-lived command without blocking the LLM turn."""
+        return self._queue_background_command(command, description, timeout)
+
+    def _queue_background_command(self, command: str, description: str = "",
+                                  timeout: int = 3600) -> str:
+        """Submit a command to the shared background executor."""
+        block_msg = self.command_policy.check(command)
+        if block_msg:
+            return block_msg
+        task_id = self.background.run(
+            command,
+            description=description,
+            timeout=timeout,
+            cwd=str(self.runtime_context.cwd),
+        )
+        return (
+            f"后台任务已提交：{task_id}。命令不会阻塞当前 Agent，"
+            "请使用 bash 检查服务是否已经就绪。"
+        )
 
     def _handle_read_file(self, path: str, start_line: int = None, end_line: int = None) -> str:
         result = self.tools.read_file(path, start_line, end_line)
@@ -1551,6 +1599,18 @@ class MiniClaudeAgent:
                 # ── Nag tracking (s_full.py s03 — hot-injected via _get_dynamic_hot_context) ──
                 rounds_without_todo = 0 if used_todo else rounds_without_todo + 1
 
+            except KeyboardInterrupt:
+                logger.warning("LLM_TASK_CANCELLED: interrupted by user at iteration=%s", iteration + 1)
+                self._emit_ui_event("task_cancelled")
+                self.session_recorder.record(
+                    "runtime_cancelled",
+                    reason="user_interrupt",
+                    stage="llm_turn",
+                    iteration=iteration + 1,
+                )
+                self.trace.record_runtime_error("用户中断当前任务")
+                self.trace.end_task("CANCELLED")
+                return "已停止当前任务。"
             except Exception as e:
                 self.last_metrics["api_errors"] += 1
                 logger.exception("LLM_TURN_ERROR: iteration=%s", iteration + 1)
@@ -1769,7 +1829,12 @@ class MiniClaudeAgent:
     def run_background(self, command: str, description: str = "",
                        timeout: int = 120) -> str:
         """Execute a command in the background. Returns task ID."""
-        return self.background.run(command, description, timeout)
+        return self.background.run(
+            command,
+            description,
+            timeout,
+            cwd=str(self.runtime_context.cwd),
+        )
 
     def run_subagent(self, prompt: str, agent_type: str = "general-purpose"
                      ) -> SubAgentResult:

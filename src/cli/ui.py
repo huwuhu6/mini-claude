@@ -7,6 +7,16 @@ import sys
 from typing import Any, TextIO
 
 
+def confirm_exit(read_line=input) -> bool:
+    """Ask for confirmation after Ctrl+C is pressed while entering text."""
+    try:
+        answer = read_line("\n确认退出 Mini-Claude？[y/N] > ").strip().lower()
+    except (EOFError, KeyboardInterrupt):
+        print()
+        return False
+    return answer in ("y", "yes")
+
+
 class TerminalUI:
     """Render concise runtime events without changing agent behavior."""
 
@@ -85,6 +95,8 @@ class TerminalUI:
                 self._write(self._paint(f"  [x] {name}  失败", self._RED))
         elif event == "runtime_error":
             self._write(self._paint(f"  [!] 运行错误：{data.get('message', '')}", self._RED))
+        elif event == "task_cancelled":
+            self._write(self._paint("  [!] 当前任务已停止，返回输入。", self._YELLOW))
 
     def _write(self, text: str) -> None:
         print(text, file=self.stream, flush=True)

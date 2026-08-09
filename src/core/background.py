@@ -36,6 +36,7 @@ class BackgroundTask:
     created_at: float = field(default_factory=time.time)
     completed_at: Optional[float] = None
     timeout: int = 120
+    cwd: Optional[str] = None
     metadata: Dict[str, Any] = field(default_factory=dict)
 
 
@@ -74,13 +75,14 @@ class BackgroundProcessor:
     # ── Task Submission ───────────────────────────────────────
 
     def run(self, command: str, description: str = "", timeout: int = 120,
-            **metadata) -> str:
+            cwd: Optional[str] = None, **metadata) -> str:
         task_id = str(uuid.uuid4())[:8]
         task = BackgroundTask(
             id=task_id,
             description=description or command[:50],
             command=command,
             timeout=timeout,
+            cwd=cwd,
             metadata=metadata,
         )
         with self._lock:
@@ -147,6 +149,7 @@ class BackgroundProcessor:
                     shell=True,
                     capture_output=True,
                     timeout=task.timeout,
+                    cwd=task.cwd,
                 )
                 raw_output = r.stdout + r.stderr
                 try:

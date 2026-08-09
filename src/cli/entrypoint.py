@@ -14,7 +14,7 @@ if str(_src) not in sys.path:
 
 from agent.mini_claude_agent import MiniClaudeAgent
 from cli.confirmation import confirm_workspace
-from cli.ui import TerminalUI
+from cli.ui import TerminalUI, confirm_exit
 from core.debug_viewer import DebugViewer
 from core.runtime_data import RuntimeDataPaths
 
@@ -63,6 +63,17 @@ def _run_repl(agent: MiniClaudeAgent) -> None:
                 user_input = _read_multiline(ui)
             else:
                 user_input = user_input.strip()
+        except KeyboardInterrupt:
+            if confirm_exit():
+                print("再见。")
+                break
+            print("已取消退出，继续输入。")
+            continue
+        except EOFError:
+            print("\n再见。")
+            break
+
+        try:
             if not user_input:
                 continue
             if user_input.lower() in ("exit", "quit"):
@@ -72,9 +83,12 @@ def _run_repl(agent: MiniClaudeAgent) -> None:
             response = agent.chat(user_input)
             if response:
                 ui.print_answer(response)
-        except (KeyboardInterrupt, EOFError):
-            print("\n再见。")
-            break
+        except KeyboardInterrupt:
+            # Agent normally converts this into a cancelled response. This
+            # fallback keeps the REPL usable if an outer boundary is hit.
+            print("\n当前任务已停止，返回输入。")
+            logger.warning("REPL task interrupted by user")
+            continue
         except SystemExit:
             break
         except Exception as exc:

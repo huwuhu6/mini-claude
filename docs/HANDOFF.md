@@ -129,7 +129,8 @@ D:\python3.12.1\python.exe -m pytest tests/integration/test_eval_contract.py tes
 - 完整对话状态主要存在内存中，进程异常退出后不能自动恢复上下文。
 - Windows 测试环境可能出现 `.pytest_cache` 无权限警告；如果核心测试通过，不要把这个警告误判成业务失败。
 - `tiktoken` 首次加载可能需要编码资源，受限网络环境下测试收集可能失败。
-- 前台服务命令被 `Ctrl+C` 中断后会记录为 `CANCELLED`，而不是普通工具失败；服务启动和后台运行仍需要后续单独设计。
+- 前台服务命令被 `Ctrl+C` 中断后会记录为 `CANCELLED`，而不是普通工具失败。现在已经提供 `run_background` 工具处理 Redis、Spring Boot 等持续运行的服务，启动后再用 `bash` 验证；后台进程退出时的统一停止命令仍未实现。
+- 如果模型仍然把 Windows `start ...` 当作普通 `bash` 命令调用，Harness 会在入口处自动把它转交给后台执行器，避免新窗口已经打开但原工具调用仍然阻塞。
 
 ## 八、推荐的协作流程
 
@@ -334,3 +335,12 @@ py -m pip install -r requirements.txt
 ```
 
 如果因为环境限制没有安装 `prompt-toolkit`，CLI 会退回兼容模式：输入 `/paste`，粘贴内容，最后单独输入 `/end` 提交。
+
+### 9.9 Ctrl+C 的两种行为
+
+现在要区分“正在输入”和“Agent 正在工作”：
+
+- 正在输入时按 `Ctrl+C`：CLI 会询问是否退出，只有输入 `y` 或 `yes` 才退出；直接回车、输入其他内容或再次按 `Ctrl+C` 都会回到输入提示。
+- Agent 工作时按 `Ctrl+C`：只取消当前任务，不退出会话。Shell 命令、模型请求或其他工具的取消会记录 `runtime_cancelled`，Trace 状态为 `CANCELLED`。
+
+明确输入 `exit` 或 `quit` 仍然直接退出，因为这不是误触式的中断。
