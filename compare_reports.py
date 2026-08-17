@@ -170,11 +170,30 @@ def _compute_tool_sequence(raw: dict) -> str:
 
 
 def _compute_saved_log_read(raw: dict) -> str:
-    """Detect whether any tool inspected a file under .agent/logs."""
+    """Detect an actual read/search of a file under .agent/logs."""
     for turn in raw.get("turns", []):
         for tc in turn.get("tools", []):
-            serialized = json.dumps(tc, ensure_ascii=False).replace("\\", "/")
-            if re.search(r"\.agent/+/logs/+", serialized):
+            tool_name = tc.get("tool_name")
+            args_hash = str(tc.get("args_hash", ""))
+            normalized = re.sub(r"/+", "/", args_hash.replace("\\", "/"))
+            if tool_name in {"read_file", "search_code"}:
+                if ".agent/logs/" in normalized:
+                    return "yes"
+                continue
+
+            if tool_name != "bash":
+                continue
+            try:
+                command = json.loads(args_hash).get("command", "")
+            except (TypeError, json.JSONDecodeError):
+                command = ""
+            command = re.sub(r"/+", "/", str(command).replace("\\", "/"))
+            reads_log = re.search(
+                r"(?:findstr|grep|rg|cat|type|more|get-content)[^\r\n]*\.agent/logs/",
+                command,
+                flags=re.IGNORECASE,
+            )
+            if reads_log:
                 return "yes"
     return "no"
 

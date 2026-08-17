@@ -70,6 +70,20 @@ def test_report_extracts_tool_sequence_and_saved_log_read():
     assert _compute_saved_log_read(trace) == "yes"
 
 
+def test_report_does_not_count_log_save_as_log_read():
+    trace = {
+        "turns": [{
+            "tools": [{
+                "tool_name": "bash",
+                "args_hash": '{"command": "python tests/test_suite.py"}',
+                "result_preview": "[Full output saved to: .agent\\logs\\cmd.log]",
+            }]
+        }]
+    }
+
+    assert _compute_saved_log_read(trace) == "no"
+
+
 def test_verify_script_cannot_escape_task_directory():
     case_dir = TASKS_ROOT / "task_001_db_port"
     config = {
