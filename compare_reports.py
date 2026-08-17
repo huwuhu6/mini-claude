@@ -36,6 +36,7 @@ _METRIC_FIELDS = (
     "final_status",
     "total_turns",
     "total_tokens",
+    "peak_turn_tokens",
     "total_tool_calls",
     "total_latency_seconds",
     "tool_call_precision",
@@ -113,6 +114,16 @@ def _compute_avg_tokens_per_turn(raw: dict) -> float | None:
     return None
 
 
+def _compute_peak_turn_tokens(raw: dict) -> int | None:
+    """Return the largest per-turn token usage recorded in a trace."""
+    values = []
+    for turn in raw.get("turns", []):
+        value = turn.get("token_usage")
+        if isinstance(value, (int, float)):
+            values.append(value)
+    return int(max(values)) if values else None
+
+
 def _compute_avg_tool_latency(raw: dict) -> float | None:
     """工具调用平均延迟（毫秒）。"""
     total_ms = 0.0
@@ -147,6 +158,25 @@ def _fmt_tool_distribution(dist: dict[str, int | float]) -> str:
         else:
             parts.append(f"{k}:{v}")
     return " ".join(parts)
+
+
+def _compute_tool_sequence(raw: dict) -> str:
+    """Return the tool call order recorded by one trace."""
+    names = []
+    for turn in raw.get("turns", []):
+        for tc in turn.get("tools", []):
+            names.append(str(tc.get("tool_name", "unknown")))
+    return " -> ".join(names) if names else "-"
+
+
+def _compute_saved_log_read(raw: dict) -> str:
+    """Detect whether any tool inspected a file under .agent/logs."""
+    for turn in raw.get("turns", []):
+        for tc in turn.get("tools", []):
+            serialized = json.dumps(tc, ensure_ascii=False).replace("\\", "/")
+            if re.search(r"\.agent/+/logs/+", serialized):
+                return "yes"
+    return "no"
 
 
 def _load_trace_metrics(trace_path: Path) -> dict[str, Any]:
@@ -187,10 +217,13 @@ def _load_trace_metrics(trace_path: Path) -> dict[str, Any]:
     # ── 衍生指标 ──────────────────────────────────────
     result["_tool_failure_count"] = _compute_failure_count(raw)
     result["_avg_tokens_per_turn"] = _compute_avg_tokens_per_turn(raw)
+    result["peak_turn_tokens"] = _compute_peak_turn_tokens(raw)
     result["_avg_tool_latency_ms"] = _compute_avg_tool_latency(raw)
     dist_dict = _compute_tool_distribution_dict(raw)
     result["_tool_distribution_dict"] = dist_dict
     result["_tool_distribution"] = _fmt_tool_distribution(dist_dict)
+    result["_tool_sequence"] = _compute_tool_sequence(raw)
+    result["_read_saved_log"] = _compute_saved_log_read(raw)
 
     return result
 
@@ -721,6 +754,7 @@ _DETAIL_METRICS = [
     ("最终状态",      "final_status"),
     ("总轮次",        "total_turns"),
     ("总 Token",      "total_tokens"),
+    ("Peak Turn Tokens", "peak_turn_tokens"),
     ("总延迟",        "total_latency_seconds"),
     ("工具调用次数",  "total_tool_calls"),
     ("工具命中率",    "tool_call_precision"),
@@ -733,11 +767,14 @@ _DETAIL_METRICS = [
     ("回滚次数",      "rollback_count"),
     ("压缩次数",      "compression_count"),
     ("工具分布",      "_tool_distribution"),
+    ("Tool Call Sequence", "_tool_sequence"),
+    ("Read Saved Log",     "_read_saved_log"),
 ]
 
 # 数值型字段列表（用于判断是否需要计算 Δ）
 _NUMERIC_KEYS = {
     "total_turns", "total_tokens", "total_tool_calls",
+    "peak_turn_tokens",
     "tool_call_precision", "loop_guard_blocking_rate",
     "total_latency_seconds", "_tool_failure_count",
     "_avg_tokens_per_turn", "_avg_tool_latency_ms",
@@ -747,7 +784,7 @@ _NUMERIC_KEYS = {
 }
 
 # 不参与 Δ 计算的字段（非数值且字符串对比无意义）
-_SKIP_DELTA_KEYS = {"_tool_distribution"}
+_SKIP_DELTA_KEYS = {"_tool_distribution", "_tool_sequence", "_read_saved_log"}
 
 
 # ═══════════════════════════════════════════════════════════════

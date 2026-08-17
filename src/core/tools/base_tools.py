@@ -3,6 +3,8 @@ import ast
 import re
 import tempfile
 import logging
+import time
+import uuid
 from pathlib import Path
 from typing import Optional, List, TYPE_CHECKING
 from dataclasses import dataclass
@@ -166,8 +168,52 @@ class BaseTools:
             command, timeout=timeout, cwd_override=cwd_override,
         )
         return ToolResult(
-            content=result["content"],
+            content=self.format_tool_output(
+                result["content"],
+                success=result["success"],
+                exit_code=result.get("exit_code"),
+            ),
             success=result["success"],
+        )
+
+    def format_tool_output(self, content: str, success: bool = True,
+                           exit_code: Optional[int] = None) -> str:
+        """Persist oversized tool output and return a bounded inspection window."""
+        output = content
+        if content.startswith("[Exit Code: ") and "\n" in content:
+            output = content.split("\n", 1)[1]
+        lines = output.splitlines()
+        total_lines = len(lines)
+        total_chars = len(output)
+        if total_lines <= 40 and total_chars <= 2000:
+            return content
+
+        logs_dir = self.workdir.resolve() / ".agent" / "logs"
+        log_name = f"cmd_{time.strftime('%Y%m%d_%H%M%S')}_{uuid.uuid4().hex[:8]}.log"
+        log_path = logs_dir / log_name
+        try:
+            logs_dir.mkdir(parents=True, exist_ok=True)
+            with log_path.open("w", encoding="utf-8", newline="") as log_file:
+                log_file.write(output)
+            saved_path = log_path.relative_to(self.workdir.resolve()).as_posix()
+        except OSError as exc:
+            logger.warning("长工具输出落盘失败: %s", exc)
+            saved_path = f"<failed: {exc}>"
+
+        code = exit_code if exit_code is not None else (0 if success else 1)
+        head = "\n".join(lines[:10]) or "(empty)"
+        tail = "\n".join(lines[-20:]) or "(empty)"
+        return (
+            f"[Command executed with exit code {code}]\n"
+            f"[Output is too long (Total {total_lines} lines / {total_chars} chars). "
+            "Truncated for context efficiency.]\n"
+            f"[Full output saved to: {saved_path}]\n\n"
+            "--- Head (first 10 lines) ---\n"
+            f"{head}\n\n"
+            "--- Tail (last 20 lines) ---\n"
+            f"{tail}\n\n"
+            "[Tip]: Use `search_code` or `read_file` with line ranges on the saved "
+            "log file to inspect specific errors or sections."
         )
 
     @staticmethod

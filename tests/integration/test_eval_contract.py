@@ -20,6 +20,9 @@ from compare_reports import (
     _include_manifest_cases,
     _include_result_cases,
     _load_all_metrics,
+    _compute_peak_turn_tokens,
+    _compute_saved_log_read,
+    _compute_tool_sequence,
     _fmt_cell,
     _render_coverage_notes,
     _render_provenance,
@@ -46,6 +49,25 @@ def test_task_007_declares_its_verifier():
     config = json.loads(config_path.read_text(encoding="utf-8"))
 
     assert config["verify_script_file"] == "verify.py"
+
+
+def test_peak_turn_tokens_uses_trace_turn_usage():
+    trace = {"turns": [{"token_usage": 120}, {"token_usage": 480}, {"token_usage": 240}]}
+    assert _compute_peak_turn_tokens(trace) == 480
+
+
+def test_report_extracts_tool_sequence_and_saved_log_read():
+    trace = {
+        "turns": [{
+            "tools": [
+                {"tool_name": "bash", "result_preview": "[Full output saved to: .agent\\logs\\cmd.log]"},
+                {"tool_name": "read_file", "args_hash": '{"path": ".agent\\logs\\cmd.log"}'},
+            ]
+        }]
+    }
+
+    assert _compute_tool_sequence(trace) == "bash -> read_file"
+    assert _compute_saved_log_read(trace) == "yes"
 
 
 def test_verify_script_cannot_escape_task_directory():

@@ -974,7 +974,12 @@ class MiniClaudeAgent:
         logs = self.background.logs(job_id, tail=max(1, min(int(tail), 200)))
         if logs is None:
             return json.dumps({"status": "not_found", "job_id": job_id}, ensure_ascii=False)
-        return json.dumps(logs, ensure_ascii=False)
+        task = self.background.get(job_id)
+        return self.tools.format_tool_output(
+            json.dumps(logs, ensure_ascii=False),
+            success=True,
+            exit_code=task.exit_code if task else None,
+        )
 
     def _handle_stop_background(self, job_id: str) -> str:
         stopped = self.background.stop(job_id)

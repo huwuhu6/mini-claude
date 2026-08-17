@@ -27,6 +27,7 @@ from core.runtime_context import (
     RuntimeContext, PathResolver, ShellSession, CommandPolicy,
 )
 from core.background import BackgroundProcessor, BackgroundTaskStatus
+from core.tools.base_tools import BaseTools
 from core.tracing import ToolTrace, TaskTrace, TraceManager
 
 
@@ -135,6 +136,41 @@ def test_background_launch_tracks_process_and_tail_logs():
         assert current.exit_code == 0
         assert logs is not None
         assert "background-output" in logs["stdout"]
+
+
+def test_long_bash_output_is_saved_and_can_be_read_in_windows():
+    with tempfile.TemporaryDirectory() as temp_dir:
+        workspace = Path(temp_dir)
+        script = workspace / "emit_output.py"
+        script.write_text(
+            "for index in range(1, 66):\n"
+            "    print(f'log line {index}')\n",
+            encoding="utf-8",
+        )
+        tools = BaseTools(workspace, shell_session=ShellSession(workspace))
+
+        result = tools.run_bash(f'"{sys.executable}" "{script}"')
+
+        assert result.success
+        assert "Output is too long" in result.content
+        assert "Total 65 lines" in result.content
+        assert "log line 1" in result.content
+        assert "log line 65" in result.content
+        saved_path = next((workspace / ".agent" / "logs").glob("cmd_*.log"))
+        saved_content = saved_path.read_text(encoding="utf-8")
+        assert len(saved_content.splitlines()) == 65
+        assert saved_content.endswith("log line 65")
+        window = tools.read_file(f".agent/logs/{saved_path.name}", 31, 35)
+        assert window.success
+        assert "log line 31" in window.content
+        assert "log line 35" in window.content
+
+
+def test_short_tool_output_is_returned_unchanged():
+    with tempfile.TemporaryDirectory() as temp_dir:
+        tools = BaseTools(Path(temp_dir))
+        content = "[Exit Code: 0]\nsmall output"
+        assert tools.format_tool_output(content) == content
 
 
 # ═════════════════════════════════════════════════════════════════

@@ -97,8 +97,6 @@ class ShellSession:
                 out = raw.decode("gbk", errors="replace")
 
             out = out.strip()
-            if len(out) > 50000:
-                out = out[:50000] + f"\n... (已截断，剩余 {len(out) - 50000} 个字符)"
 
             result = f"[Exit Code: {r.returncode}]\n"
             result += out if out else "(Command executed silently with no output or errors.)"
@@ -108,6 +106,7 @@ class ShellSession:
                 "content": result,
                 "success": r.returncode == 0,
                 "cwd": str(self.cwd),
+                "exit_code": r.returncode,
             }
 
         except subprocess.TimeoutExpired:
@@ -116,6 +115,7 @@ class ShellSession:
                 "content": f"错误: 执行超时（{timeout} 秒）",
                 "success": False,
                 "cwd": str(self.cwd),
+                "exit_code": None,
             }
         except KeyboardInterrupt:
             # Ctrl+C should cancel the current command, not tear down the
@@ -125,6 +125,7 @@ class ShellSession:
                 "content": "[用户中断] 命令已被用户取消。",
                 "success": False,
                 "cwd": str(self.cwd),
+                "exit_code": None,
             }
         except Exception as e:
             logger.error(f"[ShellSession] 错误: {e}")
@@ -132,6 +133,7 @@ class ShellSession:
                 "content": f"错误: {str(e)}",
                 "success": False,
                 "cwd": str(self.cwd),
+                "exit_code": None,
             }
 
     # ── CWD Management ─────────────────────────────────────────────
