@@ -397,3 +397,24 @@ py -m pip install -r requirements.txt
 - Agent 工作时按 `Ctrl+C`：只取消当前任务，不退出会话。Shell 命令、模型请求或其他工具的取消会记录 `runtime_cancelled`，Trace 状态为 `CANCELLED`。
 
 明确输入 `exit` 或 `quit` 仍然直接退出，因为这不是误触式的中断。
+
+## 十、当前阶段快照（2026-08-17）
+
+本轮“工具长输出文件化与渐进式读取”已经完成一次有效闭环，当前主线 HEAD 为 `2dd60c2`。核心改造包括：长 stdout/stderr 自动合并、超过阈值后写入 `.agent/logs/cmd_<timestamp>_<id>.log`、返回 Head/Tail 摘要、支持 `read_file`/`search_code` 继续检索，以及在 Trace 中保留完整的 Head/Tail 摘要。
+
+新增并完成评测的任务是 `task_014_large_log_middle_debug`：完整输出约 2244 行，唯一有效诊断位于中间第 1100 行，Head/Tail 本身没有答案。评测报告为 `eval_reports/log_to_file_refactor/task014_compare.md`。
+
+评测条件已经核对：
+
+- baseline Agent commit：`5111599f`，`worktree_dirty=false`；
+- 改造后 Agent commit：`2dd60c22`，`worktree_dirty=false`；
+- 两边的 `task_suite_sha256`、任务配置 hash、baseline hash、verify hash 和 `task_version` 一致；
+- 两边都是 `5/5` 通过；
+- 平均总 Token：`253,998 -> 79,288`，下降 `68.8%`；
+- 平均 Peak Turn Tokens：`24,295 -> 7,805`，下降 `67.9%`；
+- 平均轮数：`14.8 -> 13.8`，下降 `6.8%`；
+- 平均耗时：`22.588s -> 21.590s`，下降 `4.4%`。
+
+改造后 5 条 trace 都生成了自动 `.agent/logs/cmd_*.log`，并包含完整 Head/Tail；多条 trace 使用 `search_code` 或 `read_file` 读取了中间诊断。需要保留的边界是：Baseline 也可能把输出重定向到 `test_output.txt` 后自行检索，因此这次结果充分证明了工具层文件化和上下文压缩有效，但不能单独证明模型始终优先读取 `.agent/logs`。
+
+当前长输出改造可以视为一个完整阶段。下一次对话不要默认继续这个方向，应先根据新的用户目标重新检查 `HANDOFF.md`、相关 evolution 文档、git 状态和最近提交。只有用户明确要求继续验证“必须读取自动日志”时，才新增 benchmark；新 benchmark 应避免模型通过普通文件重定向绕开 `.agent/logs`。
