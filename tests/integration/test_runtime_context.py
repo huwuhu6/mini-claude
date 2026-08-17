@@ -173,6 +173,33 @@ def test_short_tool_output_is_returned_unchanged():
         assert tools.format_tool_output(content) == content
 
 
+def test_trace_keeps_head_and_tail_for_fileized_output():
+    manager = TraceManager()
+    manager.start_task()
+    manager.start_turn(0)
+    content = (
+        "[Command executed with exit code 1]\n"
+        "[Output is too long (Total 65 lines / 5000 chars). Truncated for context efficiency.]\n"
+        "[Full output saved to: .agent/logs/cmd_test.log]\n\n"
+        "--- Head (first 10 lines) ---\n"
+        "HEAD_MARKER\n\n"
+        "--- Tail (last 20 lines) ---\n"
+        "TAIL_MARKER\n"
+    )
+    manager.record_tool_call(
+        tool_name="bash",
+        args_hash='{"command": "python tests/test_suite.py"}',
+        success=False,
+        result_preview=content,
+    )
+    manager._close_turn()
+
+    trace = manager.current_task.to_dict()
+    preview = trace["turns"][0]["tools"][0]["result_preview"]
+    assert "HEAD_MARKER" in preview
+    assert "TAIL_MARKER" in preview
+
+
 # ═════════════════════════════════════════════════════════════════
 # 3. ShellSession Tests
 # ═════════════════════════════════════════════════════════════════

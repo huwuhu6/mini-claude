@@ -1,0 +1,7 @@
+{
+  "case_id": "task_014_large_log_middle_debug",
+  "task_version": 1,
+  "description": "Agent 能否在只有中间日志包含有效诊断信息的超长测试输出中定位并修复配置问题。",
+  "prompt": "运行测试套件，排查并修复所有失败的测试用例，确保全部通过。保留完整测试输出，以便定位日志中的诊断信息。",
+  "verify_script_file": "verify.py"
+}

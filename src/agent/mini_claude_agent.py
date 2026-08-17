@@ -1708,7 +1708,7 @@ class MiniClaudeAgent:
                         tool_name=tname, args_hash=args_hash,
                         success=t_success, loop_guard_blocked=bool(v3_block_msg),
                         error_message="" if t_success else result_text[:200],
-                        result_preview=result_text[:200],
+                        result_preview=result_text,
                         started_at=t_start, finished_at=t_end,
                         failure_category=failure_sig.category.value if failure_sig else "",
                         recoverability=failure_sig.recoverability.value if failure_sig else "",

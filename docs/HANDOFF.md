@@ -247,6 +247,29 @@ py eval_runner.py --version local_experiment --task task_001 --runs 3
 - `worktree_dirty` 应为 `false`；
 - 发现条件不满足时，当前结果只能作为过程记录，不能用于对比结论。
 
+实际操作模板：
+
+```powershell
+# 当前主分支已经包含新 Agent 和 benchmark fixture 修正时：
+git stash push -u -m "eval artifacts" -- eval_reports
+
+# 从旧 Agent commit 建立 baseline 分支，只带入 fixture 修正
+git switch -c task_baseline_vN <old-agent-commit>
+git cherry-pick <benchmark-fixture-commit>
+py eval_runner.py -v large_log_baseline_vN -t task_013_large_log_debug -r 5
+
+# 回到新 Agent commit，保持工作区干净
+git switch main
+py eval_runner.py -v log_to_file_refactor_vN -t task_013_large_log_debug -r 5
+
+# 两组运行完成后再恢复报告产物并生成比较报告
+git stash pop
+py compare_reports.py -v large_log_baseline_vN,log_to_file_refactor_vN `
+  -t task_013_large_log_debug -d -o eval_reports/log_to_file_refactor_vN/compare.md
+```
+
+比较报告生成前，先核对两个 `run_manifest_*.json` 的 Agent commit、task hash 和 `worktree_dirty`。任何一项不满足，都应更换版本标签并重新评测，而不是事后用报告数字补救。
+
 其中：
 
 - `--version` 是本次实验的标签，不会自动切换 Git 版本；

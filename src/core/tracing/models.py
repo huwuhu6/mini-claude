@@ -55,7 +55,7 @@ class ToolTrace:
             'success': self.success,
             'loop_guard_blocked': self.loop_guard_blocked,
             'error_message': self.error_message[:200],
-            'result_preview': self.result_preview[:200],
+            'result_preview': self.result_preview,
             'failure_category': self.failure_category,
             'recoverability': self.recoverability,
             'strategy_fingerprint': self.strategy_fingerprint,

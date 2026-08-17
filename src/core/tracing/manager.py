@@ -37,6 +37,20 @@ from .writer import TraceWriter
 
 logger = logging.getLogger(__name__)
 
+_SHORT_RESULT_PREVIEW_LIMIT = 200
+_LONG_RESULT_PREVIEW_LIMIT = 4000
+
+
+def _trace_result_preview(result: str) -> str:
+    """Keep the full bounded window for fileized output in audit traces."""
+    if (
+        "[Output is too long" in result
+        and "--- Head (first 10 lines) ---" in result
+        and "--- Tail (last 20 lines) ---" in result
+    ):
+        return result[:_LONG_RESULT_PREVIEW_LIMIT]
+    return result[:_SHORT_RESULT_PREVIEW_LIMIT]
+
 
 class TraceManager:
     """Orchestrates runtime tracing — bridges agent events to persisted traces."""
@@ -176,7 +190,7 @@ class TraceManager:
             success=success,
             loop_guard_blocked=loop_guard_blocked,
             error_message=error_message[:200],
-            result_preview=result_preview[:200],
+            result_preview=_trace_result_preview(result_preview),
             failure_category=failure_category,
             recoverability=recoverability,
             strategy_fingerprint=strategy_fingerprint,
