@@ -229,6 +229,24 @@ py eval_runner.py `
 py eval_runner.py --version local_experiment --task task_001 --runs 3
 ```
 
+### 9.4 Baseline 与改造后评测的版本隔离
+
+需要比较 Agent 改造前后的效果时，不能只更换 `--version` 名称。两组评测必须运行在不同的已提交代码版本上：
+
+```text
+旧 Agent commit + 新版 benchmark fixture -> baseline 评测
+新 Agent commit + 同一版 benchmark fixture -> 改造后评测
+```
+
+推荐先提交 benchmark fixture 修正，再从旧 Agent commit 创建临时分支并 cherry-pick 该 fixture commit，运行 baseline。然后切回包含改造的主分支，运行改造后评测。不要依赖未提交修改，也不要在 `git stash pop` 失败或显示没有 stash 后继续假设代码已切换。
+
+每次评测后都要检查对应的 `run_manifest_*.json`：
+
+- baseline 和改造后必须有不同的 Agent commit；
+- 两边的 `task_suite_sha256`、配置 hash、baseline hash 和 `task_version` 必须一致；
+- `worktree_dirty` 应为 `false`；
+- 发现条件不满足时，当前结果只能作为过程记录，不能用于对比结论。
+
 其中：
 
 - `--version` 是本次实验的标签，不会自动切换 Git 版本；
