@@ -22,7 +22,7 @@ class TestApplicationSuite(unittest.TestCase):
     """Many ordinary checks plus one failure hidden in a long log."""
 
     def test_timeout_matches_service_contract(self):
-        self.assertEqual(TIMEOUT, 30, "TIMEOUT must be 30 for the service contract")
+        self.assertTrue(TIMEOUT == 30, "service timeout contract violated")
 
 
 for _index in range(1, 31):
