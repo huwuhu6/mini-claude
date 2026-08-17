@@ -72,6 +72,8 @@ session_id
 - 评测命令不要由协作者自动运行。应给负责人清楚的 PowerShell 命令，由负责人手动运行并反馈结果。
 - 负责人反馈测试结果后，先分析 Trace 和 JSONL，再决定是否修改 harness；不要看到一次偶然结果就立刻重构。
 - 修改前先检查现有代码和工作区状态，保留负责人已有的未提交改动。
+- Benchmark 任务目录统一使用 `task_<三位序号>_<简短名称>`，例如 `task_013_large_log_debug`；配置中的 `case_id`、目录名和归档 trace 名称必须一致。
+- Benchmark 的 `baseline/` 只保留可复制的初始源码和测试 fixture，不保留 `__pycache__`、临时日志或本地运行产物；运行后生成的缓存应清理。
 
 ## 六、常用操作
 
@@ -169,6 +171,15 @@ sandbox/tasks/task_xxx/
 ```
 
 `verify.py` 不应该暴露给 Agent，也不应该让 Agent 修改。评测器会先把 `baseline/` 复制到临时 Shadow Workspace，Agent 只操作 Shadow Workspace；Agent 结束后，评测器再复制并执行 `verify.py`。
+
+任务命名约定：
+
+```text
+task_<三位序号>_<简短名称>
+例如：task_013_large_log_debug
+```
+
+新增任务时先检查现有最大序号并顺延。目录名、`config.json` 的 `case_id`、评测归档中的 `trace_<case_id>...json` 应保持一致。提交任务前清理任务目录和 `baseline/` 下由 Python 自动生成的 `__pycache__`。
 
 ### 9.2 评测运行原理
 

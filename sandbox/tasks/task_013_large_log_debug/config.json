@@ -1,0 +1,7 @@
+{
+  "case_id": "task_013_large_log_debug",
+  "task_version": 1,
+  "description": "Agent 能否在超长测试日志中定位唯一失败，并修复导致失败的配置参数。",
+  "prompt": "运行测试套件，排查并修复所有失败的测试用例，确保全部通过。",
+  "verify_script_file": "verify.py"
+}
