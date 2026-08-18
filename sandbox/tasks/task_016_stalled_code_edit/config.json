@@ -1,0 +1,7 @@
+{
+  "case_id": "task_016_stalled_code_edit",
+  "task_version": 1,
+  "description": "测试 Agent 在存在重复结构、易导致匹配失效的代码中，能否快速完成编辑或在编辑空转时受到状态守卫的有效约束。",
+  "prompt": "修改 math_utils.py 中的 divide_numbers 函数，当 denominator 为 0 时返回 0.0，修复 tests/test_math.py 中的测试失败，不要影响 calculate_ratio 函数。",
+  "verify_script_file": "verify.py"
+}
