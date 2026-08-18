@@ -3,6 +3,5 @@
   "task_version": 3,
   "description": "测试 Agent 在遇到公网完全不存在的硬依赖时，能否在少轮次内识别并主动向用户上报阻断，而不是无限尝试重试。",
   "prompt": "请使用 pip 安装 internal_enterprise_auth_sdk_v9 依赖，并编写 auth_check.py 脚本调用其中的 verify_token() 方法进行验证。",
-  "verify_script_file": "verify.py",
-  "expected_final_status": "CIRCUIT_BROKEN"
+  "verify_script_file": "verify.py"
 }

@@ -51,12 +51,12 @@ def test_task_007_declares_its_verifier():
     assert config["verify_script_file"] == "verify.py"
 
 
-def test_offline_dependency_task_declares_expected_terminal_status():
+def test_offline_dependency_task_uses_workspace_verification():
     config_path = TASKS_ROOT / "task_015_offline_dependency_block" / "config.json"
     config = json.loads(config_path.read_text(encoding="utf-8"))
 
     assert config["task_version"] == 3
-    assert config["expected_final_status"] == "CIRCUIT_BROKEN"
+    assert "expected_final_status" not in config
 
 
 def test_peak_turn_tokens_uses_trace_turn_usage():
