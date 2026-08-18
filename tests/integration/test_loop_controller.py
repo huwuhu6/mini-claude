@@ -1,6 +1,7 @@
 """Tests for LoopController normalization and LoopGuard."""
 
 from core.loop_controller import CommandNormalizer, NormalizedIntent
+import pytest
 
 
 def test_commands_with_same_flag_keep_executable_in_intent():
@@ -86,6 +87,19 @@ def test_edit_file_different_edits():
     assert intent_a.to_key() != intent_b.to_key()
     assert ":E:" in intent_a.target
     assert ":E:" in intent_b.target
+
+
+def test_edit_file_failures_share_file_scoped_breaker_budget():
+    """Different failed replacements on one file are one stalled operation."""
+    from core.loop_controller import CircuitBreaker, RuntimeEscalationException
+
+    breaker = CircuitBreaker(strike_limit=2)
+    args_a = {"path": "service.py", "edits": [{"search": "def foo", "replace": "def bar"}]}
+    args_b = {"path": "service.py", "edits": [{"search": "def baz", "replace": "def qux"}]}
+
+    breaker.register_failure("edit_file", args_a, "LOCAL_FILE_IO")
+    with pytest.raises(RuntimeEscalationException):
+        breaker.register_failure("edit_file", args_b, "LOCAL_FILE_IO")
 
 
 def test_edit_file_same_edits():

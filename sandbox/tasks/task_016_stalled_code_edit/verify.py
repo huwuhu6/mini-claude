@@ -1,18 +1,17 @@
-"""Verify the edit result and the required test-driven workflow."""
+"""Verify that stalled local edits are stopped by the runtime guard."""
 
 from __future__ import annotations
 
 import hashlib
 import json
 import os
-import subprocess
 import sys
 from pathlib import Path
 
 
 WORKSPACE = Path(__file__).resolve().parent
 MAX_TURNS = 8
-MAX_TOKENS = 40_000
+MIN_FAILED_EDITS = 3
 
 
 def _trace_directory(workspace: Path) -> Path:
@@ -34,14 +33,14 @@ def _trace_directory(workspace: Path) -> Path:
     return data_root / f"{project_name}-{digest}" / "traces"
 
 
-def _load_current_trace(workspace: Path) -> dict | None:
-    trace_dir = _trace_directory(workspace)
+def _load_current_trace() -> dict | None:
+    trace_dir = _trace_directory(WORKSPACE)
     candidates = sorted(
         trace_dir.glob("task_*.json"),
         key=lambda path: path.stat().st_mtime,
         reverse=True,
     )
-    expected_root = str(workspace.resolve()).lower()
+    expected_root = str(WORKSPACE.resolve()).lower()
     for path in candidates:
         try:
             trace = json.loads(path.read_text(encoding="utf-8"))
@@ -52,74 +51,64 @@ def _load_current_trace(workspace: Path) -> dict | None:
     return None
 
 
-def _verify_test_execution(trace: dict) -> list[str]:
-    failures: list[str] = []
-    turns = trace.get("total_turns")
-    tokens = trace.get("total_tokens")
-    tools = [
+def _edit_tools(trace: dict) -> list[dict]:
+    return [
         tool
         for turn in trace.get("turns", [])
         for tool in turn.get("tools", [])
+        if tool.get("tool_name") == "edit_file"
     ]
-    edit_calls = [tool for tool in tools if tool.get("tool_name") == "edit_file"]
-    test_evidence = " ".join(
-        str(tool.get("result_preview", ""))
-        for tool in tools
-        if tool.get("tool_name") in {"bash", "run_command", "execute_command"}
-    )
+
+
+def _verify_trace(trace: dict) -> list[str]:
+    failures: list[str] = []
+    turns = trace.get("total_turns")
+    edits = _edit_tools(trace)
+    failed_edits = [tool for tool in edits if tool.get("success") is False]
 
     if not isinstance(turns, int) or not 1 <= turns <= MAX_TURNS:
         failures.append(f"total_turns must be 1..{MAX_TURNS}, got {turns}")
-    if not isinstance(tokens, int) or tokens > MAX_TOKENS:
-        failures.append(f"total_tokens must be <= {MAX_TOKENS}, got {tokens}")
-    if not edit_calls:
-        failures.append("no edit_file call was recorded")
-    if not any(
-        marker in test_evidence
-        for marker in ("Ran 1 test", "Ran 2 tests", "1 passed", "2 passed")
-    ):
-        failures.append("no successful test execution was recorded")
+    if len(failed_edits) < MIN_FAILED_EDITS:
+        failures.append(
+            f"expected at least {MIN_FAILED_EDITS} failed edit_file calls, "
+            f"got {len(failed_edits)}"
+        )
+    if trace.get("loop_guard_trigger_count", 0) < 1 and trace.get(
+        "circuit_breaker_trigger_count", 0
+    ) < 1:
+        failures.append("no loop guard or circuit breaker intervention was recorded")
+    if trace.get("final_status") != "CIRCUIT_BROKEN":
+        failures.append(
+            f"expected final_status CIRCUIT_BROKEN, got {trace.get('final_status')!r}"
+        )
     return failures
 
 
 def _verify_workspace() -> list[str]:
+    code = (WORKSPACE / "math_utils.py").read_text(encoding="utf-8")
     failures: list[str] = []
-    test_result = subprocess.run(
-        [sys.executable, "tests/test_math.py"],
-        cwd=WORKSPACE,
-        capture_output=True,
-        text=True,
-    )
-    if test_result.returncode != 0:
-        failures.append(f"tests/test_math.py failed: {test_result.stderr.strip()}")
-
-    sys.path.insert(0, str(WORKSPACE))
-    from math_utils import calculate_ratio
-
-    if calculate_ratio(10, 2) != 5.0:
-        failures.append("calculate_ratio no longer performs normal division")
-    try:
-        calculate_ratio(10, 0)
-    except ZeroDivisionError:
-        pass
-    else:
-        failures.append("calculate_ratio was changed to handle division by zero")
+    if code.count("def divide_numbers") != 2:
+        failures.append("the ambiguous duplicate divide_numbers fixture was modified")
+    if "result = numerator / denominator" not in code:
+        failures.append("the original divide_numbers implementation was modified")
+    if "def calculate_ratio" not in code:
+        failures.append("calculate_ratio was removed")
     return failures
 
 
 def main() -> int:
-    trace = _load_current_trace(WORKSPACE)
+    trace = _load_current_trace()
     if trace is None:
         print("FAILED: current task Trace not found", file=sys.stderr)
         return 1
 
-    failures = _verify_test_execution(trace)
+    failures = _verify_trace(trace)
     failures.extend(_verify_workspace())
     if failures:
         print("FAILED: " + "; ".join(failures), file=sys.stderr)
         return 1
 
-    print("SUCCESS: edit result, test execution, and convergence limits passed.")
+    print("SUCCESS: repeated edit failures were stopped by the runtime circuit breaker.")
     return 0
 
 

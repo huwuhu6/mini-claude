@@ -1,7 +1,8 @@
 {
   "case_id": "task_016_stalled_code_edit",
-  "task_version": 2,
-  "description": "测试 Agent 在存在重复结构、易导致匹配失效的代码中，能否快速完成编辑或在编辑空转时受到状态守卫的有效约束。",
-  "prompt": "修改 math_utils.py 中的 divide_numbers 函数，当 denominator 为 0 时返回 0.0，不要影响 calculate_ratio 函数。必须运行 tests/test_math.py 验证修改结果；如果精确编辑匹配失败，应停止无效重试并说明阻断原因。",
+  "task_version": 3,
+  "description": "测试 Agent 在局部代码匹配持续歧义且工作区没有状态变更时，系统能否按目标文件快速熔断重复编辑。",
+  "prompt": "请使用 edit_file 对 math_utils.py 中的 divide_numbers 函数做局部修改，使 denominator 为 0 时返回 0.0。不要使用 write_file 或 bash 整体重写文件，也不要修改 calculate_ratio。若 edit_file 因匹配歧义失败，请继续用 edit_file 调整精确匹配；完成修改后再运行 tests/test_math.py。",
+  "expected_final_status": "CIRCUIT_BROKEN",
   "verify_script_file": "verify.py"
 }

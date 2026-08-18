@@ -505,7 +505,7 @@ class CircuitBreaker:
         Raises RuntimeEscalationException when the strike limit is reached.
         """
         intent = CommandNormalizer.normalize(tool_name, args)
-        key = intent.to_key()
+        key = self._failure_key(tool_name, args, intent)
 
         # Accumulate strike
         self._strikes[key] = self._strikes.get(key, 0) + 1
@@ -527,6 +527,18 @@ class CircuitBreaker:
                 f"操作: {intent.action}，目标: {intent.target}\n"
                 f"Runtime 已物理掐断 Agent 循环。"
             )
+
+    @staticmethod
+    def _failure_key(
+        tool_name: str,
+        args: Dict[str, Any],
+        intent: NormalizedIntent,
+    ) -> str:
+        """Group failed local edits by file while preserving intent dedup keys."""
+        if tool_name == "edit_file":
+            target = CommandNormalizer._extract_base_path(args) or "edit_file"
+            return f"edit_file:EDIT:{target}"
+        return intent.to_key()
 
     def get_strike_count(self, intent_key: str) -> int:
         return self._strikes.get(intent_key, 0)
