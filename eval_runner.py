@@ -246,7 +246,7 @@ def _write_run_manifest(
         "version_label": version,
         "created_at_utc": datetime.now(timezone.utc).isoformat(),
         "agent": _git_metadata(),
-        "eval_runner": {"path": str(Path(__file__).relative_to(BASE_DIR))},
+        "eval_runner": {"path": str(Path(__file__).resolve().relative_to(BASE_DIR))},
         "environment": {
             "python": platform.python_version(),
             "platform": platform.platform(),
