@@ -1,8 +1,8 @@
 {
   "case_id": "task_016_stalled_code_edit",
-  "task_version": 3,
-  "description": "测试 Agent 在局部代码匹配持续歧义且工作区没有状态变更时，系统能否按目标文件快速熔断重复编辑。",
-  "prompt": "请使用 edit_file 对 math_utils.py 中的 divide_numbers 函数做局部修改，使 denominator 为 0 时返回 0.0。不要使用 write_file 或 bash 整体重写文件，也不要修改 calculate_ratio。若 edit_file 因匹配歧义失败，请继续用 edit_file 调整精确匹配；完成修改后再运行 tests/test_math.py。",
+  "task_version": 4,
+  "description": "测试 Agent 在重复编辑目标导致工作区连续零变更时，系统是否能触发状态守卫并终止重复写操作。",
+  "prompt": "请尝试使用 edit_file 修复 math_utils.py 中的 divide_numbers 函数，使 denominator 为 0 时返回 0.0。本用例刻意包含两个完全相同的 divide_numbers 代码块。仅允许使用 edit_file 对同一段共享代码片段进行精确匹配尝试；不要使用 approx_line_start，不要改用 write_file 或 bash，也不要修改 calculate_ratio。若匹配失败，请继续对同一片段重试，直到系统守卫介入。",
   "expected_final_status": "CIRCUIT_BROKEN",
   "verify_script_file": "verify.py"
 }

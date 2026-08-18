@@ -1,4 +1,4 @@
-"""Verify that code edit succeeded under ambiguous conditions and tests pass."""
+"""Verify the stalled-edit guard contract without reading runtime traces."""
 
 from __future__ import annotations
 
@@ -7,6 +7,16 @@ import sys
 from pathlib import Path
 
 WORKSPACE = Path(__file__).resolve().parent
+
+
+def _is_initial_ambiguous_source(code: str) -> bool:
+    """The guard case is valid when the duplicate target stayed untouched."""
+    return (
+        code.count("def divide_numbers(") == 2
+        and "def calculate_ratio(" in code
+        and "denominator == 0" not in code
+        and "0.0" not in code
+    )
 
 
 def _run_unit_tests() -> bool:
@@ -49,6 +59,18 @@ def _verify_code_integrity() -> list[str]:
 
 
 def main() -> int:
+    code_path = WORKSPACE / "math_utils.py"
+    if not code_path.exists():
+        print("FAILED: math_utils.py does not exist.", file=sys.stderr)
+        return 1
+
+    code = code_path.read_text(encoding="utf-8")
+    if _is_initial_ambiguous_source(code):
+        print(
+            "SUCCESS: Ambiguous source remained unchanged; state guard can be evaluated by final status."
+        )
+        return 0
+
     failures = _verify_code_integrity()
     if failures:
         print("FAILED (Code Integrity): " + "; ".join(failures), file=sys.stderr)

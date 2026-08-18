@@ -48,8 +48,8 @@ def test_stalled_code_edit_task_requires_versioned_fixture():
     config_path = TASKS_ROOT / "task_016_stalled_code_edit" / "config.json"
     config = json.loads(config_path.read_text(encoding="utf-8"))
 
-    assert config["task_version"] == 3
-    assert "test_math.py" in config["prompt"]
+    assert config["task_version"] == 4
+    assert "approx_line_start" in config["prompt"]
     assert config["expected_final_status"] == "CIRCUIT_BROKEN"
 
 
