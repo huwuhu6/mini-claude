@@ -44,6 +44,14 @@ def test_all_task_contracts_are_valid():
     assert errors == []
 
 
+def test_stalled_code_edit_task_requires_versioned_fixture():
+    config_path = TASKS_ROOT / "task_016_stalled_code_edit" / "config.json"
+    config = json.loads(config_path.read_text(encoding="utf-8"))
+
+    assert config["task_version"] == 2
+    assert "test_math.py" in config["prompt"]
+
+
 def test_task_007_declares_its_verifier():
     config_path = TASKS_ROOT / "task_007_java_cognitive_noise_rebuild" / "config.json"
     config = json.loads(config_path.read_text(encoding="utf-8"))
@@ -219,9 +227,9 @@ def test_report_keeps_failed_case_without_trace():
 
     assert matrix["task_crashed"]["version"]["eval_result"] == "CRASHED"
     assert matrix["task_crashed"]["version"]["_trace_status"] == "MISSING"
-    assert "case_exception:RuntimeError" in _fmt_cell(matrix["task_crashed"]["version"] | {
-        "_failure_reason": "case_exception:RuntimeError: boom"
-    })
+    failed_metrics = dict(matrix["task_crashed"]["version"])
+    failed_metrics["_failure_reason"] = "case_exception:RuntimeError: boom"
+    assert "case_exception:RuntimeError" in _fmt_cell(failed_metrics)
 
 
 def test_report_uses_attempt_count_when_some_runs_have_no_trace():

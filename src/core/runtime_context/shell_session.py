@@ -9,6 +9,7 @@ import logging
 import os
 import re
 import subprocess
+import sys
 import uuid
 from pathlib import Path
 from typing import Dict, Any, List, Optional
@@ -145,7 +146,10 @@ class ShellSession:
         for part in parts:
             trimmed = part.strip()
             if trimmed.startswith("cd "):
-                target = trimmed[3:].strip().strip('"').strip("'")
+                target_text = trimmed[3:].strip()
+                if sys.platform == "win32" and re.match(r"^/d(?:\s|$)", target_text, re.IGNORECASE):
+                    target_text = target_text[2:].strip()
+                target = target_text.strip().strip('"').strip("'")
                 if not target:
                     continue
                 self._apply_cd(target)

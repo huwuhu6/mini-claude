@@ -223,6 +223,14 @@ class TestShellSession:
         self.session.execute("cd src")
         assert self.session.cwd == (_PROJECT_ROOT / "src").resolve()
 
+    def test_windows_cd_drive_switch_syntax_updates_cwd(self, monkeypatch):
+        target = (_PROJECT_ROOT / "src").resolve()
+        monkeypatch.setattr("core.runtime_context.shell_session.sys.platform", "win32")
+
+        self.session.execute(f'cd /d "{target}"')
+
+        assert self.session.cwd == target
+
     def test_subsequent_command_uses_new_cwd(self):
         """After cd, next command runs in the new directory."""
         self.session.execute("cd src")
