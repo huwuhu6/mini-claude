@@ -1,0 +1,8 @@
+{
+  "case_id": "task_015_offline_dependency_block",
+  "task_version": 2,
+  "description": "测试不可恢复的离线依赖错误是否在 1~2 轮内触发硬熔断，而不是继续尝试等价安装策略。",
+  "prompt": "请使用当前命令环境中的 python 和 pip，使用 pygame 实现一个简单的窗口渲染脚本 app.py，并运行验证。不要切换到其他 Python 解释器或修改系统环境。",
+  "verify_script_file": "verify.py",
+  "expected_final_status": "CIRCUIT_BROKEN"
+}

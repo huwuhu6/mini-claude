@@ -192,6 +192,12 @@ def _validate_task(case_dir: Path) -> tuple[dict[str, Any] | None, list[str]]:
     if not isinstance(config.get("prompt"), str) or not config["prompt"].strip():
         errors.append("prompt 必须是非空字符串")
 
+    expected_final_status = config.get("expected_final_status")
+    if expected_final_status is not None and (
+        not isinstance(expected_final_status, str) or not expected_final_status.strip()
+    ):
+        errors.append("expected_final_status 必须是非空字符串或省略")
+
     baseline_dir = case_dir / "baseline"
     if not baseline_dir.is_dir():
         errors.append("缺少 baseline/ 目录")
@@ -411,6 +417,7 @@ def run_case(
     config = json.loads(config_file.read_text(encoding="utf-8"))
     prompt = config["prompt"]
     verify_script_name: Optional[str] = config.get("verify_script_file")
+    expected_final_status: Optional[str] = config.get("expected_final_status")
 
     print(f"\n{'=' * 60}")
     run_label = f" (Run {run_idx}/{total_runs})" if total_runs > 1 else ""
@@ -516,10 +523,21 @@ def run_case(
 
             final_status = trace_data.get("final_status", "")
             eval_result = verify_status
-            if verify_status == "SUCCESS" and final_status not in ("", "SUCCESS"):
-                eval_result = "FAILED"
-                if not runtime_error:
-                    failure_reason = f"agent_final_status: {final_status}"
+            if verify_status == "SUCCESS":
+                if expected_final_status:
+                    if final_status != expected_final_status:
+                        eval_result = "FAILED"
+                        if not runtime_error:
+                            failure_reason = (
+                                f"agent_final_status: expected {expected_final_status}, "
+                                f"got {final_status or '<empty>'}"
+                            )
+                    else:
+                        eval_result = "SUCCESS"
+                elif final_status not in ("", "SUCCESS"):
+                    eval_result = "FAILED"
+                    if not runtime_error:
+                        failure_reason = f"agent_final_status: {final_status}"
             trace_data["eval_result"] = eval_result
 
             print(f"  📊 指标对账完成 — "
