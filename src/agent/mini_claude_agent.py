@@ -45,7 +45,12 @@ from core.tracing import TraceManager
 from core.runtime_data import RuntimeDataPaths
 from core.session_recorder import SessionLogHandler, SessionRecorder
 from core.failure_intelligence import FailureAnalyzer, FailureMemory, FailureEscalationPolicy, build_escalation_message
-from core.runtime_context import RuntimeContext
+from core.runtime_context import (
+    RuntimeContext,
+    run_preflight,
+    EnvironmentBlocker,
+    WorkspaceStateGuard,
+)
 from core.runtime_context.command_policy import CommandPolicy
 from cli.authority import WorkspaceAuthority
 from skills import SkillLoader
@@ -89,6 +94,10 @@ class MiniClaudeAgent:
         # Config must be loaded first (used by _setup_logging)
         self.config_manager = ConfigManager(config_path)
         self.config = self.config_manager.get_config()
+        # Probe before session subsystems start so the system prompt and audit
+        # record share the same bounded environment facts.
+        self.preflight = run_preflight(self.workdir)
+        self.environment_blocker = EnvironmentBlocker(self.preflight)
         self.data_paths = RuntimeDataPaths.for_workspace(self.workdir)
         self.session_recorder = SessionRecorder(self.data_paths.sessions)
 
@@ -98,6 +107,7 @@ class MiniClaudeAgent:
             workspace=str(self.workdir),
             data_root=str(self.data_paths.root),
         )
+        self.session_recorder.record("environment_preflight", **self.preflight.to_dict())
         logger.info(f"正在初始化 MiniClaudeAgent v{self.config.agent.version}")
 
         # Workspace Authority — unified permission boundary
@@ -105,6 +115,7 @@ class MiniClaudeAgent:
 
         # Runtime context — workspace binding, path resolution, shell session
         self.runtime_context = RuntimeContext(workspace_root=self.workdir)
+        self.workspace_state_guard = WorkspaceStateGuard(self.workdir)
 
         # Core tools (delegates whitelist to WorkspaceAuthority when available)
         self.tools = BaseTools(
@@ -420,6 +431,7 @@ class MiniClaudeAgent:
         f"Working directory: {self.workdir}\n"
         "You can use tools to read/write files, run commands, and manage tasks.\n"
         "\n"
+        f"{self.preflight.to_context()}\n\n"
         # ── Layer 2: Critical rules (promoted — before skills) ─
     ) + self._get_platform_prompt() + "\n" + (
         # ── Layer 3: Planning rule ───────────────────────────────
@@ -1247,6 +1259,46 @@ class MiniClaudeAgent:
 
     # ── Pre-LLM Processing (mirrors s_full.py agent_loop) ────────────
 
+    def _record_environment_block(
+        self,
+        tool_name: str,
+        args_hash: str,
+        block,
+        started_at: float,
+        call_id: str,
+    ) -> str:
+        """Persist and surface a terminal environment blocker in one place."""
+        result_text = block.message
+        self.trace.record_circuit_breaker()
+        self.trace.record_tool_call(
+            tool_name=tool_name,
+            args_hash=args_hash,
+            success=False,
+            loop_guard_blocked=False,
+            error_message=result_text[:200],
+            result_preview=result_text,
+            started_at=started_at,
+            finished_at=time.time(),
+            failure_category=block.category,
+            recoverability="NON_RECOVERABLE",
+            strategy_fingerprint="ENVIRONMENT_BLOCKER",
+            escalated=True,
+            circuit_breaker_triggered=True,
+            cwd=str(self.runtime_context.cwd),
+            workspace_root=str(self.runtime_context.workspace_root),
+            session_id=self.runtime_context.shell_session.session_id,
+        )
+        self.session_recorder.record(
+            "tool_result",
+            call_id=call_id,
+            tool=tool_name,
+            success=False,
+            blocked=True,
+            result=result_text,
+        )
+        self._emit_ui_event("tool_result", name=tool_name, success=False, blocked=True)
+        return result_text
+
     def _is_tool_error(self, result_text: str) -> bool:
         """Detect whether a tool result indicates failure.
 
@@ -1258,6 +1310,12 @@ class MiniClaudeAgent:
             return False
         if result_text.startswith("错误:"):
             return True
+        # File tools return localized Harness failures after the dispatcher
+        # unwraps ToolResult.content.
+        if "Harness" in result_text[:240] and any(
+            marker in result_text[:240] for marker in ("失败", "拦截", "failed", "blocked")
+        ):
+            return True
         if result_text.startswith("[Exit Code: ") and "]" in result_text[:20]:
             try:
                 code_start = len("[Exit Code: ")
@@ -1265,6 +1323,8 @@ class MiniClaudeAgent:
                 return int(result_text[code_start:code_end]) != 0
             except (ValueError, IndexError):
                 pass
+        if '"status": "launch_failed"' in result_text:
+            return True
         return False
 
     def _check_auto_compress(self) -> bool:
@@ -1389,10 +1449,12 @@ class MiniClaudeAgent:
             workspace_root=str(self.runtime_context.workspace_root),
             workspace_confirmed=self._workspace_confirmed,
             require_tool_call=require_tool_call,
+            environment=self.preflight.to_dict(),
         )
         self.runtime_context.current_task_id = tid
         self.failure_memory.set_task(tid)
         self.loop_controller.clear()
+        self.workspace_state_guard.reset()
 
         no_tool_retry_count = 0
         tool_call_seen = False
@@ -1587,12 +1649,31 @@ class MiniClaudeAgent:
                     # ── Trace + V3 Defense + Execute + Failure Intelligence ──
                     t_start = time.time()
                     args_hash = canonicalize_args(args)
+                    state_before = None
+                    state_guard_blocked = False
+                    if self.workspace_state_guard.is_write_operation(tname, args):
+                        state_before = self.workspace_state_guard.snapshot()
                     v3_block_msg = None
                     failure_sig = None
 
                     try:
                         # ── V3 Layer 2+3: intent-based dedup → circuit breaker ──
-                        v3_block_msg = self.loop_controller.check(tname, args)
+                        preflight_block = self.environment_blocker.check_command(tname, args)
+                        if preflight_block:
+                            result_text = self._record_environment_block(
+                                tname, args_hash, preflight_block, t_start, tc.get("id", "")
+                            )
+                            self.trace.end_task("SUCCESS")
+                            return result_text
+
+                        state_stall_preblock = None
+                        if state_before is not None:
+                            state_stall_preblock = self.workspace_state_guard.pending_write_message()
+                        if state_stall_preblock:
+                            state_guard_blocked = True
+                            v3_block_msg = state_stall_preblock
+                        else:
+                            v3_block_msg = self.loop_controller.check(tname, args)
 
                         if v3_block_msg:
                             result_text = v3_block_msg
@@ -1602,6 +1683,29 @@ class MiniClaudeAgent:
                         else:
                             result = self._execute_tool(tname, args)
                             result_text = str(result)
+
+                            environment_block = self.environment_blocker.classify_result(
+                                result_text,
+                                failed=self._is_tool_error(result_text),
+                            )
+                            if environment_block:
+                                result_text = self._record_environment_block(
+                                    tname, args_hash, environment_block, t_start, tc.get("id", "")
+                                )
+                                self.trace.end_task("SUCCESS")
+                                return result_text
+
+                            state_guard_message = None
+                            if state_before is not None:
+                                mutation = self.workspace_state_guard.mutation(
+                                    state_before, self.workspace_state_guard.snapshot()
+                                )
+                                state_guard_message = self.workspace_state_guard.observe_write(mutation)
+                            elif self.workspace_state_guard.is_read_operation(tname):
+                                state_guard_message = self.workspace_state_guard.observe_read(tname, args)
+                            if state_guard_message:
+                                result_text = state_guard_message
+                                state_guard_blocked = True
 
                             if result_text.startswith("[用户中断]"):
                                 t_end = time.time()
@@ -1703,18 +1807,29 @@ class MiniClaudeAgent:
 
                     t_end = time.time()
 
-                    t_success = not v3_block_msg and not self._is_tool_error(result_text)
+                    t_success = (
+                        not v3_block_msg
+                        and not state_guard_blocked
+                        and not self._is_tool_error(result_text)
+                    )
                     self.trace.record_tool_call(
                         tool_name=tname, args_hash=args_hash,
-                        success=t_success, loop_guard_blocked=bool(v3_block_msg),
+                        success=t_success,
+                        loop_guard_blocked=bool(v3_block_msg) or state_guard_blocked,
                         error_message="" if t_success else result_text[:200],
                         result_preview=result_text,
                         started_at=t_start, finished_at=t_end,
-                        failure_category=failure_sig.category.value if failure_sig else "",
-                        recoverability=failure_sig.recoverability.value if failure_sig else "",
+                        failure_category=(
+                            "STATE_STALLED" if state_guard_blocked
+                            else failure_sig.category.value if failure_sig else ""
+                        ),
+                        recoverability=(
+                            "NON_RECOVERABLE" if state_guard_blocked
+                            else failure_sig.recoverability.value if failure_sig else ""
+                        ),
                         strategy_fingerprint=failure_sig.strategy_fingerprint if failure_sig else "",
                         escalated=failure_sig.escalated if failure_sig else False,
-                        circuit_breaker_triggered=False,
+                        circuit_breaker_triggered=state_guard_blocked,
                         cwd=str(self.runtime_context.cwd),
                         workspace_root=str(self.runtime_context.workspace_root),
                         session_id=self.runtime_context.shell_session.session_id,
@@ -1731,14 +1846,14 @@ class MiniClaudeAgent:
                         call_id=tc.get("id"),
                         tool=tname,
                         success=t_success,
-                        blocked=bool(v3_block_msg),
+                        blocked=bool(v3_block_msg) or state_guard_blocked,
                         result=result_text,
                     )
                     self._emit_ui_event(
                         "tool_result",
                         name=tname,
                         success=t_success,
-                        blocked=bool(v3_block_msg),
+                        blocked=bool(v3_block_msg) or state_guard_blocked,
                     )
 
                     # Log with clean format
@@ -1755,6 +1870,11 @@ class MiniClaudeAgent:
                         content=result_text,
                         tool_call_id=tc.get('id', ''),
                     ))
+
+                    if state_guard_blocked:
+                        self.trace.record_circuit_breaker()
+                        self.trace.end_task("CIRCUIT_BROKEN")
+                        return result_text
 
                 # ── Nag tracking (s_full.py s03 — hot-injected via _get_dynamic_hot_context) ──
                 rounds_without_todo = 0 if used_todo else rounds_without_todo + 1

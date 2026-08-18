@@ -26,6 +26,10 @@ _ClassificationRule = Tuple[
 ]
 
 _CLASSIFICATION_RULES: list[_ClassificationRule] = [
+    (re.compile(r'\[WinError 5\]|\[Errno 13\]'),
+     FailureCategory.PERMISSION_DENIED,
+     Recoverability.USER_INTERVENTION_REQUIRED,
+     "The operating system denied access to the requested resource.", 0.95),
 
     # ── PERMISSION_DENIED (highest priority) ─────────────────
     (re.compile(r'Permission denied|permission denied|Access is denied|'
@@ -36,6 +40,7 @@ _CLASSIFICATION_RULES: list[_ClassificationRule] = [
 
     # ── NETWORK_UNREACHABLE ─────────────────────────────────
     (re.compile(r'Failed to establish a new connection|Cannot connect|'
+                r'ENOTFOUND|ETIMEDOUT|EHOSTUNREACH|ECONNREFUSED|'
                 r'connection refused|Connection refused|'
                 r'Network is unreachable|network is unreachable|'
                 r'cannot reach|no route to host|No route to host|'
@@ -58,6 +63,10 @@ _CLASSIFICATION_RULES: list[_ClassificationRule] = [
 
     # ── PACKAGE_NOT_FOUND ───────────────────────────────────
     (re.compile(r'Could not find a version|No matching distribution|'
+                r'Could not resolve dependencies|Could not find artifact|'
+                r'no matching package named|failed to select a version for the requirement|'
+                r'cannot find module providing package|no matching versions for query|'
+                r'npm\s+ERR!\s+(?:code\s+)?E404|yarn\s+error:.*Couldn.t find package|'
                 r'not found in repository|package not found|Package not found|'
                 r'404 Not Found|404 Client Error|'
                 r'找不到.*版本|没有找到.*包|no such package'),

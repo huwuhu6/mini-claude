@@ -25,10 +25,77 @@ if _src not in sys.path:
 import pytest
 from core.runtime_context import (
     RuntimeContext, PathResolver, ShellSession, CommandPolicy,
+    EnvironmentBlocker, WorkspaceStateGuard, run_preflight,
 )
+from core.runtime_context.preflight import _version_command
 from core.background import BackgroundProcessor, BackgroundTaskStatus
 from core.tools.base_tools import BaseTools
 from core.tracing import ToolTrace, TaskTrace, TraceManager
+from agent.mini_claude_agent import MiniClaudeAgent
+
+
+def test_agent_classifies_harness_edit_failures_as_tool_errors():
+    assert MiniClaudeAgent._is_tool_error(None, "【Harness 事务拦截】匹配失败")
+
+
+def test_preflight_discovers_only_workspace_relevant_toolchains(tmp_path, monkeypatch):
+    (tmp_path / "package.json").write_text("{}", encoding="utf-8")
+    (tmp_path / "go.mod").write_text("module example.local/app", encoding="utf-8")
+
+    monkeypatch.setattr(
+        "core.runtime_context.preflight._probe_network",
+        lambda deadline, clock: "OFFLINE",
+    )
+    monkeypatch.setattr(
+        "core.runtime_context.preflight._version_for",
+        lambda executable, deadline, clock: f"{executable} test-version",
+    )
+
+    result = run_preflight(tmp_path)
+
+    assert result.network_access == "OFFLINE"
+    assert set(result.detected_toolchains) == {"node", "npm", "pnpm", "yarn", "go"}
+    assert "External dependency downloads" in result.to_context()
+
+
+def test_environment_blocker_covers_polyglot_failures():
+    preflight = type("Probe", (), {"network_access": "OFFLINE"})()
+    blocker = EnvironmentBlocker(preflight)
+
+    assert blocker.check_command(
+        "bash", {"command": "npm install missing-package"}
+    ).category == "NETWORK_UNREACHABLE"
+    assert blocker.classify_result("npm ERR! code E404").category == "PACKAGE_NOT_FOUND"
+    assert blocker.classify_result("error: EACCES").category == "PERMISSION_DENIED"
+    assert blocker.classify_result("readme: Permission denied is documented", failed=False) is None
+
+
+def test_windows_command_wrappers_use_cmd_exe():
+    command = _version_command(r"C:\tools\npm.CMD", ("--version",), platform_name="nt")
+    assert command[:3] == ["cmd.exe", "/d", "/c"]
+    assert command[3].lower().endswith("npm.cmd")
+
+
+def test_workspace_guard_recognizes_polyglot_write_commands(tmp_path):
+    guard = WorkspaceStateGuard(tmp_path)
+    assert guard.is_write_operation("bash", {"command": "python -c \"Path('a').write_text('x')\""})
+    assert guard.is_write_operation("bash", {"command": "node -e \"fs.writeFile('a', 'x')\""})
+    assert guard.is_write_operation("powershell", {"command": "Set-Content app.py value"})
+    assert not guard.is_write_operation("bash", {"command": "python -c \"print(open('a').read())\""})
+
+
+def test_workspace_state_guard_stops_two_noop_writes(tmp_path):
+    target = tmp_path / "app.py"
+    target.write_text("print('ok')\n", encoding="utf-8")
+    guard = WorkspaceStateGuard(tmp_path)
+    before = guard.snapshot()
+
+    assert guard.observe_write(guard.mutation(before, guard.snapshot())) is None
+    assert guard.observe_write(guard.mutation(before, guard.snapshot())) is None
+    message = guard.pending_write_message()
+
+    assert message is not None
+    assert "State Stalled Detected" in message
 
 
 # ═════════════════════════════════════════════════════════════════

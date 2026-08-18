@@ -17,10 +17,16 @@ from .workspace import RuntimeContext
 from .path_resolver import PathResolver
 from .shell_session import ShellSession
 from .command_policy import CommandPolicy
+from .preflight import PreflightResult, run_preflight
+from .environment_guard import EnvironmentBlock, EnvironmentBlocker
+from .workspace_state import WorkspaceMutation, WorkspaceStateGuard
 
 __all__ = [
     'RuntimeContext',
     'PathResolver',
     'ShellSession',
     'CommandPolicy',
+    'PreflightResult', 'run_preflight',
+    'EnvironmentBlock', 'EnvironmentBlocker',
+    'WorkspaceMutation', 'WorkspaceStateGuard',
 ]

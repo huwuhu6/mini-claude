@@ -30,7 +30,7 @@ import logging
 import time
 import uuid
 from pathlib import Path
-from typing import Optional
+from typing import Any, Dict, Optional
 
 from .models import ToolTrace, TurnTrace, TaskTrace
 from .writer import TraceWriter
@@ -65,7 +65,8 @@ class TraceManager:
     def start_task(self, task_id: str = "", user_prompt: str = "",
                     workspace_root: str = "",
                     workspace_confirmed: bool = False,
-                    require_tool_call: bool = False) -> str:
+                    require_tool_call: bool = False,
+                    environment: Optional[Dict[str, Any]] = None) -> str:
         """Begin a new task-level trace.  Returns task_id."""
         tid = task_id or str(uuid.uuid4())[:8]
         self.current_task = TaskTrace(
@@ -74,6 +75,7 @@ class TraceManager:
             workspace_root=workspace_root,
             workspace_confirmed=workspace_confirmed,
             require_tool_call=require_tool_call,
+            environment=dict(environment or {}),
         )
         self.current_turn = None
         logger.debug(f"Trace: task started [{tid}]")

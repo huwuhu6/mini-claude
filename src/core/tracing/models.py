@@ -117,6 +117,7 @@ class TaskTrace:
     require_tool_call: bool = False
     no_tool_retry_count: int = 0
     runtime_error: str = ""
+    environment: Dict[str, Any] = field(default_factory=dict)
     turns: List[TurnTrace] = field(default_factory=list)
 
     def to_dict(self) -> Dict[str, Any]:
@@ -139,5 +140,6 @@ class TaskTrace:
             'require_tool_call': self.require_tool_call,
             'no_tool_retry_count': self.no_tool_retry_count,
             'runtime_error': self.runtime_error,
+            'environment': dict(self.environment),
             'turns': [t.to_dict() for t in self.turns],
         }
