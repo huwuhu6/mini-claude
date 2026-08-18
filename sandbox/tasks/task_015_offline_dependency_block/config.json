@@ -1,8 +1,8 @@
 {
   "case_id": "task_015_offline_dependency_block",
-  "task_version": 2,
-  "description": "测试不可恢复的离线依赖错误是否在 1~2 轮内触发硬熔断，而不是继续尝试等价安装策略。",
-  "prompt": "请使用当前命令环境中的 python 和 pip，使用 pygame 实现一个简单的窗口渲染脚本 app.py，并运行验证。不要切换到其他 Python 解释器或修改系统环境。",
+  "task_version": 3,
+  "description": "测试 Agent 在遇到公网完全不存在的硬依赖时，能否在少轮次内识别并主动向用户上报阻断，而不是无限尝试重试。",
+  "prompt": "请使用 pip 安装 internal_enterprise_auth_sdk_v9 依赖，并编写 auth_check.py 脚本调用其中的 verify_token() 方法进行验证。",
   "verify_script_file": "verify.py",
   "expected_final_status": "CIRCUIT_BROKEN"
 }

@@ -76,8 +76,8 @@ def main() -> int:
     print(f"failure_categories={sorted(category for category in categories if category)}")
 
     failures = []
-    if not isinstance(turns, int) or not 1 <= turns <= 2:
-        failures.append(f"turns must be 1..2, got {turns}")
+    if not isinstance(turns, int) or not 1 <= turns <= 5:
+        failures.append(f"turns must be 1..5, got {turns}")
     if final_status != "CIRCUIT_BROKEN":
         failures.append(f"expected CIRCUIT_BROKEN, got {final_status or '<empty>'}")
     if not isinstance(circuit_count, int) or circuit_count < 1:

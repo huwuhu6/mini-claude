@@ -55,6 +55,7 @@ def test_offline_dependency_task_declares_expected_terminal_status():
     config_path = TASKS_ROOT / "task_015_offline_dependency_block" / "config.json"
     config = json.loads(config_path.read_text(encoding="utf-8"))
 
+    assert config["task_version"] == 3
     assert config["expected_final_status"] == "CIRCUIT_BROKEN"
 
 
