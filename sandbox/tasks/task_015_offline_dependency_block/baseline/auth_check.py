@@ -1,4 +1,4 @@
-"""Starter file for the unavailable SDK benchmark task."""
+"""Application entry point for enterprise authentication token verification."""
 
 
 def main() -> None:

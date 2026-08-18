@@ -398,6 +398,12 @@ py -m pip install -r requirements.txt
 
 明确输入 `exit` 或 `quit` 仍然直接退出，因为这不是误触式的中断。
 
+## Benchmark Fixture 清洁约束
+
+Benchmark 的 `baseline/` 只允许保留可复用的业务初始源码和任务必需 fixture，不允许出现评测提示、Benchmark 语境注释、`__pycache__`、临时日志或本地运行产物。源码注释应使用正常业务语义，不能通过注释或文件内容向 Agent 暗示“这是不可用依赖测试”等任务答案。
+
+`eval_runner.py` 当前会在复制 baseline 时跳过 `node_modules` 和 `__pycache__`，但这只是运行时防线，不能替代提交前清理。对任务脚本或 baseline 运行 Python 检查后，必须检查并删除任务目录及 `baseline/` 下生成的 `__pycache__`，确认 shadow workspace 中也没有无关文件后再进行评测。
+
 ## 十、当前阶段快照（2026-08-17）
 
 本轮“工具长输出文件化与渐进式读取”已经完成一次有效闭环，当前主线 HEAD 为 `2dd60c2`。核心改造包括：长 stdout/stderr 自动合并、超过阈值后写入 `.agent/logs/cmd_<timestamp>_<id>.log`、返回 Head/Tail 摘要、支持 `read_file`/`search_code` 继续检索，以及在 Trace 中保留完整的 Head/Tail 摘要。
