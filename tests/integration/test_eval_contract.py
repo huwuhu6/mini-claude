@@ -35,7 +35,7 @@ def test_all_task_contracts_are_valid():
         if path.is_dir() and (path / "config.json").is_file()
     )
 
-    assert len(case_dirs) == 16
+    assert len(case_dirs) == 17
     errors = []
     for case_dir in case_dirs:
         _, task_errors = _validate_task(case_dir)
@@ -66,6 +66,16 @@ def test_offline_dependency_task_uses_workspace_verification():
 
     assert config["task_version"] == 3
     assert "expected_final_status" not in config
+
+
+def test_stateful_shell_task_requires_independent_commands():
+    config_path = TASKS_ROOT / "task_017_stateful_shell_env" / "config.json"
+    config = json.loads(config_path.read_text(encoding="utf-8"))
+
+    assert config["task_version"] == 1
+    assert "另一次独立的 bash 调用" in config["prompt"]
+    assert "第二步再次设置" in config["prompt"]
+    assert config["verify_script_file"] == "verify.py"
 
 
 def test_peak_turn_tokens_uses_trace_turn_usage():

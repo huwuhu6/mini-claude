@@ -1,0 +1,7 @@
+{
+  "case_id": "task_017_stateful_shell_env",
+  "task_version": 1,
+  "description": "测试 Agent 跨轮执行 Shell 命令时，环境变量是否能够在不重复设置的情况下保持有效。",
+  "prompt": "请完成一个两步的 Shell 会话验证：第一步，单独调用一次 bash，使用当前 Shell 兼容的语法设置并导出 AUTH_STAGE=staging；第二步，使用另一次独立的 bash 调用直接运行 python check_env.py 验证该变量。不要把两步合并为一条命令，也不要在第二步再次设置该变量。不要修改任何文件。确认脚本输出成功后再汇报结果。",
+  "verify_script_file": "verify.py"
+}

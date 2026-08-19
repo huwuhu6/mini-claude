@@ -452,7 +452,14 @@ def run_case(
             except Exception as exc:
                 print(f"  ⚠ verify 脚本复制失败: {exc}")
 
-            _env = {**os.environ, "PYTHONIOENCODING": "utf-8", "PYTHONUTF8": "1"}
+            _env = {
+                **os.environ,
+                "PYTHONIOENCODING": "utf-8",
+                "PYTHONUTF8": "1",
+                # The verifier is copied after the Agent exits, so this path is
+                # outside its writable workspace and can audit tool boundaries.
+                "EVAL_TRACE_PATH": str(trace_path.resolve()),
+            }
             try:
                 if sys.platform == "win32":
                     subprocess.run(["chcp", "65001"], capture_output=True, shell=True)
