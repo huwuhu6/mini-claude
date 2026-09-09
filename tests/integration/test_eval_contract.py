@@ -10,12 +10,16 @@ import pytest
 
 from eval_runner import (
     TASKS_ROOT,
+    _find_latest_trace,
     _positive_int,
+    _select_cases,
     _sha256_tree,
     _truncate_output,
     _validate_task,
     _version_label,
+    write_run_results,
 )
+from core.runtime_data import RuntimeDataPaths
 from compare_reports import (
     _include_manifest_cases,
     _include_result_cases,
@@ -35,13 +39,79 @@ def test_all_task_contracts_are_valid():
         if path.is_dir() and (path / "config.json").is_file()
     )
 
-    assert len(case_dirs) == 30
+    assert len(case_dirs) == 35
     errors = []
     for case_dir in case_dirs:
         _, task_errors = _validate_task(case_dir)
         errors.extend(f"{case_dir.name}: {error}" for error in task_errors)
 
     assert errors == []
+
+
+def _task_configs(case_dirs):
+    return {
+        path.name: json.loads((path / "config.json").read_text(encoding="utf-8"))
+        for path in case_dirs
+    }
+
+
+def test_suite_only_selects_all_anti_loop_cases_from_metadata():
+    case_dirs = sorted(p for p in TASKS_ROOT.iterdir() if (p / "config.json").is_file())
+    selected = _select_cases(case_dirs, _task_configs(case_dirs), suite="anti_loop")
+    assert len(selected) == 17
+    assert all("anti_loop" == _task_configs([p])[p.name]["evaluation"]["suite"] for p in selected)
+
+
+def test_split_only_preserves_historical_case_compatibility():
+    case_dirs = sorted(p for p in TASKS_ROOT.iterdir() if (p / "config.json").is_file())
+    configs = _task_configs(case_dirs)
+    selected = _select_cases(case_dirs, configs, split="dev")
+    assert TASKS_ROOT / "task_030_long_running_daemon_lifecycle_legacy" in selected
+    assert TASKS_ROOT / "task_026_multi_scope_validation" not in selected
+
+
+def test_suite_and_split_are_an_intersection():
+    case_dirs = sorted(p for p in TASKS_ROOT.iterdir() if (p / "config.json").is_file())
+    selected = _select_cases(case_dirs, _task_configs(case_dirs), "anti_loop", "dev")
+    assert len(selected) == 12
+    assert all("task_026" not in path.name for path in selected)
+
+
+def test_unknown_suite_selects_nothing_without_id_hardcoding():
+    case_dirs = sorted(p for p in TASKS_ROOT.iterdir() if (p / "config.json").is_file())
+    assert _select_cases(case_dirs, _task_configs(case_dirs), "not_a_suite") == []
+
+
+def test_evaluation_runtime_root_is_writable_and_trials_are_isolated(tmp_path):
+    workspace = tmp_path / "workspace"
+    workspace.mkdir()
+    first = RuntimeDataPaths.for_workspace(workspace, tmp_path / "run" / "case" / "trial_0001")
+    second = RuntimeDataPaths.for_workspace(workspace, tmp_path / "run" / "case" / "trial_0002")
+    first.traces.mkdir(parents=True)
+    second.traces.mkdir(parents=True)
+    trace = first.traces / "task_example.json"
+    trace.write_text("{}", encoding="utf-8")
+    assert first.root != second.root
+    assert _find_latest_trace(workspace, first.root) == trace
+    assert _find_latest_trace(workspace, second.root) is None
+    import shutil
+    shutil.rmtree(first.root)
+    assert _find_latest_trace(workspace, first.root) is None
+
+
+def test_run_results_is_atomic_and_preserves_denominator(tmp_path, monkeypatch):
+    import eval_runner
+    monkeypatch.setattr(eval_runner, "OUTPUT_ROOT", tmp_path)
+    metadata = {"run_id": "run-1", "planned_trials": 2}
+    result_path = write_run_results("smoke", metadata, [{
+        "case_id": "task_crash", "attempted": True,
+        "verify_status": "CRASHED", "trace_status": "MISSING",
+    }])
+    payload = json.loads(result_path.read_text(encoding="utf-8"))
+    assert payload["planned_trials"] == 2
+    assert payload["attempted_trials"] == 1
+    assert payload["missing_trace_trials"] == 1
+    assert not result_path.with_name(result_path.name + ".tmp").exists()
 
 
 def test_stalled_code_edit_task_requires_versioned_fixture():

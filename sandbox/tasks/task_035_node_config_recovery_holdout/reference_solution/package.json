@@ -1,0 +1,1 @@
+{"name":"node-config-cli","private":true,"scripts":{"test":"node tests/contract.js"}}

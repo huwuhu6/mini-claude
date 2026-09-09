@@ -657,8 +657,10 @@ def run_case(
     )
 
     # ── Step 3: 动态路由断言（黄雀在后验证） ───────────────
-    verify_status = "FAILED"
+    verify_status = "CRASHED" if agent_error else "FAILED"
     failure_reason = agent_error
+    final_status: str | None = None
+    terminal_reason: str | None = None
     verify_exit_code: int | None = None
     verify_stdout: str | None = None
     verify_stderr: str | None = None
@@ -753,6 +755,7 @@ def run_case(
                 failure_reason = f"agent_runtime_error: {runtime_error}"
 
             final_status = trace_data.get("final_status", "")
+            terminal_reason = trace_data.get("terminal_reason", "") or None
             eval_result = verify_status
             if verify_status == "SUCCESS":
                 if expected_final_status:
@@ -803,6 +806,7 @@ def run_case(
             failure_reason = f"trace_processing_error:{type(exc).__name__}: {exc}"
     else:
         print("  ⚠ 未找到 Trace JSON，跳过指标对账与归档")
+        terminal_reason = "AGENT_EXCEPTION" if agent_error else "TRACE_MISSING"
 
     # ── Step 5: 垃圾回收 + 句柄缓冲 + 暴力毁灭现场 ────────
     gc.collect()
@@ -819,6 +823,7 @@ def run_case(
         "split": contract.get("split"),
         "behavior_class": contract.get("behavior_class"),
         "finished_at": datetime.now(timezone.utc).isoformat(),
+        "runtime_data_root": str(runtime_data_root),
         "case_id": case_id,
         "verify_status": verify_status,
         "agent_duration_s": agent_duration,
@@ -828,8 +833,9 @@ def run_case(
         "tool_call_precision": trace_data.get("tool_call_precision"),
         "self_healing_convergence_speed": trace_data.get("self_healing_convergence_speed"),
         "loop_guard_blocking_rate": trace_data.get("loop_guard_blocking_rate"),
-        "final_status": trace_data.get("final_status"),
+        "final_status": final_status,
         "eval_result": trace_data.get("eval_result", verify_status),
+        "terminal_reason": terminal_reason,
         "runtime_error": trace_data.get("runtime_error", ""),
         "trace_status": trace_status,
         "failure_reason": failure_reason,

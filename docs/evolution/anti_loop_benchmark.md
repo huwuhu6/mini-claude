@@ -19,7 +19,9 @@
 | task_028 | holdout | must_stop | 依赖错误表达变体 | 防固定字符串 Case Patch |
 | task_029 | holdout | must_stop | 环境阻断形态变体 | 防 DEV 过拟合 |
 
-`task_030_long_running_daemon_lifecycle_legacy` 是原有未提交的历史回归任务，已保留但不属于 Anti-Loop 主矩阵；原 task_015/016 同样属于 diagnostic/regression。
+`task_030_long_running_daemon_lifecycle_legacy` 是原有历史回归任务，已保留但不属于 Anti-Loop 主矩阵；原 task_015/016 同样属于 diagnostic/regression。
+
+本矩阵新增了不同工具链和拓扑的 Core：`task_031`（JVM/javac 重复编译）、`task_032`（Node/npm 本地测试）、`task_033`（generic shell 状态振荡）、`task_034`（Java signer 永久阻断）以及 `task_035`（Node 配置拓扑 holdout）。它们的 verifier 执行真实编译、运行、测试或 evaluator-side 状态检查，不读取 evaluator 私有实现。
 
 ## 指标
 
@@ -39,22 +41,26 @@ Governance Accuracy = (TP + TN) / (TP + TN + FP + FN)
 ## 运行流程
 
 ```powershell
-python eval_runner.py --validate-only
-python eval_runner.py --version baseline_dev --split dev --runs 3
-python eval_runner.py --version candidate_dev --split dev --runs 3
-python compare_reports.py --versions baseline_dev,candidate_dev --detail
+D:\python3.12.1\python.exe eval_runner.py --validate-only
+D:\python3.12.1\python.exe eval_runner.py --suite anti_loop --split dev --version baseline_dev --runs 3
+D:\python3.12.1\python.exe eval_runner.py --suite anti_loop --split dev --version candidate_dev --runs 3
+D:\python3.12.1\python.exe compare_reports.py --versions baseline_dev,candidate_dev --detail
 ```
 
 正式数据使用 `--runs 5`。Candidate 冻结后才运行：
 
 ```powershell
-python eval_runner.py --version candidate_holdout --split holdout --runs 5
-python compare_reports.py --versions candidate_dev,candidate_holdout --detail
+D:\python3.12.1\python.exe eval_runner.py --suite anti_loop --split holdout --version candidate_holdout --runs 5
+D:\python3.12.1\python.exe compare_reports.py --versions candidate_dev,candidate_holdout --detail
 ```
 
 Holdout 是 procedural validation split，不是密码学隐藏集；看到 Holdout 结果后若修改治理算法，必须换一批新的 Holdout。
 
-Manifest 会记录 agent commit/dirty 状态、Python/platform、task suite/config/fixture hash、provider/model/temperature/max_tokens、feature flags 和 max_iterations。比较时 suite、配置或模型条件不一致会明确报警，不能静默归因。
+Manifest 会记录 agent commit/dirty 状态、Python/platform、task suite/config/fixture hash、provider/model/temperature/max_tokens、feature flags、`configured_max_iterations`、`effective_max_iterations`，以及显式的 per-run/per-trial evaluation runtime data root 策略。`run_results` 是原子替换的 Durable Trial Ledger：每个已尝试 Trial 立即入账，异常、中断、缺 Trace 不能从分母消失。
+
+`--suite` 从 `config.json.evaluation.suite` 读取；`--suite anti_loop --split dev` 是 Core DEV 的正式选择方式。省略 suite 时保留历史兼容语义，历史普通 Case 不会被隐式声称为 Anti-Loop Case。
+
+报告还输出 ecosystem（python/jvm/node/shell/other）与 principle coverage；两者只说明结构性覆盖，不构成“跨语言分数”。
 
 ## 当前局限
 

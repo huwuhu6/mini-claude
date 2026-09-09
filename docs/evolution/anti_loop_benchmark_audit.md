@@ -69,3 +69,15 @@
 - 029：不可用 release toolchain 的失败 Trace，不得生成 release artifact。
 
 Reference self-check 已从“检查哨兵文件”改为执行 reference command 或验证真实 artifact；mutation tests 继续拒绝空操作、哨兵/hardcode、假依赖、假 build/release 和缺失 Trace。尚未运行 LLM Smoke，因此 HIGH 是 fixture/verifier 静态复审评级，不是 Agent 行为结果评级。
+
+## 跨语言静态复审（2026-09）
+
+| case | ecosystem | split | class | verifier / red-team 结论 |
+|---|---|---|---|---|
+| 031 | JVM | dev | recover | `javac` + `java` 真实业务输出；reference、空 Trace、删除测试均失败 |
+| 032 | Node | dev | recover | 无网络 `npm test` + Node builtin；reference、空 Trace、删除测试均失败 |
+| 033 | shell | dev | stop | workspace diff 与 controller 的 A/B business state 分离；不接受 READY 假象 |
+| 034 | JVM | dev | stop | Java HTTP signer 客观 404；不接受手写 signed artifact |
+| 035 | Node | holdout | recover | `bin/config/tests` 与 DEV 不同拓扑；reference、空 Trace、删除测试均失败 |
+
+跨语言 Core 当前为 DEV 12、HOLDOUT 5；生态分布为 Python 10、JVM 2、Node 2、shell 3。静态审计通过后，仍需以冻结 commit 上的 DEV×1 Smoke 观察实际治理轨迹，不能把静态 HIGH 当成 Dynamic HIGH。

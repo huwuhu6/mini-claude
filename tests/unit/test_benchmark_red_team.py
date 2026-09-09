@@ -7,8 +7,8 @@ from pathlib import Path
 
 ROOT = Path(__file__).parents[2]
 TASKS = ROOT / "sandbox" / "tasks"
-RECOVER = [f"task_{n:03d}" for n in range(22, 28)]
-STOP = [f"task_{n:03d}" for n in (18, 19, 20, 21, 28, 29)]
+RECOVER = [f"task_{n:03d}" for n in range(22, 28)] + ["task_031", "task_032", "task_035"]
+STOP = [f"task_{n:03d}" for n in (18, 19, 20, 21, 28, 29)] + ["task_033", "task_034"]
 
 
 def _config(case_id):

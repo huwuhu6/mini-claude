@@ -374,6 +374,8 @@ def _load_all_metrics(
                 if isinstance(contract, dict):
                     metrics["evaluation_split"] = contract.get("split")
                     metrics["behavior_class"] = contract.get("behavior_class")
+                    metrics["ecosystem"] = contract.get("ecosystem", "unknown")
+                    metrics["principles"] = contract.get("principles", [])
             except (OSError, json.JSONDecodeError):
                 pass
             raw_groups.setdefault((ver_name, case_id), []).append(metrics)
@@ -647,6 +649,60 @@ def _render_anti_loop_summary(matrix: dict[str, dict[str, dict[str, Any]]],
             rows.append(f"| `{version}` | {tp} | {tn} | {fp} | {fn} | {acc:.1%} |")
         if rows:
             lines.extend([f"### {split}", "", "| 版本 | TP | TN | FP | FN | Governance Accuracy |", "|---|---:|---:|---:|---:|---:|", *rows, ""])
+    return lines
+
+
+def _render_language_coverage(
+    manifests: dict[str, dict[str, Any] | None] | None = None,
+) -> list[str]:
+    """Report structural coverage; this is not a cross-language score."""
+    selected_ids: set[str] | None = None
+    if manifests:
+        ids: set[str] = set()
+        for manifest in manifests.values():
+            if manifest and not manifest.get("_error"):
+                ids.update(_manifest_case_ids(manifest))
+        if ids:
+            selected_ids = ids
+
+    ecosystems: dict[str, int] = {}
+    principles: dict[str, int] = {}
+    splits: dict[str, int] = {"dev": 0, "holdout": 0}
+    if TASKS_ROOT.is_dir():
+        for case_dir in sorted(TASKS_ROOT.iterdir()):
+            if selected_ids is not None and case_dir.name not in selected_ids:
+                continue
+            try:
+                config = json.loads((case_dir / "config.json").read_text(encoding="utf-8"))
+            except (OSError, json.JSONDecodeError):
+                continue
+            evaluation = config.get("evaluation", {})
+            if not isinstance(evaluation, dict) or evaluation.get("suite") != "anti_loop":
+                continue
+            ecosystem = str(evaluation.get("ecosystem", "unknown"))
+            ecosystems[ecosystem] = ecosystems.get(ecosystem, 0) + 1
+            split = evaluation.get("split")
+            if split in splits:
+                splits[split] += 1
+            for principle in evaluation.get("principles", []):
+                principles[str(principle)] = principles.get(str(principle), 0) + 1
+
+    lines = [
+        "## Anti-Loop Language / Principle Coverage\n",
+        "> 结构性覆盖统计，不是跨语言分数。\n",
+        "### Core cases by ecosystem\n",
+        "| ecosystem | cases |", "|---|---:|",
+    ]
+    for ecosystem in ("python", "jvm", "node", "shell", "other", "unknown"):
+        if ecosystems.get(ecosystem, 0):
+            lines.append(f"| {ecosystem} | {ecosystems[ecosystem]} |")
+    for ecosystem, count in sorted(ecosystems.items()):
+        if ecosystem not in {"python", "jvm", "node", "shell", "other", "unknown"}:
+            lines.append(f"| {ecosystem} | {count} |")
+    lines.extend(["", "### Principle coverage\n", "| principle | cases |", "|---|---:|"])
+    for principle, count in sorted(principles.items()):
+        lines.append(f"| {principle} | {count} |")
+    lines.extend(["", f"Core DEV: {splits['dev']} cases; Core HOLDOUT: {splits['holdout']} cases.", ""])
     return lines
 
 
@@ -1107,6 +1163,7 @@ def _render_report(
 
     lines.extend(_render_global_board(versions, matrix))
     lines.extend(_render_anti_loop_summary(matrix, versions))
+    lines.extend(_render_language_coverage(manifests))
 
     lines.append("## 多版本精简对比\n")
     lines.append("> ✅ Nt · Nktok · N%hit · Ncmp · Ns    |    ❌ STATUS · Nt · Nktok · Ncmp\n")

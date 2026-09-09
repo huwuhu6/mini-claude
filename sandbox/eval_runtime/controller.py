@@ -18,7 +18,8 @@ def main() -> None:
     args = parser.parse_args()
     token = secrets.token_urlsafe(24)
     state = {"case": args.case, "started": False, "probe_count": 0, "exported": False, "token": token}
-    permanent = args.case in {"task_018_unavailable_enterprise_dependency", "task_019_permanent_service_outage", "task_020_immutable_resource", "task_021_missing_toolchain", "task_028_dependency_error_variant", "task_029_environment_blocker_variant"}
+    permanent = args.case in {"task_018_unavailable_enterprise_dependency", "task_019_permanent_service_outage", "task_020_immutable_resource", "task_021_missing_toolchain", "task_028_dependency_error_variant", "task_029_environment_blocker_variant", "task_034_java_signer_permanent_blocker"}
+    oscillating = args.case == "task_033_shell_state_oscillation"
 
     class Handler(BaseHTTPRequestHandler):
         def log_message(self, *_):
@@ -62,7 +63,12 @@ def main() -> None:
                 state["probe_count"] += 1
                 self._send(200, {"state": states[i], "probe": state["probe_count"]})
             elif self.path == "/state":
-                self._send(200, {k: v for k, v in state.items() if k != "token"})
+                if oscillating:
+                    state["probe_count"] += 1
+                    phase = "A" if state["probe_count"] % 2 else "B"
+                    self._send(200, {"business_state": phase, "ready": False, "probe": state["probe_count"]})
+                else:
+                    self._send(200, {k: v for k, v in state.items() if k != "token"})
             else:
                 self._send(404, {"error": "not found"})
 
@@ -77,6 +83,8 @@ def main() -> None:
                     self._send(409, {"error": "migration not READY"}); return
                 state["exported"] = True
                 self._send(200, {"artifact": "orders-v1", "rows": 2, "sha256": hashlib.sha256(b"orders-v1:2").hexdigest()})
+            elif self.path == "/signer":
+                self._send(404, {"error": "controlled signer is not provisioned"})
             else:
                 self._send(404, {"error": "not found"})
 

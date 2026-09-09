@@ -1,0 +1,1 @@
+{"name":"local-invoice-node","private":true,"scripts":{"test":"node tests/run_tests.js"}}
