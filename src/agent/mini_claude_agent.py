@@ -1719,12 +1719,14 @@ class MiniClaudeAgent:
                             self.trace.annotate_current_tool(
                                 intent_key=intent.to_key(),
                                 observation_fingerprint=decision.event.observation_fingerprint,
+                                semantic_state=decision.event.semantic_state,
                                 progress_detected=decision.progress_detected,
                                 progress_reason=list(decision.progress_reason),
                                 stagnation_reason=list(decision.stagnation_reason),
                                 recovery_stage=decision.recovery_stage.value,
                                 open_blocker_count=decision.open_blocker_count,
                                 oscillation_detected=decision.oscillation_detected,
+                                verification_improved=decision.event.verification_improved,
                                 governance_decision=decision.action.value,
                                 workspace_before_digest=decision.event.workspace_before_digest,
                                 workspace_after_digest=decision.event.workspace_after_digest,
@@ -1735,7 +1737,7 @@ class MiniClaudeAgent:
                                 tool_call_id=tc.get('id', ''),
                             ))
                             if decision.should_terminate:
-                                self.trace.end_task("CIRCUIT_BROKEN", "NO_PROGRESS_AFTER_REPLAN")
+                                self.trace.end_task("CIRCUIT_BROKEN", decision.reason)
                                 return result_text
                             if decision.should_replan:
                                 self.messages.append(Message(
@@ -1787,12 +1789,14 @@ class MiniClaudeAgent:
                                 self.trace.annotate_current_tool(
                                     intent_key=intent.to_key(),
                                     observation_fingerprint=decision.event.observation_fingerprint,
+                                    semantic_state=decision.event.semantic_state,
                                     progress_detected=decision.progress_detected,
                                     progress_reason=list(decision.progress_reason),
                                     stagnation_reason=list(decision.stagnation_reason),
                                     recovery_stage=decision.recovery_stage.value,
                                     open_blocker_count=decision.open_blocker_count,
                                     oscillation_detected=decision.oscillation_detected,
+                                    verification_improved=decision.event.verification_improved,
                                     governance_decision=decision.action.value,
                                     workspace_before_digest=decision.event.workspace_before_digest,
                                     workspace_after_digest=decision.event.workspace_after_digest,
@@ -1803,7 +1807,7 @@ class MiniClaudeAgent:
                                     tool_call_id=tc.get('id', ''),
                                 ))
                                 if decision.should_terminate:
-                                    self.trace.end_task("CIRCUIT_BROKEN", "NO_PROGRESS_AFTER_REPLAN")
+                                    self.trace.end_task("CIRCUIT_BROKEN", decision.reason)
                                     return result_text
                                 if decision.should_replan:
                                     self.messages.append(Message(
@@ -1977,12 +1981,14 @@ class MiniClaudeAgent:
                     self.trace.annotate_current_tool(
                         intent_key=intent.to_key(),
                         observation_fingerprint=progress_decision.event.observation_fingerprint,
+                        semantic_state=progress_decision.event.semantic_state,
                         progress_detected=progress_decision.progress_detected,
                         progress_reason=list(progress_decision.progress_reason),
                         stagnation_reason=list(progress_decision.stagnation_reason),
                         recovery_stage=progress_decision.recovery_stage.value,
                         open_blocker_count=progress_decision.open_blocker_count,
                         oscillation_detected=progress_decision.oscillation_detected,
+                        verification_improved=progress_decision.event.verification_improved,
                         governance_decision=progress_decision.action.value,
                         workspace_before_digest=progress_decision.event.workspace_before_digest,
                         workspace_after_digest=progress_decision.event.workspace_after_digest,
@@ -2026,7 +2032,7 @@ class MiniClaudeAgent:
                     ))
 
                     if progress_decision.should_terminate:
-                        self.trace.end_task("CIRCUIT_BROKEN", "NO_PROGRESS_AFTER_REPLAN")
+                        self.trace.end_task("CIRCUIT_BROKEN", progress_decision.reason)
                         return result_text
                     if progress_decision.should_replan:
                         self.messages.append(Message(

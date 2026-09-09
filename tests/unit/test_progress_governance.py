@@ -60,12 +60,57 @@ def test_state_oscillation_requires_repeated_cycle():
     tracker = ProgressTracker()
     states = ("A", "B", "A", "B")
     decisions = [
-        observe(tracker, i, action, "unchanged", {"state": state}, {"state": state})
-        for i, (action, state) in enumerate(zip(states, states), 1)
+        observe(tracker, i, "poll", f"state={state}", {"state": state}, {"state": state})
+        for i, state in enumerate(states, 1)
     ]
     assert not decisions[2].oscillation_detected
     assert decisions[3].oscillation_detected
     assert decisions[3].action is GovernanceAction.TERMINATE
+    assert decisions[3].reason == "SEMANTIC_OSCILLATION"
+
+
+def test_single_partial_cycle_is_not_oscillation():
+    tracker = ProgressTracker()
+    decisions = [
+        observe(tracker, i, "poll", f"observed: {state}")
+        for i, state in enumerate(("A", "B", "A"), 1)
+    ]
+    assert not decisions[-1].oscillation_detected
+    assert decisions[-1].action is not GovernanceAction.TERMINATE
+
+
+def test_period_three_semantic_oscillation_is_detected():
+    tracker = ProgressTracker()
+    decisions = [
+        observe(tracker, i, "poll", f"phase={state}")
+        for i, state in enumerate(("A", "B", "C", "A", "B", "C"), 1)
+    ]
+    assert not decisions[2].oscillation_detected
+    assert decisions[-1].oscillation_detected
+    assert decisions[-1].reason == "SEMANTIC_OSCILLATION"
+
+
+def test_workspace_diff_cannot_hide_semantic_oscillation():
+    tracker = ProgressTracker()
+    decisions = [
+        observe(
+            tracker, i, "poll", f"status={state}",
+            {"run": str(i - 1)}, {"run": str(i)},
+        )
+        for i, state in enumerate(("A", "B", "A", "B"), 1)
+    ]
+    assert decisions[-1].oscillation_detected
+    assert decisions[-1].action is GovernanceAction.TERMINATE
+
+
+def test_improving_observations_are_not_oscillation():
+    tracker = ProgressTracker()
+    decisions = [
+        observe(tracker, i, "test", output)
+        for i, output in enumerate(("5 failed", "3 failed", "1 failed", "PASS"), 1)
+    ]
+    assert all(not decision.oscillation_detected for decision in decisions)
+    assert decisions[-1].action is not GovernanceAction.TERMINATE
 
 
 def test_observation_evolution_without_workspace_mutation_is_progress():

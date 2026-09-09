@@ -50,12 +50,14 @@ class ToolTrace:
     # Progress-aware governance evidence
     intent_key: str = ""
     observation_fingerprint: str = ""
+    semantic_state: str = ""
     progress_detected: bool = False
     progress_reason: List[str] = field(default_factory=list)
     stagnation_reason: List[str] = field(default_factory=list)
     recovery_stage: str = ""
     open_blocker_count: int = 0
     oscillation_detected: bool = False
+    verification_improved: bool = False
     completion_guard_triggered: bool = False
     governance_decision: str = ""
     workspace_before_digest: str = ""
@@ -89,12 +91,14 @@ class ToolTrace:
             'session_id': self.session_id,
             'intent_key': self.intent_key,
             'observation_fingerprint': self.observation_fingerprint,
+            'semantic_state': self.semantic_state,
             'progress_detected': self.progress_detected,
             'progress_reason': list(self.progress_reason),
             'stagnation_reason': list(self.stagnation_reason),
             'recovery_stage': self.recovery_stage,
             'open_blocker_count': self.open_blocker_count,
             'oscillation_detected': self.oscillation_detected,
+            'verification_improved': self.verification_improved,
             'completion_guard_triggered': self.completion_guard_triggered,
             'governance_decision': self.governance_decision,
             'workspace_before_digest': self.workspace_before_digest,

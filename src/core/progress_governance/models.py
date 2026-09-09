@@ -48,7 +48,9 @@ class ProgressEvent:
     recovery_stage: str = RecoveryStage.HEALTHY.value
     open_blocker_count: int = 0
     oscillation_detected: bool = False
+    verification_improved: bool = False
     governance_decision: str = GovernanceAction.ALLOW.value
+    semantic_state: str = ""
 
     def to_dict(self) -> Dict[str, Any]:
         return {
@@ -69,7 +71,9 @@ class ProgressEvent:
             "recovery_stage": self.recovery_stage,
             "open_blocker_count": self.open_blocker_count,
             "oscillation_detected": self.oscillation_detected,
+            "verification_improved": self.verification_improved,
             "governance_decision": self.governance_decision,
+            "semantic_state": self.semantic_state,
         }
 
 

@@ -4,6 +4,7 @@ from __future__ import annotations
 
 import hashlib
 import json
+import re
 from collections import deque
 from typing import Any, Dict, Iterable, Mapping, Optional
 
@@ -150,13 +151,36 @@ class ProgressTracker:
         self.replan_count = 0
         self._replan_pending = False
 
-    def _oscillates(self, candidate: tuple[str, str, bool] | None = None) -> bool:
-        if len(self.events) < self.oscillation_cycles * 2:
-            # The candidate may complete the first detectable cycle.
-            if candidate is None:
-                return False
+    _SEMANTIC_STATE = re.compile(
+        r"(?:^|[\s\[({,;])(?:observed|state|status|phase)\s*[:=]\s*"
+        r"([A-Za-z][A-Za-z0-9_.-]*)\b", re.IGNORECASE,
+    )
+    _GENERIC_STATE = re.compile(r"^([A-Za-z][A-Za-z0-9_.-]*)$")
+
+    @classmethod
+    def _semantic_state(cls, text: str) -> str:
+        """Extract generic state tokens; otherwise use normalized output."""
+        normalized = ObservationNormalizer.normalize(text)
+        matches = [m.group(1).lower() for m in cls._SEMANTIC_STATE.finditer(normalized)]
+        if matches:
+            return "|".join(matches)
+        match = cls._GENERIC_STATE.match(normalized.strip())
+        return match.group(1).lower() if match else ObservationNormalizer.fingerprint(text)
+
+    @staticmethod
+    def _verification_improved(text: str) -> bool:
+        """Recognise explicit generic validation improvement evidence."""
+        normalized = ObservationNormalizer.normalize(text)
+        return bool(re.search(
+            r"\b(?:pass|passed|success|successful|ready|healthy|verified|"
+            r"compiled|valid|0\s+failed|0\s+errors?)\b",
+            normalized,
+            re.IGNORECASE,
+        ))
+
+    def _oscillates(self, candidate: tuple[str, bool] | None = None) -> bool:
         values = [
-            (e.workspace_after_digest, e.observation_fingerprint, e.progress_detected)
+            (e.semantic_state or e.observation_fingerprint, e.verification_improved)
             for e in self.events
         ]
         if candidate is not None:
@@ -173,7 +197,7 @@ class ProgressTracker:
             ):
                 continue
             states = [e[0] for e in tail]
-            if len(set(states)) > 1 and not any(e[2] for e in tail):
+            if len(set(states)) > 1 and not any(e[1] for e in tail):
                 return True
         return False
 
@@ -187,10 +211,12 @@ class ProgressTracker:
         command_blocked: bool = False,
     ) -> GovernanceDecision:
         observation = ObservationNormalizer.fingerprint(result_text, workspace_root)
+        semantic_state = self._semantic_state(result_text)
         before_digest = self._digest(workspace_before)
         after_digest = self._digest(workspace_after)
         changed_paths = self._changed_paths(workspace_before, workspace_after)
         previous = self.events[-1] if self.events else None
+        verification_improved = self._verification_improved(result_text)
         progress_reasons: list[str] = []
         stagnation_reasons: list[str] = []
 
@@ -242,7 +268,7 @@ class ProgressTracker:
                 success and progress and self._has_substantive_success(result_text)
             ),
         )
-        oscillation = self._oscillates((after_digest, observation, progress))
+        oscillation = self._oscillates((semantic_state, verification_improved))
         if oscillation:
             stagnation_reasons.append("STATE_OSCILLATION")
 
@@ -252,7 +278,11 @@ class ProgressTracker:
             stage = RecoveryStage.HEALTHY
         action = GovernanceAction.ALLOW if progress or self.no_progress_streak < 2 else GovernanceAction.WARN
         reason = "progress evidence" if progress else ", ".join(stagnation_reasons) or "initial evidence"
-        if self._replan_pending and self.no_progress_streak >= 2:
+        if oscillation:
+            stage = RecoveryStage.TERMINAL
+            action = GovernanceAction.TERMINATE
+            reason = "SEMANTIC_OSCILLATION"
+        elif self._replan_pending and self.no_progress_streak >= 2:
             stage = RecoveryStage.TERMINAL
             action = GovernanceAction.TERMINATE
             reason = "NO_PROGRESS_AFTER_REPLAN"
@@ -275,7 +305,10 @@ class ProgressTracker:
             stagnation_reason=tuple(dict.fromkeys(stagnation_reasons)),
             recovery_stage=stage.value,
             open_blocker_count=len(self.blockers.unresolved()),
-            oscillation_detected=oscillation, governance_decision=action.value,
+            oscillation_detected=oscillation,
+            verification_improved=verification_improved,
+            governance_decision=action.value,
+            semantic_state=semantic_state,
         )
         self.events.append(event)
         return GovernanceDecision(
