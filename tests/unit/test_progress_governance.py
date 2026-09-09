@@ -131,7 +131,8 @@ def test_related_recovery_resolves_permission_blocker():
     )
     observe(tracker, 2, "bash:EXECUTE:export", "config updated", {"cfg": "old"}, {"cfg": "new"})
     decision = observe(
-        tracker, 3, "bash:EXECUTE:export", "success", {"cfg": "new"}, {"cfg": "new"},
+        tracker, 3, "bash:EXECUTE:export", "export verification: SUCCESS and READY",
+        {"cfg": "new"}, {"cfg": "new"},
     )
     assert decision.open_blocker_count == 0
     assert tracker.blockers.all()[0].lifecycle is BlockerLifecycle.RESOLVED
@@ -154,9 +155,57 @@ def test_completion_guard_intercepts_then_blocks_unsupported_completion():
         tracker, 1, "build", "Command not found", {}, {}, success=False,
         failure_category="COMMAND_NOT_FOUND",
     )
+    observe(
+        tracker, 2, "build", "Command not found", {}, {}, success=False,
+        failure_category="COMMAND_NOT_FOUND",
+    )
     guard = CompletionGuard()
     assert guard.check(tracker).action is GovernanceAction.REPLAN
     assert guard.check(tracker).action is GovernanceAction.TERMINATE
+
+
+def test_report_does_not_resolve_confirmed_blocker_at_completion():
+    tracker = ProgressTracker()
+    for turn in (1, 2):
+        observe(
+            tracker, turn, "build", "Command not found", {}, {}, success=False,
+            failure_category="COMMAND_NOT_FOUND",
+        )
+    observe(tracker, 3, "write_report", "report generated successfully", {}, {"report": "1"})
+    assert tracker.blockers.unresolved()
+    assert tracker.blockers.all()[0].lifecycle is not BlockerLifecycle.RESOLVED
+    assert CompletionGuard().check(tracker).action is GovernanceAction.REPLAN
+
+
+def test_fallback_then_real_verification_resolves_blocker():
+    tracker = ProgressTracker()
+    observe(
+        tracker, 1, "build", "Command not found", {}, {}, success=False,
+        failure_category="COMMAND_NOT_FOUND",
+    )
+    observe(tracker, 2, "fallback", "local fallback file written", {}, {"out": "1"})
+    assert tracker.blockers.unresolved()
+    observe(
+        tracker, 3, "verify", "downstream verification: PASS; result is READY",
+        {"out": "1"}, {"out": "1"},
+    )
+    assert not CompletionGuard().check(tracker).should_terminate
+    assert tracker.blockers.all()[0].lifecycle is BlockerLifecycle.RESOLVED
+
+
+def test_original_operation_success_is_resolution_evidence():
+    tracker = ProgressTracker()
+    observe(
+        tracker, 1, "export", "Permission denied", {}, {}, success=False,
+        failure_category="PERMISSION_DENIED",
+    )
+    observe(tracker, 2, "change_path", "writable path selected", {}, {"path": "new"})
+    observe(
+        tracker, 3, "export", "original export verified: SUCCESS",
+        {"path": "new"}, {"path": "new"},
+    )
+    assert not CompletionGuard().check(tracker).should_terminate
+    assert tracker.blockers.all()[0].lifecycle is BlockerLifecycle.RESOLVED
 
 
 def test_completion_guard_allows_verified_recovery():

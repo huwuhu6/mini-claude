@@ -87,7 +87,11 @@ class BlockerLedger:
                 marker = f"turn:{turn}"
                 if marker not in item.progress_since_blocker:
                     item.progress_since_blocker.append(marker)
-            if success and progress_detected:
+            # A successful command or a workspace mutation is not, by itself,
+            # proof that the blocked business operation recovered.  Require
+            # generic verification-shaped evidence for resolution; this keeps
+            # reports, writes, and unrelated exit=0 activity as weak evidence.
+            if success and progress_detected and alternative_evidence:
                 item.lifecycle = BlockerLifecycle.RESOLVED
             elif progress_detected:
                 item.lifecycle = BlockerLifecycle.MITIGATED
@@ -337,7 +341,10 @@ class CompletionGuard:
         self.intercepts = 0
 
     def check(self, tracker: ProgressTracker) -> GovernanceDecision:
-        unresolved = tracker.blockers.unresolved()
+        unresolved = [
+            item for item in tracker.blockers.unresolved()
+            if item.evidence_count >= 2
+        ]
         if not unresolved:
             return GovernanceDecision(open_blocker_count=0)
         if self.intercepts < self.max_intercepts:
