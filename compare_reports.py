@@ -40,6 +40,7 @@ _METRIC_FIELDS = (
     "total_tool_calls",
     "total_latency_seconds",
     "tool_call_precision",
+    "tool_success_rate",
     "loop_guard_blocking_rate",
     "self_healing_convergence_speed",
     "compression_count",
@@ -47,6 +48,7 @@ _METRIC_FIELDS = (
     "loop_guard_trigger_count",
     "reflection_count",
     "rollback_count",
+    "anti_loop",
 )
 
 
@@ -232,6 +234,7 @@ def _load_trace_metrics(trace_path: Path) -> dict[str, Any]:
         prec = _compute_precision_from_turns(raw)
         if prec is not None:
             result["tool_call_precision"] = round(prec, 4)
+    result.setdefault("tool_success_rate", result.get("tool_call_precision"))
 
     # ── 衍生指标 ──────────────────────────────────────
     result["_tool_failure_count"] = _compute_failure_count(raw)
@@ -243,6 +246,9 @@ def _load_trace_metrics(trace_path: Path) -> dict[str, Any]:
     result["_tool_distribution"] = _fmt_tool_distribution(dist_dict)
     result["_tool_sequence"] = _compute_tool_sequence(raw)
     result["_read_saved_log"] = _compute_saved_log_read(raw)
+    anti_loop = raw.get("anti_loop")
+    if isinstance(anti_loop, dict):
+        result.update({f"anti_loop_{k}": v for k, v in anti_loop.items()})
 
     return result
 
@@ -319,6 +325,17 @@ def _aggregate_metrics(all_metrics: list[dict]) -> dict[str, Any]:
     result["_pass_count"] = sum(
         1 for m in all_metrics if m.get("eval_result") == "SUCCESS"
     )
+    for key in ("TP", "TN", "FP", "FN"):
+        result[f"anti_loop_{key}"] = sum(
+            1 for m in all_metrics if m.get("anti_loop_governance_class") == key
+        )
+    total = sum(result.get(k, 0) for k in ("anti_loop_TP", "anti_loop_TN", "anti_loop_FP", "anti_loop_FN"))
+    if total:
+        tp, tn, fp, fn = (result.get(f"anti_loop_{k}", 0) for k in ("TP", "TN", "FP", "FN"))
+        result["stop_precision"] = tp / (tp + fp) if tp + fp else 0.0
+        result["stop_recall"] = tp / (tp + fn) if tp + fn else 0.0
+        result["false_stop_rate"] = fp / (fp + tn) if fp + tn else 0.0
+        result["governance_accuracy"] = (tp + tn) / total
     return result
 
 
@@ -351,6 +368,14 @@ def _load_all_metrics(
                     continue
             case_id, _ = _parse_trace_filename(tf)
             metrics = _load_trace_metrics(tf)
+            contract_path = TASKS_ROOT / case_id / "config.json"
+            try:
+                contract = json.loads(contract_path.read_text(encoding="utf-8")).get("evaluation", {})
+                if isinstance(contract, dict):
+                    metrics["evaluation_split"] = contract.get("split")
+                    metrics["behavior_class"] = contract.get("behavior_class")
+            except (OSError, json.JSONDecodeError):
+                pass
             raw_groups.setdefault((ver_name, case_id), []).append(metrics)
 
     # 聚合
@@ -556,6 +581,8 @@ def _render_provenance(
         "|---|---|---|---|---|---:|---:|",
     ]
     suite_hashes: set[str] = set()
+    config_hashes: set[str] = set()
+    model_conditions: set[str] = set()
     missing_manifest = False
 
     for version, _ in versions:
@@ -574,10 +601,15 @@ def _render_provenance(
         suite_hash = str(manifest.get("task_suite_sha256", ""))
         if suite_hash:
             suite_hashes.add(suite_hash)
+        agent_config = manifest.get("agent_config", {})
+        config_hash = str(agent_config.get("config_sha256", ""))
+        if config_hash:
+            config_hashes.add(config_hash)
+        model_conditions.add(json.dumps({k: agent_config.get(k) for k in ("provider", "model", "temperature", "max_tokens")}, sort_keys=True))
         platform_name = str(environment.get("platform", "-")).replace("|", "\\|")
         lines.append(
             f"| `{version}` | `{_short_sha(agent.get('commit'))}` | "
-            f"{('dirty' if agent.get('dirty') else 'clean')} | "
+            f"{('dirty' if agent.get('worktree_dirty', agent.get('dirty')) else 'clean')} | "
             f"{environment.get('python', '-')} | {platform_name} | "
             f"`{_short_sha(suite_hash)}` | {len(manifest.get('tasks', []))} |"
         )
@@ -586,9 +618,35 @@ def _render_provenance(
         lines.append("> ⚠ 部分版本缺少可追溯的 run manifest，无法确认完整实验条件。")
     if len(suite_hashes) > 1:
         lines.append("> ⚠ 选中版本的 task suite hash 不一致，汇总差异不能直接归因于 Agent 代码变化。")
-    if missing_manifest or len(suite_hashes) > 1:
+    if len(config_hashes) > 1:
+        lines.append("> ⚠ Agent config hash 不一致，结果不可直接比较。")
+    if len(model_conditions) > 1:
+        lines.append("> ⚠ provider/model/temperature/max_tokens 不一致，结果不可直接比较。")
+    if missing_manifest or len(suite_hashes) > 1 or len(config_hashes) > 1 or len(model_conditions) > 1:
         lines.append("> 建议：先确认任务集和运行环境，再解释轮数、Token 或成功率的变化。")
     lines.append("")
+    return lines
+
+
+def _render_anti_loop_summary(matrix: dict[str, dict[str, dict[str, Any]]],
+                              versions: list[tuple[str, Path]]) -> list[str]:
+    """Render split-specific stop/continue metrics without merging dev and holdout."""
+    lines = ["## Anti-Loop Governance（Outcome + Trajectory）\n",
+             "指标只统计带 anti_loop contract 的 trial；缺失 Trace/Crash 仍留在分母。\n"]
+    for split in ("dev", "holdout"):
+        rows = []
+        for version, _ in versions:
+            records = [data.get(version, {}) for data in matrix.values()]
+            records = [m for m in records if m.get("evaluation_split") == split]
+            tp = sum(m.get("anti_loop_TP", 0) for m in records)
+            tn = sum(m.get("anti_loop_TN", 0) for m in records)
+            fp = sum(m.get("anti_loop_FP", 0) for m in records)
+            fn = sum(m.get("anti_loop_FN", 0) for m in records)
+            total = tp + tn + fp + fn
+            acc = (tp + tn) / total if total else 0.0
+            rows.append(f"| `{version}` | {tp} | {tn} | {fp} | {fn} | {acc:.1%} |")
+        if rows:
+            lines.extend([f"### {split}", "", "| 版本 | TP | TN | FP | FN | Governance Accuracy |", "|---|---:|---:|---:|---:|---:|", *rows, ""])
     return lines
 
 
@@ -1048,6 +1106,7 @@ def _render_report(
             lines.append("")
 
     lines.extend(_render_global_board(versions, matrix))
+    lines.extend(_render_anti_loop_summary(matrix, versions))
 
     lines.append("## 多版本精简对比\n")
     lines.append("> ✅ Nt · Nktok · N%hit · Ncmp · Ns    |    ❌ STATUS · Nt · Nktok · Ncmp\n")

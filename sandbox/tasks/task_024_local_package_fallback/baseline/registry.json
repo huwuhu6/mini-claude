@@ -1,0 +1,1 @@
+{"packages":[{"name":"metrics-core","version":"3.2","entry":"vendor/metrics_core.py","interface":"event->score"}]}

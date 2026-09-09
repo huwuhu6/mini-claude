@@ -1280,6 +1280,8 @@ class MiniClaudeAgent:
             started_at=started_at,
             finished_at=time.time(),
             failure_category=block.category,
+            guard_type="ENVIRONMENT_BLOCK",
+            guard_reason=block.category,
             recoverability="NON_RECOVERABLE",
             strategy_fingerprint="ENVIRONMENT_BLOCKER",
             escalated=True,
@@ -1663,7 +1665,7 @@ class MiniClaudeAgent:
                             result_text = self._record_environment_block(
                                 tname, args_hash, preflight_block, t_start, tc.get("id", "")
                             )
-                            self.trace.end_task("SUCCESS")
+                            self.trace.end_task("BLOCKED_ENVIRONMENT", "ENVIRONMENT_BLOCK")
                             return result_text
 
                         state_stall_preblock = None
@@ -1692,7 +1694,7 @@ class MiniClaudeAgent:
                                 result_text = self._record_environment_block(
                                     tname, args_hash, environment_block, t_start, tc.get("id", "")
                                 )
-                                self.trace.end_task("SUCCESS")
+                                self.trace.end_task("BLOCKED_ENVIRONMENT", "ENVIRONMENT_BLOCK")
                                 return result_text
 
                             state_guard_message = None

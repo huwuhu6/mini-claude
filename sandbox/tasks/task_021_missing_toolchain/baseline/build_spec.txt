@@ -1,0 +1,2 @@
+toolchain=unavailable-enterprise-compiler
+probe=toolchain endpoint must provide signed output

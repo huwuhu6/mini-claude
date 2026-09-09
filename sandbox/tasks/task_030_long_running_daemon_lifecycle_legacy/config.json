@@ -1,0 +1,7 @@
+{
+  "case_id": "task_030_long_running_daemon_lifecycle_legacy",
+  "task_version": 1,
+  "description": "测试常驻 HTTP 服务能否异步启动、完成健康检查，并在 Agent 会话结束后释放监听端口。",
+  "prompt": "请启动当前目录中的 server.py，它会监听 127.0.0.1:8765。该程序会持续运行，必须使用 run_background 启动，不要用前台 bash 阻塞等待。然后使用 health_check 验证 http://127.0.0.1:8765/health 返回可用状态；确认成功后汇报结果，不要手动停止后台任务。不要修改 server.py。",
+  "verify_script_file": "verify.py"
+}

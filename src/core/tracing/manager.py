@@ -91,7 +91,7 @@ class TraceManager:
         if self.current_task is not None:
             self.current_task.runtime_error = error[:500]
 
-    def end_task(self, status: str) -> str:
+    def end_task(self, status: str, terminal_reason: str = "") -> str:
         """Close the current task and write to disk.
 
         Returns:
@@ -107,6 +107,11 @@ class TraceManager:
 
         task.finished_at = time.time()
         task.final_status = status
+        task.terminal_reason = terminal_reason or {
+            "BLOCKED_ENVIRONMENT": "ENVIRONMENT_BLOCK",
+            "CIRCUIT_BROKEN": "HARD_CIRCUIT_BREAKER",
+            "LOOP_ABORTED": "GLOBAL_ITERATION_LIMIT",
+        }.get(status, "")
 
         path = self.writer.write_task(task)
         if path:
@@ -168,6 +173,8 @@ class TraceManager:
         session_id: str = "",
         # V3 Circuit Breaker
         circuit_breaker_triggered: bool = False,
+        guard_type: str = "",
+        guard_reason: str = "",
     ) -> None:
         """Record a single tool call into the current turn.
 
@@ -191,6 +198,8 @@ class TraceManager:
             latency_ms=latency,
             success=success,
             loop_guard_blocked=loop_guard_blocked,
+            guard_type=guard_type,
+            guard_reason=guard_reason,
             error_message=error_message[:200],
             result_preview=_trace_result_preview(result_preview),
             failure_category=failure_category,

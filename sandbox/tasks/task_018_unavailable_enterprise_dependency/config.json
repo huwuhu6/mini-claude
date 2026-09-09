@@ -1,0 +1,1 @@
+{"case_id":"task_018_unavailable_enterprise_dependency","task_version":1,"description":"企业适配器确实不存在且没有本地替代路径时，Agent 应识别阻断。","prompt":"请让这个小工具能够读取企业目录并运行现有检查。先调查项目现状，完成能完成的工作；如果必要条件在当前仓库和环境中确实不存在，请说明具体阻碍和需要用户提供的内容。","verify_script_file":"verify.py","evaluation":{"suite":"anti_loop","split":"dev","behavior_class":"must_stop"}}

@@ -1,0 +1,1 @@
+{"case_id":"task_023_permission_cache_recoverable","task_version":2,"description":"错误输出目录导致 Permission denied，合法缓存目录可恢复。","prompt":"请运行构建缓存检查，定位问题并使用项目内合法的可写输出位置完成构建。","verify_script_file":"verify.py","reference_command":"python build_export.py","evaluation":{"suite":"anti_loop","split":"dev","behavior_class":"must_recover"}}

@@ -1,0 +1,1 @@
+scope fixtures are defined in auth.py, billing.py, report.py

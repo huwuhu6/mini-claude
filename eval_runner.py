@@ -46,7 +46,28 @@ _src = str(BASE_DIR / "src")
 if _src not in sys.path:
     sys.path.insert(0, _src)
 
-from core.runtime_data import RuntimeDataPaths
+try:
+    from core.runtime_data import RuntimeDataPaths
+except Exception:
+    # Contract/reference validation must remain offline and must not import
+    # optional runtime modules (notably tiktoken's downloadable encoding).
+    class RuntimeDataPaths:  # type: ignore[no-redef]
+        @classmethod
+        def for_workspace(cls, workspace: Path):
+            digest = hashlib.sha256(str(workspace.resolve()).lower().encode("utf-8")).hexdigest()[:8]
+            root = BASE_DIR / "sandbox" / ".runtime_data" / f"{workspace.name}-{digest}"
+            value = type("RuntimePaths", (), {})()
+            value.root = root
+            value.traces = root / "traces"
+            return value
+import importlib.util
+_anti_loop_spec = importlib.util.spec_from_file_location(
+    "_anti_loop_eval", BASE_DIR / "src" / "core" / "evaluation" / "anti_loop.py"
+)
+_anti_loop_module = importlib.util.module_from_spec(_anti_loop_spec)
+assert _anti_loop_spec.loader is not None
+_anti_loop_spec.loader.exec_module(_anti_loop_module)
+grade_trial = _anti_loop_module.grade_trial
 
 # ═══════════════════════════════════════════════════════════════
 # 路径向内锁死 —— 所有评测行为路由到 sandbox/ 内部
@@ -54,6 +75,7 @@ from core.runtime_data import RuntimeDataPaths
 TASKS_ROOT = BASE_DIR / "sandbox" / "tasks"
 SHADOW_WORKSPACE = BASE_DIR / "sandbox" / "shadow_workspace"
 OUTPUT_ROOT = BASE_DIR / "sandbox" / "eval_results"
+FIXTURE_RUNTIME_ROOT = BASE_DIR / "sandbox" / "eval_runtime"
 _CONFIG_PATH = BASE_DIR / "configs" / "default.yaml"
 
 # 自愈收敛速度统计时关注的 bash 类工具名
@@ -192,6 +214,17 @@ def _validate_task(case_dir: Path) -> tuple[dict[str, Any] | None, list[str]]:
     if not isinstance(config.get("prompt"), str) or not config["prompt"].strip():
         errors.append("prompt 必须是非空字符串")
 
+    evaluation = config.get("evaluation")
+    if evaluation is not None:
+        if not isinstance(evaluation, dict):
+            errors.append("evaluation 必须是对象")
+        else:
+            if evaluation.get("suite") == "anti_loop":
+                if evaluation.get("split") not in {"dev", "holdout"}:
+                    errors.append("anti_loop evaluation.split 必须是 dev 或 holdout")
+                if evaluation.get("behavior_class") not in {"must_stop", "must_recover"}:
+                    errors.append("anti_loop evaluation.behavior_class 必须是 must_stop 或 must_recover")
+
     expected_final_status = config.get("expected_final_status")
     if expected_final_status is not None and (
         not isinstance(expected_final_status, str) or not expected_final_status.strip()
@@ -220,6 +253,51 @@ def _validate_task(case_dir: Path) -> tuple[dict[str, Any] | None, list[str]]:
     return (config if not errors else None), errors
 
 
+def _validate_reference_solution(case_dir: Path, config: dict[str, Any]) -> list[str]:
+    """Run each solvable case's verifier against its checked-in reference outcome."""
+    evaluation = config.get("evaluation", {})
+    if evaluation.get("suite") != "anti_loop" or evaluation.get("behavior_class") != "must_recover":
+        return []
+    reference = case_dir / "reference_solution"
+    if not reference.is_dir():
+        return ["must_recover 缺少 reference_solution/"]
+    verify_name = config.get("verify_script_file")
+    if not verify_name:
+        return ["must_recover 必须声明 verify_script_file"]
+    import tempfile
+    controller, fixture_env = _start_fixture_controller(case_dir.name, "reference")
+    try:
+      with tempfile.TemporaryDirectory(prefix="anti_loop_ref_") as temp:
+        work = Path(temp)
+        for item in reference.iterdir():
+            dst = work / item.name
+            if item.is_dir():
+                shutil.copytree(item, dst)
+            else:
+                shutil.copy2(item, dst)
+        shutil.copy2(case_dir / verify_name, work / verify_name)
+        reference_command = config.get("reference_command")
+        if reference_command:
+            command = reference_command.split()
+            setup = subprocess.run(command, cwd=work, capture_output=True, text=True,
+                                   encoding="utf-8", errors="replace",
+                                   env={**os.environ, **fixture_env}, timeout=30)
+            if setup.returncode != 0:
+                return [f"reference solution 执行失败: {setup.stdout[-300:]}{setup.stderr[-300:]}"]
+        env = {**os.environ, **fixture_env, "EVAL_REFERENCE_CHECK": "1"}
+        try:
+            result = subprocess.run([sys.executable, verify_name], cwd=work,
+                                    capture_output=True, text=True, encoding="utf-8", errors="replace",
+                                    env=env, timeout=30)
+        except Exception as exc:
+            return [f"reference verifier 异常: {exc}"]
+        if result.returncode != 0:
+            return [f"reference verifier 未通过: {result.stdout[-300:]}{result.stderr[-300:]}"]
+    finally:
+        _stop_fixture_controller(controller)
+    return []
+
+
 def _task_metadata(case_dir: Path, config: dict[str, Any]) -> dict[str, Any]:
     """Describe the exact fixture used by a run."""
     verify_name = config.get("verify_script_file")
@@ -230,6 +308,11 @@ def _task_metadata(case_dir: Path, config: dict[str, Any]) -> dict[str, Any]:
         "config_sha256": _sha256_file(case_dir / "config.json"),
         "baseline_sha256": _sha256_tree(case_dir / "baseline"),
         "verify_sha256": _sha256_file(verify_path) if verify_path else None,
+        "evaluation": config.get("evaluation", {}),
+        "fixture_runtime": {
+            "version": 1,
+            "controller_sha256": _sha256_file(BASE_DIR / "sandbox" / "eval_runtime" / "controller.py"),
+        },
     }
 
 
@@ -241,6 +324,15 @@ def _write_run_manifest(
     suite_digest = hashlib.sha256(
         json.dumps(tasks, sort_keys=True).encode("utf-8")
     ).hexdigest()
+    agent_config: dict[str, Any] = {}
+    try:
+        import yaml
+        loaded = yaml.safe_load(_CONFIG_PATH.read_text(encoding="utf-8")) or {}
+        if isinstance(loaded, dict):
+            agent_config = loaded
+    except Exception:
+        pass
+    llm_cfg = agent_config.get("llm", {}) if isinstance(agent_config.get("llm"), dict) else {}
     metadata: dict[str, Any] = {
         "run_id": run_id,
         "version_label": version,
@@ -250,6 +342,15 @@ def _write_run_manifest(
         "environment": {
             "python": platform.python_version(),
             "platform": platform.platform(),
+        },
+        "agent_config": {
+            "provider": llm_cfg.get("provider", agent_config.get("provider")),
+            "model": llm_cfg.get("model", agent_config.get("model")),
+            "temperature": llm_cfg.get("temperature", agent_config.get("temperature")),
+            "max_tokens": llm_cfg.get("max_tokens", agent_config.get("max_tokens")),
+            "config_sha256": _sha256_file(_CONFIG_PATH),
+            "feature_flags": agent_config.get("features", agent_config.get("feature_flags", {})),
+            "max_iterations": agent_config.get("max_iterations", llm_cfg.get("max_iterations")),
         },
         "task_suite_sha256": suite_digest,
         "tasks": tasks,
@@ -318,8 +419,16 @@ def _compute_metrics(trace_data: dict) -> dict:
     else:
         self_healing_convergence = 0
 
+    contract = (config.get("evaluation") or {})
+    if contract.get("suite") == "anti_loop":
+        grade = grade_trial(contract, trace_data if trace_data else None, {
+            "verify_status": verify_status,
+            "final_status": trace_data.get("final_status", ""),
+        })
+        trace_data["anti_loop"] = grade
     return {
         "tool_call_precision": round(tool_call_precision, 4),
+        "tool_success_rate": round(tool_call_precision, 4),
         "loop_guard_blocking_rate": round(loop_guard_blocking_rate, 4),
         "self_healing_convergence_speed": self_healing_convergence,
     }
@@ -364,12 +473,16 @@ def _prepare_sandbox(baseline_dir: Path) -> None:
 
 def _run_agent(
     prompt: str, require_tool_call: bool = False,
+    env_updates: Optional[dict[str, str]] = None,
 ) -> tuple[Optional[Path], float, str | None]:
     """实例化 Agent 并执行 prompt，返回 trace、耗时和异常原因。"""
     # 延迟导入，使 --validate-only 不依赖 LLM、tiktoken 或 API 环境。
     from agent.mini_claude_agent import MiniClaudeAgent
 
     agent = None
+    old_env = {key: os.environ.get(key) for key in (env_updates or {})}
+    if env_updates:
+        os.environ.update(env_updates)
     try:
         agent = MiniClaudeAgent(
             config_path=_CONFIG_PATH,
@@ -386,6 +499,11 @@ def _run_agent(
         print(f"  ❌ Agent 异常: {exc}")
         return None, 0.0, f"agent_exception:{type(exc).__name__}: {exc}"
     finally:
+        for key, old_value in old_env.items():
+            if old_value is None:
+                os.environ.pop(key, None)
+            else:
+                os.environ[key] = old_value
         if agent:
             try:
                 agent.shutdown()
@@ -396,6 +514,39 @@ def _run_agent(
 # ═══════════════════════════════════════════════════════════════
 # 单 Case 运行器
 # ═══════════════════════════════════════════════════════════════
+
+def _start_fixture_controller(case_id: str, run_id: str) -> tuple[Optional[subprocess.Popen], dict[str, str]]:
+    """Start a localhost-only controller and return process plus injected env."""
+    runtime = FIXTURE_RUNTIME_ROOT / run_id / case_id
+    runtime.mkdir(parents=True, exist_ok=True)
+    ready = runtime / "ready.json"
+    ready.unlink(missing_ok=True)
+    command = [sys.executable, str(BASE_DIR / "sandbox" / "eval_runtime" / "controller.py"),
+               "--case", case_id, "--ready-file", str(ready)]
+    process = subprocess.Popen(command, stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL)
+    deadline = time.time() + 10
+    while time.time() < deadline and not ready.exists() and process.poll() is None:
+        time.sleep(0.05)
+    if not ready.exists() or process.poll() is not None:
+        process.terminate()
+        return None, {}
+    payload = json.loads(ready.read_text(encoding="utf-8"))
+    return process, {
+        "EVAL_FIXTURE_URL": str(payload["url"]),
+        "EVAL_FIXTURE_TOKEN": str(payload["token"]),
+        "EVAL_FIXTURE_RUNTIME": str(runtime),
+    }
+
+
+def _stop_fixture_controller(process: Optional[subprocess.Popen]) -> None:
+    if process is None:
+        return
+    try:
+        process.terminate()
+        process.wait(timeout=5)
+    except (OSError, subprocess.TimeoutExpired):
+        process.kill()
+
 
 def run_case(
     case_dir: Path,
@@ -425,13 +576,14 @@ def run_case(
     print(f"{'=' * 60}")
 
     t_start = time.perf_counter()
+    fixture_process, fixture_env = _start_fixture_controller(case_id, run_metadata["run_id"])
 
     # ── Step 1: 沙箱准备 ─────────────────────────────────
     _prepare_sandbox(baseline_dir)
 
     # ── Step 2: 启动 Agent ───────────────────────────────
     trace_path, agent_duration, agent_error = _run_agent(
-        prompt, require_tool_call=bool(verify_script_name),
+        prompt, require_tool_call=bool(verify_script_name), env_updates=fixture_env,
     )
 
     # ── Step 3: 动态路由断言（黄雀在后验证） ───────────────
@@ -454,6 +606,7 @@ def run_case(
 
             _env = {
                 **os.environ,
+                **fixture_env,
                 "PYTHONIOENCODING": "utf-8",
                 "PYTHONUTF8": "1",
                 # The verifier is copied after the Agent exits, so this path is
@@ -521,6 +674,7 @@ def run_case(
             trace_data["evaluation_metadata"] = run_metadata
             trace_data["total_latency_seconds"] = total_latency
             trace_data["tool_call_precision"] = metrics.get("tool_call_precision", 1.0)
+            trace_data["tool_success_rate"] = metrics.get("tool_success_rate", 1.0)
             trace_data["loop_guard_blocking_rate"] = metrics.get("loop_guard_blocking_rate", 0.0)
             trace_data["self_healing_convergence_speed"] = metrics.get("self_healing_convergence_speed", 0)
 
@@ -580,6 +734,8 @@ def run_case(
     time.sleep(0.5)
     _hard_rmtree(RuntimeDataPaths.for_workspace(SHADOW_WORKSPACE).root)
     _hard_rmtree(SHADOW_WORKSPACE)
+    _stop_fixture_controller(fixture_process)
+    _hard_rmtree(FIXTURE_RUNTIME_ROOT / run_metadata["run_id"] / case_id)
     print("  🧹 shadow_workspace 已清除")
 
     return {
@@ -601,6 +757,8 @@ def run_case(
         "verify_stdout": verify_stdout,
         "verify_stderr": verify_stderr,
         "verify_duration_s": verify_duration_s,
+        "evaluation": contract,
+        "anti_loop": trace_data.get("anti_loop"),
     }
 
 
@@ -667,6 +825,10 @@ def main() -> None:
         help="每个任务运行次数（默认: 1）。多运行时 trace 文件会标注运行序号",
     )
     parser.add_argument(
+        "--split", choices=("dev", "holdout", "all"), default="dev",
+        help="Anti-Loop split；默认只运行 dev，holdout 必须显式指定",
+    )
+    parser.add_argument(
         "--validate-only", action="store_true",
         help="只校验任务契约，不启动 Agent 或写入评测结果",
     )
@@ -717,10 +879,31 @@ def main() -> None:
             print(f"     - {error}")
         sys.exit(1)
 
+    reference_errors = []
+    for case_dir in case_dirs:
+        reference_errors.extend(
+            f"{case_dir.name}: {error}"
+            for error in _validate_reference_solution(case_dir, task_configs[case_dir.name])
+        )
+    if reference_errors:
+        print("  ❌ Reference Solution 自检失败:")
+        for error in reference_errors:
+            print(f"     - {error}")
+        sys.exit(1)
+
     print(f"  📋 扫描到 {len(case_dirs)} 个有效 case\n")
     if args.validate_only:
         print("  ✅ 任务契约校验通过，未启动 Agent。")
         return
+
+    if args.split != "all":
+        filtered = []
+        for case_dir in case_dirs:
+            evaluation = task_configs[case_dir.name].get("evaluation", {})
+            if evaluation.get("suite") != "anti_loop" or evaluation.get("split", "dev") == args.split:
+                filtered.append(case_dir)
+        case_dirs = filtered
+        print(f"  🔧 Anti-Loop split: {args.split} → {len(case_dirs)} 个 case")
 
     if args.runs > 1:
         print(f"  🔧 每任务运行 {args.runs} 次\n")

@@ -1,0 +1,1 @@
+{"case_id":"task_024_local_package_fallback","task_version":2,"description":"远端 package 不存在，但 vendor 目录提供兼容实现。","prompt":"请完成 resolver 的修复并运行项目检查。调查仓库内已有组件和配置，确保最终功能可用。","verify_script_file":"verify.py","reference_command":"python run_analytics.py","evaluation":{"suite":"anti_loop","split":"dev","behavior_class":"must_recover"}}

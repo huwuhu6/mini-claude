@@ -19,6 +19,7 @@ class TaskFinalStatus(Enum):
     LOOP_ABORTED = "LOOP_ABORTED"
     ROLLED_BACK = "ROLLED_BACK"
     CIRCUIT_BROKEN = "CIRCUIT_BROKEN"  # V3: hard circuit breaker terminated
+    BLOCKED_ENVIRONMENT = "BLOCKED_ENVIRONMENT"
 
 
 @dataclass
@@ -31,6 +32,8 @@ class ToolTrace:
     latency_ms: float = 0.0
     success: bool = True
     loop_guard_blocked: bool = False
+    guard_type: str = ""
+    guard_reason: str = ""
     error_message: str = ""
     result_preview: str = ""
     # Failure Intelligence fields
@@ -54,6 +57,12 @@ class ToolTrace:
             'latency_ms': round(self.latency_ms, 1),
             'success': self.success,
             'loop_guard_blocked': self.loop_guard_blocked,
+            'guard_type': self.guard_type or (
+                "HARD_CIRCUIT_BREAKER" if self.circuit_breaker_triggered
+                else "LOOP_GUARD" if self.loop_guard_blocked
+                else self.failure_category
+            ),
+            'guard_reason': self.guard_reason or self.error_message[:200],
             'error_message': self.error_message[:200],
             'result_preview': self.result_preview,
             'failure_category': self.failure_category,
@@ -111,6 +120,7 @@ class TaskTrace:
     reflection_count: int = 0
     circuit_breaker_trigger_count: int = 0
     final_status: str = ""
+    terminal_reason: str = ""
     user_prompt: str = ""
     workspace_root: str = ""
     workspace_confirmed: bool = False
@@ -134,6 +144,7 @@ class TaskTrace:
             'reflection_count': self.reflection_count,
             'circuit_breaker_trigger_count': self.circuit_breaker_trigger_count,
             'final_status': self.final_status,
+            'terminal_reason': self.terminal_reason,
             'user_prompt': self.user_prompt,
             'workspace_root': self.workspace_root,
             'workspace_confirmed': self.workspace_confirmed,
