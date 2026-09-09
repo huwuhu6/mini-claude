@@ -177,6 +177,16 @@ def test_report_does_not_resolve_confirmed_blocker_at_completion():
     assert CompletionGuard().check(tracker).action is GovernanceAction.REPLAN
 
 
+def test_explicit_unavailable_capability_is_confirmed_without_repetition():
+    tracker = ProgressTracker()
+    observe(
+        tracker, 1, "build", "controlled capability unavailable", {}, {},
+        success=False, failure_category="UNKNOWN",
+    )
+    assert tracker.blockers.all()[0].category == "CAPABILITY_UNAVAILABLE"
+    assert CompletionGuard().check(tracker).action is GovernanceAction.REPLAN
+
+
 def test_fallback_then_real_verification_resolves_blocker():
     tracker = ProgressTracker()
     observe(

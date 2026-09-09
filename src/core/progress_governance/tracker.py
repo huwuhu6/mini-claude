@@ -25,7 +25,7 @@ class BlockerLedger:
     _CATEGORIES = frozenset({
         "NETWORK_UNREACHABLE", "PACKAGE_NOT_FOUND", "PERMISSION_DENIED",
         "COMMAND_NOT_FOUND", "FILE_NOT_FOUND", "TIMEOUT", "OUT_OF_MEMORY",
-        "DISK_FULL",
+        "DISK_FULL", "CAPABILITY_UNAVAILABLE",
     })
 
     def __init__(self) -> None:
@@ -160,6 +160,23 @@ class ProgressTracker:
         r"([A-Za-z][A-Za-z0-9_.-]*)\b", re.IGNORECASE,
     )
     _GENERIC_STATE = re.compile(r"^([A-Za-z][A-Za-z0-9_.-]*)$")
+    _CAPABILITY_UNAVAILABLE = re.compile(
+        r"\b(?:unavailable|not available|does not exist|not supported|"
+        r"unsupported capability|cannot be provided)\b", re.IGNORECASE,
+    )
+
+    @classmethod
+    def _infer_blocker_category(cls, text: str) -> str:
+        normalized = ObservationNormalizer.normalize(text)
+        if cls._CAPABILITY_UNAVAILABLE.search(normalized):
+            return "CAPABILITY_UNAVAILABLE"
+        if re.search(r"\b(?:permission denied|access denied)\b", normalized):
+            return "PERMISSION_DENIED"
+        if re.search(r"\b(?:connection refused|network unreachable)\b", normalized):
+            return "NETWORK_UNREACHABLE"
+        if re.search(r"\b(?:command not found|not recognized as a command)\b", normalized):
+            return "COMMAND_NOT_FOUND"
+        return ""
 
     @classmethod
     def _semantic_state(cls, text: str) -> str:
@@ -262,7 +279,11 @@ class ProgressTracker:
         else:
             self.no_progress_streak += 1
 
-        blocker_category = blocker_category or failure_category
+        blocker_category = (
+            blocker_category if blocker_category in self.blockers._CATEGORIES
+            else failure_category if failure_category in self.blockers._CATEGORIES
+            else self._infer_blocker_category(result_text)
+        )
         if blocker_category:
             self.blockers.record_failure(
                 turn=turn, category=blocker_category,
@@ -343,7 +364,7 @@ class CompletionGuard:
     def check(self, tracker: ProgressTracker) -> GovernanceDecision:
         unresolved = [
             item for item in tracker.blockers.unresolved()
-            if item.evidence_count >= 2
+            if item.evidence_count >= 2 or item.category == "CAPABILITY_UNAVAILABLE"
         ]
         if not unresolved:
             return GovernanceDecision(open_blocker_count=0)
