@@ -77,7 +77,8 @@ class MiniClaudeAgent:
     def __init__(self, config_path: Optional[Path] = None,
                  workspace_root: Optional[Path] = None,
                  workdir: Optional[Path] = None,
-                 workspace_confirmed: bool = False):
+                 workspace_confirmed: bool = False,
+                 runtime_data_root: Optional[Path] = None):
         self._ui_event_handler: Optional[Callable[[str, Dict[str, Any]], None]] = None
         self._last_assistant_note: Optional[str] = None
         # ── Resolve workspace root (explicit > legacy > cwd fallback) ──
@@ -98,7 +99,9 @@ class MiniClaudeAgent:
         # record share the same bounded environment facts.
         self.preflight = run_preflight(self.workdir)
         self.environment_blocker = EnvironmentBlocker(self.preflight)
-        self.data_paths = RuntimeDataPaths.for_workspace(self.workdir)
+        self.data_paths = RuntimeDataPaths.for_workspace(
+            self.workdir, data_root=runtime_data_root
+        )
         self.session_recorder = SessionRecorder(self.data_paths.sessions)
 
         self._setup_logging()

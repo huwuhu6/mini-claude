@@ -53,9 +53,9 @@ except Exception:
     # optional runtime modules (notably tiktoken's downloadable encoding).
     class RuntimeDataPaths:  # type: ignore[no-redef]
         @classmethod
-        def for_workspace(cls, workspace: Path):
+        def for_workspace(cls, workspace: Path, data_root: Path | None = None):
             digest = hashlib.sha256(str(workspace.resolve()).lower().encode("utf-8")).hexdigest()[:8]
-            root = BASE_DIR / "sandbox" / ".runtime_data" / f"{workspace.name}-{digest}"
+            root = Path(data_root).resolve() if data_root else BASE_DIR / "sandbox" / ".runtime_data" / f"{workspace.name}-{digest}"
             value = type("RuntimePaths", (), {})()
             value.root = root
             value.traces = root / "traces"
@@ -76,7 +76,9 @@ TASKS_ROOT = BASE_DIR / "sandbox" / "tasks"
 SHADOW_WORKSPACE = BASE_DIR / "sandbox" / "shadow_workspace"
 OUTPUT_ROOT = BASE_DIR / "sandbox" / "eval_results"
 FIXTURE_RUNTIME_ROOT = BASE_DIR / "sandbox" / "eval_runtime"
+EVAL_RUNTIME_DATA_ROOT = BASE_DIR / "sandbox" / "eval_runtime_data"
 _CONFIG_PATH = BASE_DIR / "configs" / "default.yaml"
+EFFECTIVE_MAX_ITERATIONS = 50
 
 # 自愈收敛速度统计时关注的 bash 类工具名
 _BASH_LIKE_TOOLS = frozenset({"bash", "execute_command", "run_command"})
@@ -279,6 +281,10 @@ def _validate_reference_solution(case_dir: Path, config: dict[str, Any]) -> list
         reference_command = config.get("reference_command")
         if reference_command:
             command = reference_command.split()
+            if command and command[0].lower() in {"python", "python.exe", "py"}:
+                command[0] = sys.executable
+            elif sys.platform == "win32" and command and command[0].lower() == "npm":
+                command[0] = "npm.cmd"
             setup = subprocess.run(command, cwd=work, capture_output=True, text=True,
                                    encoding="utf-8", errors="replace",
                                    env={**os.environ, **fixture_env}, timeout=30)
@@ -316,6 +322,36 @@ def _task_metadata(case_dir: Path, config: dict[str, Any]) -> dict[str, Any]:
     }
 
 
+def _select_cases(
+    case_dirs: list[Path], configs: dict[str, dict[str, Any]],
+    suite: str | None = None, split: str | None = None,
+) -> list[Path]:
+    """Select cases by metadata, retaining the legacy split-only behavior.
+
+    A suite makes the selection an explicit intersection.  Without a suite,
+    ``--split`` keeps the historical behavior: legacy cases remain eligible
+    while Anti-Loop cases are filtered by their declared split.
+    """
+    if suite is None and split in (None, "all"):
+        return list(case_dirs)
+
+    selected: list[Path] = []
+    for case_dir in case_dirs:
+        evaluation = configs[case_dir.name].get("evaluation", {})
+        case_suite = evaluation.get("suite")
+        case_split = evaluation.get("split")
+        if suite is not None and case_suite != suite:
+            continue
+        if split not in (None, "all"):
+            if suite is None:
+                if case_suite == "anti_loop" and case_split != split:
+                    continue
+            elif case_split != split:
+                continue
+        selected.append(case_dir)
+    return selected
+
+
 def _write_run_manifest(
     version: str, run_id: str, case_dirs: list[Path], configs: dict[str, dict[str, Any]],
 ) -> dict[str, Any]:
@@ -333,6 +369,12 @@ def _write_run_manifest(
     except Exception:
         pass
     llm_cfg = agent_config.get("llm", {}) if isinstance(agent_config.get("llm"), dict) else {}
+    configured_max_iterations = agent_config.get("max_iterations", llm_cfg.get("max_iterations"))
+    effective_max_iterations = (
+        configured_max_iterations
+        if isinstance(configured_max_iterations, int) and configured_max_iterations > 0
+        else EFFECTIVE_MAX_ITERATIONS
+    )
     metadata: dict[str, Any] = {
         "run_id": run_id,
         "version_label": version,
@@ -350,7 +392,17 @@ def _write_run_manifest(
             "max_tokens": llm_cfg.get("max_tokens", agent_config.get("max_tokens")),
             "config_sha256": _sha256_file(_CONFIG_PATH),
             "feature_flags": agent_config.get("features", agent_config.get("feature_flags", {})),
-            "max_iterations": agent_config.get("max_iterations", llm_cfg.get("max_iterations")),
+            "configured_max_iterations": configured_max_iterations,
+            "effective_max_iterations": effective_max_iterations,
+            # Kept as an alias for older report readers.
+            "max_iterations": effective_max_iterations,
+        },
+        "runtime_data": {
+            "strategy": "evaluation_isolated_explicit_root",
+            "root": str((EVAL_RUNTIME_DATA_ROOT / run_id).resolve()),
+            "per_trial": True,
+            "cleanup_after_trial": True,
+            "archive_before_cleanup": True,
         },
         "task_suite_sha256": suite_digest,
         "tasks": tasks,
@@ -369,9 +421,13 @@ def _write_run_manifest(
 # Trace 搜寻
 # ═══════════════════════════════════════════════════════════════
 
-def _find_latest_trace(workspace: Path) -> Optional[Path]:
+def _find_latest_trace(
+    workspace: Path, runtime_data_root: Path | None = None
+) -> Optional[Path]:
     """在项目级运行时数据目录中按修改时间查找最新的 trace JSON 文件。"""
-    trace_dir = RuntimeDataPaths.for_workspace(workspace).traces
+    trace_dir = RuntimeDataPaths.for_workspace(
+        workspace, data_root=runtime_data_root
+    ).traces
     if not trace_dir.is_dir():
         return None
     candidates = sorted(
@@ -419,13 +475,6 @@ def _compute_metrics(trace_data: dict) -> dict:
     else:
         self_healing_convergence = 0
 
-    contract = (config.get("evaluation") or {})
-    if contract.get("suite") == "anti_loop":
-        grade = grade_trial(contract, trace_data if trace_data else None, {
-            "verify_status": verify_status,
-            "final_status": trace_data.get("final_status", ""),
-        })
-        trace_data["anti_loop"] = grade
     return {
         "tool_call_precision": round(tool_call_precision, 4),
         "tool_success_rate": round(tool_call_precision, 4),
@@ -474,6 +523,7 @@ def _prepare_sandbox(baseline_dir: Path) -> None:
 def _run_agent(
     prompt: str, require_tool_call: bool = False,
     env_updates: Optional[dict[str, str]] = None,
+    runtime_data_root: Path | None = None,
 ) -> tuple[Optional[Path], float, str | None]:
     """实例化 Agent 并执行 prompt，返回 trace、耗时和异常原因。"""
     # 延迟导入，使 --validate-only 不依赖 LLM、tiktoken 或 API 环境。
@@ -488,13 +538,14 @@ def _run_agent(
             config_path=_CONFIG_PATH,
             workspace_root=SHADOW_WORKSPACE,
             workspace_confirmed=True,
+            runtime_data_root=runtime_data_root,
         )
         print("  🤖 Agent 已初始化，正在执行 prompt…")
         t0 = time.perf_counter()
         agent.chat(prompt, require_tool_call=require_tool_call)
         elapsed = round(time.perf_counter() - t0, 2)
         print(f"  ✅ Agent 执行完毕，耗时 {elapsed}s")
-        return _find_latest_trace(SHADOW_WORKSPACE), elapsed, None
+        return _find_latest_trace(SHADOW_WORKSPACE, runtime_data_root), elapsed, None
     except Exception as exc:
         print(f"  ❌ Agent 异常: {exc}")
         return None, 0.0, f"agent_exception:{type(exc).__name__}: {exc}"
@@ -554,18 +605,32 @@ def run_case(
     run_metadata: dict[str, Any],
     run_idx: int = 1,
     total_runs: int = 1,
+    trial_index: int = 1,
 ) -> dict[str, Any]:
     """运行单个评测 case，返回结果字典。"""
     case_id = case_dir.name
+    started_at = datetime.now(timezone.utc).isoformat()
+    contract: dict[str, Any] = {}
+    base_result = {
+        "case_id": case_id,
+        "trial_index": trial_index,
+        "suite": None,
+        "split": None,
+        "behavior_class": None,
+        "started_at": started_at,
+        "finished_at": None,
+        "attempted": True,
+    }
     config_file = case_dir / "config.json"
     baseline_dir = case_dir / "baseline"
 
     if not config_file.exists():
-        return {"case_id": case_id, "verify_status": "NO_CONFIG",
+        return {**base_result, "verify_status": "NO_CONFIG",
                 "agent_duration_s": 0.0, "total_latency_s": 0.0,
                 "trace_status": "MISSING"}
 
     config = json.loads(config_file.read_text(encoding="utf-8"))
+    contract = config.get("evaluation") or {}
     prompt = config["prompt"]
     verify_script_name: Optional[str] = config.get("verify_script_file")
     expected_final_status: Optional[str] = config.get("expected_final_status")
@@ -576,6 +641,10 @@ def run_case(
     print(f"{'=' * 60}")
 
     t_start = time.perf_counter()
+    runtime_data_root = (
+        EVAL_RUNTIME_DATA_ROOT / run_metadata["run_id"] / case_id / f"trial_{trial_index:04d}"
+    ).resolve()
+    runtime_data_root.mkdir(parents=True, exist_ok=True)
     fixture_process, fixture_env = _start_fixture_controller(case_id, run_metadata["run_id"])
 
     # ── Step 1: 沙箱准备 ─────────────────────────────────
@@ -584,6 +653,7 @@ def run_case(
     # ── Step 2: 启动 Agent ───────────────────────────────
     trace_path, agent_duration, agent_error = _run_agent(
         prompt, require_tool_call=bool(verify_script_name), env_updates=fixture_env,
+        runtime_data_root=runtime_data_root,
     )
 
     # ── Step 3: 动态路由断言（黄雀在后验证） ───────────────
@@ -700,6 +770,11 @@ def run_case(
                     if not runtime_error:
                         failure_reason = f"agent_final_status: {final_status}"
             trace_data["eval_result"] = eval_result
+            if contract.get("suite") == "anti_loop":
+                trace_data["anti_loop"] = grade_trial(contract, trace_data, {
+                    "verify_status": verify_status,
+                    "final_status": trace_data.get("final_status", ""),
+                })
 
             print(f"  📊 指标对账完成 — "
                   f"precision={trace_data['tool_call_precision']}, "
@@ -732,13 +807,18 @@ def run_case(
     # ── Step 5: 垃圾回收 + 句柄缓冲 + 暴力毁灭现场 ────────
     gc.collect()
     time.sleep(0.5)
-    _hard_rmtree(RuntimeDataPaths.for_workspace(SHADOW_WORKSPACE).root)
+    _hard_rmtree(runtime_data_root)
     _hard_rmtree(SHADOW_WORKSPACE)
     _stop_fixture_controller(fixture_process)
     _hard_rmtree(FIXTURE_RUNTIME_ROOT / run_metadata["run_id"] / case_id)
     print("  🧹 shadow_workspace 已清除")
 
     return {
+        **base_result,
+        "suite": contract.get("suite"),
+        "split": contract.get("split"),
+        "behavior_class": contract.get("behavior_class"),
+        "finished_at": datetime.now(timezone.utc).isoformat(),
         "case_id": case_id,
         "verify_status": verify_status,
         "agent_duration_s": agent_duration,
@@ -785,20 +865,60 @@ def print_summary(results: list[dict], version: str) -> None:
           f"⏭ {skipped} 跳过")
 
 
+def _crashed_trial_result(
+    case_dir: Path, config: dict[str, Any] | None, trial_index: int, reason: str
+) -> dict[str, Any]:
+    """Create a denominator-preserving result when the runner itself crashes."""
+    evaluation = (config or {}).get("evaluation") or {}
+    now = datetime.now(timezone.utc).isoformat()
+    return {
+        "case_id": case_dir.name,
+        "trial_index": trial_index,
+        "suite": evaluation.get("suite"),
+        "split": evaluation.get("split"),
+        "behavior_class": evaluation.get("behavior_class"),
+        "started_at": now,
+        "finished_at": now,
+        "attempted": True,
+        "verify_status": "CRASHED",
+        "final_status": "CRASHED",
+        "eval_result": "CRASHED",
+        "agent_duration_s": 0.0,
+        "total_latency_s": 0.0,
+        "trace_status": "MISSING",
+        "terminal_reason": "runner_exception",
+        "failure_reason": reason,
+    }
+
+
 def write_run_results(version: str, run_metadata: dict[str, Any], results: list[dict]) -> Path:
-    """归档每个 case 的执行状态，覆盖没有生成 trace 的失败路径。"""
+    """Atomically persist the durable trial ledger after every attempted trial."""
     report_dir = OUTPUT_ROOT / version
     report_dir.mkdir(parents=True, exist_ok=True)
     output_path = report_dir / f"run_results_{run_metadata['run_id']}.json"
     payload = {
         "run_id": run_metadata["run_id"],
         "version_label": version,
+        "planned_trials": run_metadata.get("planned_trials", 0),
+        "attempted_trials": sum(1 for result in results if result.get("attempted", True)),
+        "completed_trials": sum(
+            1 for result in results
+            if result.get("attempted", True)
+            and result.get("trace_status") == "ARCHIVED"
+            and result.get("final_status") not in {"CRASHED", "ERROR"}
+        ),
+        "missing_trace_trials": sum(1 for result in results if result.get("trace_status") == "MISSING"),
+        "crashed_trials": sum(1 for result in results if result.get("verify_status") == "CRASHED"),
         "results": results,
     }
-    output_path.write_text(
-        json.dumps(payload, indent=2, ensure_ascii=False), encoding="utf-8"
-    )
-    print(f"  💾 Case 执行结果已归档: {output_path.relative_to(BASE_DIR)}")
+    temp_path = output_path.with_name(output_path.name + ".tmp")
+    temp_path.write_text(json.dumps(payload, indent=2, ensure_ascii=False), encoding="utf-8")
+    os.replace(temp_path, output_path)
+    try:
+        display_path = output_path.relative_to(BASE_DIR)
+    except ValueError:
+        display_path = output_path
+    print(f"  💾 Case 执行结果已归档: {display_path}")
     return output_path
 
 
@@ -825,8 +945,12 @@ def main() -> None:
         help="每个任务运行次数（默认: 1）。多运行时 trace 文件会标注运行序号",
     )
     parser.add_argument(
-        "--split", choices=("dev", "holdout", "all"), default="dev",
-        help="Anti-Loop split；默认只运行 dev，holdout 必须显式指定",
+        "--suite", type=str, default=None,
+        help="按 config.json 的 evaluation.suite 选择任务（例如 anti_loop）",
+    )
+    parser.add_argument(
+        "--split", choices=("dev", "holdout", "all"), default=None,
+        help="按任务元数据选择 split；不指定 suite 时保留历史 split-only 兼容语义",
     )
     parser.add_argument(
         "--validate-only", action="store_true",
@@ -879,6 +1003,21 @@ def main() -> None:
             print(f"     - {error}")
         sys.exit(1)
 
+    # No suite keeps the old default (legacy cases plus Anti-Loop DEV).  An
+    # explicit suite without split selects the complete suite.
+    selection_split = args.split
+    if selection_split is None and args.suite is None and not args.validate_only:
+        selection_split = "dev"
+    selected_case_dirs = _select_cases(case_dirs, task_configs, args.suite, selection_split)
+    print(f"  Selected suite: {args.suite or '<historical compatibility>'}")
+    print(f"  Selected split: {selection_split or '<all>'}")
+    print(f"  Selected case count: {len(selected_case_dirs)}")
+    print(f"  Selected case IDs: {', '.join(d.name for d in selected_case_dirs) or '<none>'}")
+    if not selected_case_dirs:
+        print("  ❌ 选择条件没有匹配的 case")
+        sys.exit(1)
+    case_dirs = selected_case_dirs
+
     reference_errors = []
     for case_dir in case_dirs:
         reference_errors.extend(
@@ -896,46 +1035,49 @@ def main() -> None:
         print("  ✅ 任务契约校验通过，未启动 Agent。")
         return
 
-    if args.split != "all":
-        filtered = []
-        for case_dir in case_dirs:
-            evaluation = task_configs[case_dir.name].get("evaluation", {})
-            if evaluation.get("suite") != "anti_loop" or evaluation.get("split", "dev") == args.split:
-                filtered.append(case_dir)
-        case_dirs = filtered
-        print(f"  🔧 Anti-Loop split: {args.split} → {len(case_dirs)} 个 case")
-
     if args.runs > 1:
         print(f"  🔧 每任务运行 {args.runs} 次\n")
 
     run_id = datetime.now(timezone.utc).strftime("%Y%m%dT%H%M%SZ")
     run_metadata = _write_run_manifest(version, run_id, case_dirs, task_configs)
+    run_metadata["selected_suite"] = args.suite
+    run_metadata["selected_split"] = selection_split
+    run_metadata["planned_trials"] = len(case_dirs) * args.runs
+    # Rewrite the manifest after adding selection and denominator metadata.
+    manifest_path = OUTPUT_ROOT / version / f"run_manifest_{run_id}.json"
+    manifest_path.write_text(json.dumps(run_metadata, indent=2, ensure_ascii=False), encoding="utf-8")
 
     results: list[dict[str, Any]] = []
-    for case_dir in case_dirs:
-        for run_idx in range(1, args.runs + 1):
-            try:
-                result = run_case(
-                    case_dir, version, run_metadata,
-                    run_idx=run_idx, total_runs=args.runs,
-                )
-                results.append(result)
-            except Exception as exc:
-                print(f"  ❌ Case [{case_dir.name}] 崩溃: {exc}")
-                gc.collect()
-                time.sleep(0.5)
-                _hard_rmtree(SHADOW_WORKSPACE)
-                print("  🧹 shadow_workspace 已紧急清理")
-                results.append({
-                    "case_id": case_dir.name,
-                    "verify_status": "CRASHED",
-                    "agent_duration_s": 0.0,
-                    "total_latency_s": 0.0,
-                    "trace_status": "MISSING",
-                    "failure_reason": f"case_exception:{type(exc).__name__}: {exc}",
-                })
-
     write_run_results(version, run_metadata, results)
+    trial_index = 0
+    try:
+        for case_dir in case_dirs:
+            for run_idx in range(1, args.runs + 1):
+                trial_index += 1
+                try:
+                    result = run_case(
+                        case_dir, version, run_metadata,
+                        run_idx=run_idx, total_runs=args.runs,
+                        trial_index=trial_index,
+                    )
+                except Exception as exc:
+                    print(f"  ❌ Case [{case_dir.name}] 崩溃: {exc}")
+                    gc.collect()
+                    time.sleep(0.5)
+                    _hard_rmtree(SHADOW_WORKSPACE)
+                    print("  🧹 shadow_workspace 已紧急清理")
+                    result = _crashed_trial_result(
+                        case_dir, task_configs.get(case_dir.name), trial_index,
+                        f"case_exception:{type(exc).__name__}: {exc}",
+                    )
+                results.append(result)
+                write_run_results(version, run_metadata, results)
+    except KeyboardInterrupt:
+        print("  ⚠ Smoke/评测被中断；已将已尝试 Trial 持久化到 run_results。")
+        write_run_results(version, run_metadata, results)
+        print_summary(results, version)
+        return
+
     print_summary(results, version)
 
 
