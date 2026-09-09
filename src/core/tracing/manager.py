@@ -180,6 +180,20 @@ class TraceManager:
         circuit_breaker_triggered: bool = False,
         guard_type: str = "",
         guard_reason: str = "",
+        # Progress-aware governance fields
+        intent_key: str = "",
+        observation_fingerprint: str = "",
+        progress_detected: bool = False,
+        progress_reason: Optional[list[str]] = None,
+        stagnation_reason: Optional[list[str]] = None,
+        recovery_stage: str = "",
+        open_blocker_count: int = 0,
+        oscillation_detected: bool = False,
+        completion_guard_triggered: bool = False,
+        governance_decision: str = "",
+        workspace_before_digest: str = "",
+        workspace_after_digest: str = "",
+        changed_paths: Optional[list[str]] = None,
     ) -> None:
         """Record a single tool call into the current turn.
 
@@ -215,12 +229,44 @@ class TraceManager:
             cwd=cwd,
             workspace_root=workspace_root,
             session_id=session_id,
+            intent_key=intent_key,
+            observation_fingerprint=observation_fingerprint,
+            progress_detected=progress_detected,
+            progress_reason=list(progress_reason or []),
+            stagnation_reason=list(stagnation_reason or []),
+            recovery_stage=recovery_stage,
+            open_blocker_count=open_blocker_count,
+            oscillation_detected=oscillation_detected,
+            completion_guard_triggered=completion_guard_triggered,
+            governance_decision=governance_decision,
+            workspace_before_digest=workspace_before_digest,
+            workspace_after_digest=workspace_after_digest,
+            changed_paths=list(changed_paths or []),
         )
         turn.tools.append(trace)
         turn.tool_calls_count += 1
 
         if loop_guard_blocked:
             task.loop_guard_trigger_count += 1
+
+    def annotate_current_tool(self, **fields: Any) -> None:
+        """Attach post-execution governance evidence to the latest tool trace."""
+        if not self.current_turn or not self.current_turn.tools:
+            return
+        trace = self.current_turn.tools[-1]
+        for name, value in fields.items():
+            if hasattr(trace, name):
+                setattr(trace, name, value)
+
+    def record_completion_guard(self, decision: str, open_blockers: int) -> None:
+        if self.current_task:
+            self.current_task.completion_guard_trigger_count += 1
+            self.current_task.completion_guard_triggered = True
+            self.current_task.governance_decision = decision
+            self.current_task.open_blocker_count = open_blockers
+        if self.current_turn:
+            self.current_turn.reflection_triggered = True
+            self.current_turn.completion_guard_triggered = True
 
     # ── Event Counters (lightweight, no turn required for task-level) ──
 
