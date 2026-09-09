@@ -5,10 +5,11 @@ agent:
 
 # LLM Provider Configuration
 llm:
-  provider: "deepseek"  # Default provider
-  model: "deepseek-chat"
+  provider: "dashscope"  # Alibaba Cloud Bailian / DashScope
+  model: "deepseek-v4-flash"
   max_tokens: 8000
   temperature: 0.7
+  timeout_ms: 20000
 
   # Deepseek configuration
   deepseek:
@@ -19,6 +20,11 @@ llm:
   anthropic:
     api_key: "${ANTHROPIC_API_KEY}"
     base_url: "${ANTHROPIC_BASE_URL}"
+
+  # DashScope compatible-mode configuration
+  dashscope:
+    api_key: "${DASHSCOPE_API_KEY}"
+    base_url: "https://dashscope.aliyuncs.com/compatible-mode/v1"
 
 # Feature Configuration
 features:

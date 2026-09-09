@@ -330,6 +330,15 @@ class MiniClaudeAgent:
             api_key = os.getenv('DEEPSEEK_API_KEY', llm.api_key or '')
             base_url = os.getenv('DEEPSEEK_BASE_URL',
                                  llm.base_url or 'https://api.deepseek.com')
+        elif llm.provider == 'dashscope':
+            api_key = os.getenv('DASHSCOPE_API_KEY', llm.api_key or '')
+            base_url = os.getenv(
+                'DASHSCOPE_COMPATIBLE_BASE_URL',
+                os.getenv(
+                    'AI_BASE_URL',
+                    llm.base_url or 'https://dashscope.aliyuncs.com/compatible-mode/v1',
+                ),
+            )
         elif llm.provider == 'anthropic':
             api_key = os.getenv('ANTHROPIC_API_KEY', llm.api_key or '')
             base_url = os.getenv('ANTHROPIC_BASE_URL',
@@ -344,6 +353,7 @@ class MiniClaudeAgent:
             'temperature': llm.temperature,
             'api_key': api_key,
             'base_url': base_url,
+            'timeout': llm.timeout_ms / 1000.0,
         }
 
         if api_key:

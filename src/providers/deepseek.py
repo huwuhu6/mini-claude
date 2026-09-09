@@ -19,7 +19,8 @@ class DeepseekProvider(LLMProvider):
         api_key = config.get('api_key', '')
         base_url = config.get('base_url', 'https://api.deepseek.com')
         self.base_url = base_url
-        self.timeout = float(config.get('timeout', 60.0))
+        self.timeout = float(config.get('timeout', config.get('timeout_ms', 60000) / 1000.0))
+        self.provider_name = str(config.get('provider_name', 'deepseek'))
         self.last_error_diagnostic: Dict[str, Any] = {}
 
         self.client = OpenAI(
@@ -28,7 +29,7 @@ class DeepseekProvider(LLMProvider):
             timeout=self.timeout,
             max_retries=0,
         )
-        logger.info(f"Deepseek 提供者已初始化，模型: {self.model}")
+        logger.info(f"{self.provider_name} 提供者已初始化，模型: {self.model}")
 
     def create_message(
         self,
@@ -135,7 +136,7 @@ class DeepseekProvider(LLMProvider):
         else:
             category = "PROVIDER_ERROR"
         return {
-            "provider": "deepseek",
+            "provider": self.provider_name,
             "model": self.model,
             "endpoint_host": endpoint_host,
             "timeout_seconds": self.timeout,
