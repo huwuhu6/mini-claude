@@ -1900,11 +1900,25 @@ class MiniClaudeAgent:
                 self.last_metrics["api_errors"] += 1
                 logger.exception("LLM_TURN_ERROR: iteration=%s", iteration + 1)
                 self._emit_ui_event("runtime_error", message=str(e)[:200])
-                self.session_recorder.record("runtime_error", message=str(e))
-                logger.error(f"LLM 循环出错: {e}")
-                self.trace.record_runtime_error(str(e))
+                diagnostic = getattr(provider, "last_error_diagnostic", None)
+                if diagnostic:
+                    self.trace.record_provider_diagnostic(diagnostic)
+                    self.session_recorder.record("provider_diagnostic", **diagnostic)
+                    chain = diagnostic.get("exception_chain") or [{}]
+                    error_message = (
+                        f"provider={diagnostic.get('provider')} "
+                        f"category={diagnostic.get('error_category')} "
+                        f"endpoint_host={diagnostic.get('endpoint_host')} "
+                        f"proxy_present={diagnostic.get('proxy_present')} "
+                        f"root={chain[0].get('message', '')}"
+                    )
+                else:
+                    error_message = str(e)
+                self.session_recorder.record("runtime_error", message=error_message)
+                logger.error(f"LLM 循环出错: {error_message}")
+                self.trace.record_runtime_error(error_message)
                 self.trace.end_task("FAILED")
-                return f"错误: {str(e)}"
+                return f"错误: {error_message}"
 
         logger.warning(f"工具循环已达最大次数 ({max_iterations})，强制终止")
         self.trace.end_task("LOOP_ABORTED")

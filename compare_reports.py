@@ -49,6 +49,8 @@ _METRIC_FIELDS = (
     "reflection_count",
     "rollback_count",
     "anti_loop",
+    "trial_validity",
+    "runtime_error",
 )
 
 
@@ -278,7 +280,9 @@ def _aggregate_metrics(all_metrics: list[dict]) -> dict[str, Any]:
     if not all_metrics:
         return {}
     if len(all_metrics) == 1:
-        return all_metrics[0]
+        result = dict(all_metrics[0])
+        _apply_governance_counts(result, all_metrics)
+        return result
 
     result: dict[str, Any] = {}
 
@@ -325,18 +329,38 @@ def _aggregate_metrics(all_metrics: list[dict]) -> dict[str, Any]:
     result["_pass_count"] = sum(
         1 for m in all_metrics if m.get("eval_result") == "SUCCESS"
     )
+    _apply_governance_counts(result, all_metrics)
+    return result
+
+
+def _metric_trial_validity(metric: dict[str, Any]) -> str:
+    explicit = metric.get("trial_validity")
+    if explicit in {"VALID", "INFRA_ERROR", "EVAL_ERROR"}:
+        return str(explicit)
+    if metric.get("runtime_error"):
+        return "INFRA_ERROR"
+    if metric.get("_trace_status") in {"MISSING", "INVALID"}:
+        return "EVAL_ERROR"
+    return "VALID"
+
+
+def _apply_governance_counts(result: dict[str, Any], metrics: list[dict[str, Any]]) -> None:
+    """Populate confusion counts from VALID trials, including single trials."""
+    valid = [m for m in metrics if _metric_trial_validity(m) == "VALID"]
     for key in ("TP", "TN", "FP", "FN"):
         result[f"anti_loop_{key}"] = sum(
-            1 for m in all_metrics if m.get("anti_loop_governance_class") == key
+            1 for m in valid if m.get("anti_loop_governance_class") == key
         )
-    total = sum(result.get(k, 0) for k in ("anti_loop_TP", "anti_loop_TN", "anti_loop_FP", "anti_loop_FN"))
-    if total:
-        tp, tn, fp, fn = (result.get(f"anti_loop_{k}", 0) for k in ("TP", "TN", "FP", "FN"))
-        result["stop_precision"] = tp / (tp + fp) if tp + fp else 0.0
-        result["stop_recall"] = tp / (tp + fn) if tp + fn else 0.0
-        result["false_stop_rate"] = fp / (fp + tn) if fp + tn else 0.0
-        result["governance_accuracy"] = (tp + tn) / total
-    return result
+    result["valid_governance_trials"] = len(valid)
+    result["infra_error_trials"] = sum(_metric_trial_validity(m) == "INFRA_ERROR" for m in metrics)
+    result["eval_error_trials"] = sum(_metric_trial_validity(m) == "EVAL_ERROR" for m in metrics)
+    total = sum(result.get(f"anti_loop_{key}", 0) for key in ("TP", "TN", "FP", "FN"))
+    tp, tn, fp, fn = (result.get(f"anti_loop_{key}", 0) for key in ("TP", "TN", "FP", "FN"))
+    result["governance_trial_count"] = total
+    result["stop_precision"] = tp / (tp + fp) if tp + fp else 0.0
+    result["stop_recall"] = tp / (tp + fn) if tp + fn else 0.0
+    result["false_stop_rate"] = fp / (fp + tn) if fp + tn else 0.0
+    result["governance_accuracy"] = (tp + tn) / total if total else 0.0
 
 
 def _load_all_metrics(
@@ -500,6 +524,18 @@ def _include_result_cases(
                 # Trace 提供指标，run results 提供真实尝试次数和通过率。
                 version_metrics["_run_count"] = len(case_results)
                 version_metrics["_pass_count"] = pass_count
+                _apply_governance_counts(
+                    version_metrics,
+                    [
+                        {
+                            "trial_validity": item.get("trial_validity"),
+                            "runtime_error": item.get("runtime_error"),
+                            "_trace_status": item.get("trace_status"),
+                            "anti_loop_governance_class": (item.get("anti_loop") or {}).get("governance_class"),
+                        }
+                        for item in case_results
+                    ],
+                )
                 if missing_trace_count:
                     version_metrics["_missing_trace_count"] = missing_trace_count
                     version_metrics["_failure_reasons"] = reasons
@@ -515,6 +551,18 @@ def _include_result_cases(
                 "_missing_trace_count": missing_trace_count,
                 "_failure_reason": "; ".join(reasons) if reasons else None,
             }
+            _apply_governance_counts(
+                matrix[case_id][version],
+                [
+                    {
+                        "trial_validity": item.get("trial_validity"),
+                        "runtime_error": item.get("runtime_error"),
+                        "_trace_status": item.get("trace_status"),
+                        "anti_loop_governance_class": (item.get("anti_loop") or {}).get("governance_class"),
+                    }
+                    for item in case_results
+                ],
+            )
 
 
 def _manifest_case_ids(manifest: dict[str, Any] | None) -> set[str]:
@@ -703,6 +751,30 @@ def _render_language_coverage(
     for principle, count in sorted(principles.items()):
         lines.append(f"| {principle} | {count} |")
     lines.extend(["", f"Core DEV: {splits['dev']} cases; Core HOLDOUT: {splits['holdout']} cases.", ""])
+    return lines
+
+
+def _render_trial_validity_summary(
+    results_by_version: dict[str, dict[str, Any] | None] | None,
+) -> list[str]:
+    lines = [
+        "## Trial Validity / Denominator\n",
+        "只有 `VALID` Trial 进入 TP/TN/FP/FN；Provider、Agent、Evaluator 失败保留在执行分母。\n",
+        "| version | planned | attempted | valid governance | infra errors | eval errors |",
+        "|---|---:|---:|---:|---:|---:|",
+    ]
+    for version, payload in (results_by_version or {}).items():
+        if not payload or payload.get("_error"):
+            continue
+        records = [r for r in payload.get("results", []) if isinstance(r, dict)]
+        valid = sum(r.get("trial_validity") == "VALID" for r in records)
+        infra = sum(r.get("trial_validity") == "INFRA_ERROR" for r in records)
+        eval_errors = sum(r.get("trial_validity") == "EVAL_ERROR" for r in records)
+        lines.append(
+            f"| `{version}` | {payload.get('planned_trials', 0)} | "
+            f"{payload.get('attempted_trials', len(records))} | {valid} | {infra} | {eval_errors} |"
+        )
+    lines.append("")
     return lines
 
 
@@ -1140,6 +1212,7 @@ def _render_report(
     detail: bool = False,
     descriptions: dict[str, str] | None = None,
     manifests: dict[str, dict[str, Any] | None] | None = None,
+    results_by_version: dict[str, dict[str, Any] | None] | None = None,
 ) -> str:
     """组装完整 Markdown 报告。"""
     lines: list[str] = [
@@ -1163,6 +1236,7 @@ def _render_report(
 
     lines.extend(_render_global_board(versions, matrix))
     lines.extend(_render_anti_loop_summary(matrix, versions))
+    lines.extend(_render_trial_validity_summary(results_by_version))
     lines.extend(_render_language_coverage(manifests))
 
     lines.append("## 多版本精简对比\n")
@@ -1249,6 +1323,7 @@ def main() -> None:
         detail=args.detail,
         descriptions=descriptions,
         manifests=manifests,
+        results_by_version=results_by_version,
     )
     output_path = Path(args.output)
     output_path.parent.mkdir(parents=True, exist_ok=True)

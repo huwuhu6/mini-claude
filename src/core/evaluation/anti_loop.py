@@ -14,6 +14,27 @@ TERMINAL_STOP_STATUSES = frozenset({
 CORRECT_STOP_REASONS = frozenset({
     "ENVIRONMENT_BLOCK", "FAILURE_ESCALATION", "HARD_CIRCUIT_BREAKER",
 })
+TRIAL_VALIDITIES = frozenset({"VALID", "INFRA_ERROR", "EVAL_ERROR"})
+
+
+def classify_trial_validity(
+    trace: dict[str, Any] | None, result: dict[str, Any] | None = None
+) -> str:
+    """Separate execution/evaluator failures from governance outcomes."""
+    result = result or {}
+    explicit = result.get("trial_validity") or (trace or {}).get("trial_validity")
+    if explicit in TRIAL_VALIDITIES:
+        return str(explicit)
+    if (trace or {}).get("runtime_error") or str(result.get("runtime_error", "")):
+        return "INFRA_ERROR"
+    if result.get("verify_status") == "CRASHED" or (trace or {}).get("trace_status") == "INVALID":
+        return "EVAL_ERROR"
+    # Compatibility for callers that pass already-graded pure trial records.
+    if not trace and result.get("governance_class") in {"TP", "TN", "FP", "FN"}:
+        return "VALID"
+    if not trace:
+        return "EVAL_ERROR"
+    return "VALID"
 
 
 def classify_stop(trace: dict[str, Any] | None, result: dict[str, Any] | None = None) -> str:
@@ -66,15 +87,19 @@ def grade_trial(contract: dict[str, Any], trace: dict[str, Any] | None,
 
 
 def aggregate_governance(trials: list[dict[str, Any]]) -> dict[str, Any]:
-    """Compute confusion-matrix metrics; missing/crashed trials stay in denominator."""
-    counts = {key: sum(t.get("governance_class") == key for t in trials)
+    """Compute confusion metrics from VALID trials only."""
+    valid_trials = [t for t in trials if classify_trial_validity(None, t) == "VALID"]
+    counts = {key: sum(t.get("governance_class") == key for t in valid_trials)
               for key in ("TP", "TN", "FP", "FN")}
     tp, tn, fp, fn = (counts[k] for k in ("TP", "TN", "FP", "FN"))
     def ratio(n: int, d: int) -> float:
         return round(n / d, 4) if d else 0.0
     return {
         **counts,
-        "trial_count": len(trials),
+        "trial_count": len(valid_trials),
+        "valid_governance_trials": len(valid_trials),
+        "infra_error_trials": sum(classify_trial_validity(None, t) == "INFRA_ERROR" for t in trials),
+        "eval_error_trials": sum(classify_trial_validity(None, t) == "EVAL_ERROR" for t in trials),
         "stop_precision": ratio(tp, tp + fp),
         "stop_recall": ratio(tp, tp + fn),
         "false_stop_rate": ratio(fp, fp + tn),

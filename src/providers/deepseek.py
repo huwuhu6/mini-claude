@@ -1,4 +1,8 @@
+import json
 import logging
+import os
+import re
+from urllib.parse import urlparse
 from typing import List, Dict, Any, Optional
 from openai import OpenAI
 
@@ -14,10 +18,15 @@ class DeepseekProvider(LLMProvider):
         super().__init__(config)
         api_key = config.get('api_key', '')
         base_url = config.get('base_url', 'https://api.deepseek.com')
+        self.base_url = base_url
+        self.timeout = float(config.get('timeout', 60.0))
+        self.last_error_diagnostic: Dict[str, Any] = {}
 
         self.client = OpenAI(
             api_key=api_key,
-            base_url=base_url
+            base_url=base_url,
+            timeout=self.timeout,
+            max_retries=0,
         )
         logger.info(f"Deepseek 提供者已初始化，模型: {self.model}")
 
@@ -90,8 +99,51 @@ class DeepseekProvider(LLMProvider):
             return response
 
         except Exception as e:
-            logger.error(f"使用 Deepseek 创建消息时出错: {e}")
+            self.last_error_diagnostic = self._diagnose_error(e)
+            logger.error(
+                "Deepseek request failed: %s",
+                json.dumps(self.last_error_diagnostic, ensure_ascii=False, sort_keys=True),
+            )
             raise
+
+    def _diagnose_error(self, error: BaseException) -> Dict[str, Any]:
+        """Return a secret-free, structured transport diagnostic."""
+        endpoint_host = urlparse(self.base_url).hostname or "unknown"
+        proxy_present = any(os.environ.get(name) for name in (
+            "HTTP_PROXY", "HTTPS_PROXY", "ALL_PROXY",
+            "http_proxy", "https_proxy", "all_proxy",
+        ))
+        chain: list[dict[str, str]] = []
+        current: BaseException | None = error
+        seen: set[int] = set()
+        while current is not None and id(current) not in seen and len(chain) < 8:
+            seen.add(id(current))
+            message = str(current)
+            if self.config.get("api_key"):
+                message = message.replace(str(self.config["api_key"]), "[REDACTED]")
+            message = re.sub(r"(?i)(authorization\s*[:=]\s*bearer\s+)[^\s,]+", r"\1[REDACTED]", message)
+            chain.append({"type": type(current).__name__, "message": message[:500]})
+            current = current.__cause__ or current.__context__
+
+        status = getattr(error, "status_code", None)
+        if status is not None:
+            category = "HTTP_STATUS"
+        elif any("timeout" in item["message"].lower() for item in chain):
+            category = "TIMEOUT"
+        elif any("connect" in item["type"].lower() or "connection" in item["message"].lower() for item in chain):
+            category = "CONNECTION"
+        else:
+            category = "PROVIDER_ERROR"
+        return {
+            "provider": "deepseek",
+            "model": self.model,
+            "endpoint_host": endpoint_host,
+            "timeout_seconds": self.timeout,
+            "proxy_present": proxy_present,
+            "http_status": status,
+            "error_category": category,
+            "exception_chain": chain,
+        }
 
     def get_cost_estimate(self, messages: List[Message], model: str = None) -> float:
         """

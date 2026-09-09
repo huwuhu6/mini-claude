@@ -68,6 +68,7 @@ _anti_loop_module = importlib.util.module_from_spec(_anti_loop_spec)
 assert _anti_loop_spec.loader is not None
 _anti_loop_spec.loader.exec_module(_anti_loop_module)
 grade_trial = _anti_loop_module.grade_trial
+classify_trial_validity = _anti_loop_module.classify_trial_validity
 
 # ═══════════════════════════════════════════════════════════════
 # 路径向内锁死 —— 所有评测行为路由到 sandbox/ 内部
@@ -735,6 +736,7 @@ def run_case(
     metrics: dict[str, Any] = {}
     trace_data: dict[str, Any] = {}
     trace_status = "MISSING"
+    trial_validity = "EVAL_ERROR"
 
     if trace_path and trace_path.exists():
         try:
@@ -773,11 +775,22 @@ def run_case(
                     if not runtime_error:
                         failure_reason = f"agent_final_status: {final_status}"
             trace_data["eval_result"] = eval_result
+            trial_validity = classify_trial_validity(trace_data, {
+                "verify_status": verify_status,
+                "runtime_error": runtime_error,
+            })
+            trace_data["trial_validity"] = trial_validity
             if contract.get("suite") == "anti_loop":
-                trace_data["anti_loop"] = grade_trial(contract, trace_data, {
-                    "verify_status": verify_status,
-                    "final_status": trace_data.get("final_status", ""),
-                })
+                if trial_validity == "VALID":
+                    trace_data["anti_loop"] = grade_trial(contract, trace_data, {
+                        "verify_status": verify_status,
+                        "final_status": trace_data.get("final_status", ""),
+                    })
+                else:
+                    trace_data["anti_loop"] = {
+                        "governance_class": "UNCLASSIFIED",
+                        "trial_validity": trial_validity,
+                    }
 
             print(f"  📊 指标对账完成 — "
                   f"precision={trace_data['tool_call_precision']}, "
@@ -807,6 +820,7 @@ def run_case(
     else:
         print("  ⚠ 未找到 Trace JSON，跳过指标对账与归档")
         terminal_reason = "AGENT_EXCEPTION" if agent_error else "TRACE_MISSING"
+        trial_validity = "INFRA_ERROR" if agent_error else "EVAL_ERROR"
 
     # ── Step 5: 垃圾回收 + 句柄缓冲 + 暴力毁灭现场 ────────
     gc.collect()
@@ -836,6 +850,7 @@ def run_case(
         "final_status": final_status,
         "eval_result": trace_data.get("eval_result", verify_status),
         "terminal_reason": terminal_reason,
+        "trial_validity": trial_validity,
         "runtime_error": trace_data.get("runtime_error", ""),
         "trace_status": trace_status,
         "failure_reason": failure_reason,
@@ -893,6 +908,7 @@ def _crashed_trial_result(
         "total_latency_s": 0.0,
         "trace_status": "MISSING",
         "terminal_reason": "runner_exception",
+        "trial_validity": "INFRA_ERROR",
         "failure_reason": reason,
     }
 

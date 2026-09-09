@@ -91,6 +91,11 @@ class TraceManager:
         if self.current_task is not None:
             self.current_task.runtime_error = error[:500]
 
+    def record_provider_diagnostic(self, diagnostic: Dict[str, Any]) -> None:
+        """Attach sanitized provider transport facts without secrets."""
+        if self.current_task is not None:
+            self.current_task.provider_diagnostic = dict(diagnostic)
+
     def end_task(self, status: str, terminal_reason: str = "") -> str:
         """Close the current task and write to disk.
 
