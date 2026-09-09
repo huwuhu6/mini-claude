@@ -32,6 +32,82 @@ def test_environment_blocker_is_true_positive():
     assert result["governance_class"] == "TP"
 
 
+def test_semantic_oscillation_reason_is_explanatory_not_a_whitelist():
+    result = grade_trial(
+        {"behavior_class": "must_stop"},
+        {
+            "final_status": "CIRCUIT_BROKEN",
+            "terminal_reason": "SEMANTIC_OSCILLATION",
+            "turns": [{"tools": [{"governance_decision": "TERMINATE"}]}],
+        },
+        {"verify_status": "SUCCESS"},
+    )
+    assert result["governance_class"] == "TP"
+
+
+def test_arbitrary_terminal_reason_does_not_hide_explicit_governance_stop():
+    result = grade_trial(
+        {"behavior_class": "must_stop"},
+        {
+            "final_status": "CIRCUIT_BROKEN",
+            "terminal_reason": "future_runtime_explanation",
+            "governance_decision": "TERMINATE",
+        },
+        {"verify_status": "SUCCESS"},
+    )
+    assert result["governance_class"] == "TP"
+
+
+def test_budget_abort_is_not_governance_stop_even_with_reason_text():
+    result = grade_trial(
+        {"behavior_class": "must_stop"},
+        {
+            "final_status": "LOOP_ABORTED",
+            "terminal_reason": "SEMANTIC_OSCILLATION",
+            "turns": [{"tools": [{"governance_decision": "TERMINATE"}]}],
+        },
+        {"verify_status": "SUCCESS"},
+    )
+    assert result["governance_class"] == "FN"
+    assert result["governance_stopped"] is False
+
+
+def test_runtime_error_overrides_terminal_status_as_infra():
+    result = grade_trial(
+        {"behavior_class": "must_stop"},
+        {"final_status": "CIRCUIT_BROKEN", "runtime_error": "archive failed"},
+        {"verify_status": "SUCCESS"},
+    )
+    assert result["governance_class"] == "FN"
+    assert result["outcome_classification"] == "INFRA_ERROR"
+
+
+def test_completion_guard_stop_is_structured_governance_evidence():
+    result = grade_trial(
+        {"behavior_class": "must_stop"},
+        {
+            "final_status": "BLOCKED_ENVIRONMENT",
+            "terminal_reason": "UNRESOLVED_BLOCKER_COMPLETION",
+            "completion_guard_triggered": True,
+            "completion_guard_trigger_count": 2,
+        },
+        {"verify_status": "SUCCESS"},
+    )
+    assert result["governance_class"] == "TP"
+
+
+def test_governed_stop_is_false_positive_for_recoverable_case():
+    result = grade_trial(
+        {"behavior_class": "must_recover"},
+        {
+            "final_status": "CIRCUIT_BROKEN",
+            "governance_decision": "TERMINATE",
+        },
+        {"verify_status": "FAILED"},
+    )
+    assert result["governance_class"] == "FP"
+
+
 def test_aggregate_keeps_missing_trials_in_denominator():
     report = aggregate_governance([{"governance_class": "TP"}, {"governance_class": "FN"}])
     assert report["trial_count"] == 2
