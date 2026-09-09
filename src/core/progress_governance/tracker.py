@@ -179,12 +179,18 @@ class ProgressTracker:
         ))
 
     def _oscillates(self, candidate: tuple[str, bool] | None = None) -> bool:
-        values = [
-            (e.semantic_state or e.observation_fingerprint, e.verification_improved)
-            for e in self.events
-        ]
+        values: list[tuple[str, bool]] = []
+        for event in self.events:
+            state = event.semantic_state or event.observation_fingerprint
+            values.extend(
+                (part, event.verification_improved)
+                for part in state.split("|") if part
+            )
         if candidate is not None:
-            values.append(candidate)
+            values.extend(
+                (part, candidate[1])
+                for part in candidate[0].split("|") if part
+            )
         for period in (2, 3):
             needed = period * self.oscillation_cycles
             if len(values) < needed:
