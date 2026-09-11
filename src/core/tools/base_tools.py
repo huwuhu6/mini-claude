@@ -17,6 +17,12 @@ if TYPE_CHECKING:
 
 logger = logging.getLogger(__name__)
 
+# Backend limits for read_file.  These are hard bounds even when the model
+# supplies an explicit end_line; max_lines remains only a caller-facing hint.
+READ_FILE_MAX_LINES = 200
+READ_FILE_MAX_CHARS = 100_000
+READ_FILE_MAX_BYTES = 256 * 1024
+
 
 @dataclass
 class ToolResult:
@@ -248,26 +254,25 @@ class BaseTools:
         return lines, len(lines)
 
     def read_file(self, path: str, start_line: int = None,
-                  end_line: int = None, max_lines: int = 200) -> ToolResult:
+                  end_line: int = None,
+                  max_lines: int = READ_FILE_MAX_LINES) -> ToolResult:
         """
         Read a window of file content with anchor-comment delimiters.
 
         Pure code output (no per-line prefix) to maximise Prompt Cache
         stability — line numbers shift after edits, destroying cache hits.
 
-        When ``end_line`` is not provided the result is capped at
-        ``start_line + max_lines - 1`` to prevent accidental token floods.
-        Pass ``end_line`` explicitly to override this limit.
+        The result is always capped at the backend hard limits, including when
+        ``end_line`` is explicitly provided, to prevent accidental token floods.
 
         Args:
             path: File path
             start_line: First line number to include (1-based, inclusive).
                         Defaults to 1 when omitted.
             end_line: Last line number to include (1-based, inclusive).
-                      Defaults to total line count when omitted
-                      (soft-capped by ``max_lines``).
-            max_lines: Maximum lines to return when ``end_line`` is omitted.
-                       Default 200. Ignored when ``end_line`` is explicit.
+                      The hard line limit still applies.
+            max_lines: Requested maximum lines, never allowed to exceed the
+                       backend hard limit. Default 200.
 
         Returns:
             ToolResult with an anchor header/footer and clean code body.
@@ -301,10 +306,12 @@ class BaseTools:
             # Resolve slice boundaries (1-based inclusive)
             start = 1 if start_line is None else max(1, int(start_line))
 
-            if end_line is not None:
-                end = min(total_lines, int(end_line))
-            else:
-                end = min(total_lines, start + max_lines - 1)
+            line_limit = min(max(1, int(max_lines)), READ_FILE_MAX_LINES)
+            requested_end = (
+                total_lines if end_line is None
+                else min(total_lines, int(end_line))
+            )
+            end = min(total_lines, requested_end, start + line_limit - 1)
 
             # Validation: start must not exceed end
             if start > end:
@@ -321,13 +328,26 @@ class BaseTools:
             output_parts = [
                 f"--- FILE: {path} (LINES: {start}-{end} of {total_lines}) ---",
             ]
-            output_parts.append('\n'.join(chunk))
+            body = '\n'.join(chunk)
+            limited_body = self._limit_read_output(body)
+            output_parts.append(limited_body)
 
-            # Truncation notice when max_lines capped an un-specified end
-            if end_line is None and end < total_lines:
+            line_truncated = end < requested_end
+            char_truncated = len(limited_body) < len(body)
+            if line_truncated or char_truncated:
+                reasons = []
+                if line_truncated:
+                    reasons.append(f"行数上限为 {line_limit} 行")
+                if char_truncated:
+                    reasons.append(
+                        f"字符/字节上限为 {READ_FILE_MAX_CHARS} 字符、{READ_FILE_MAX_BYTES} 字节"
+                    )
+                next_start = end + 1
+                next_end = next_start + line_limit - 1
                 output_parts.append(
-                    f"... (内容被截断，仅显示 {start}-{end} 行，共 {total_lines} 行。"
-                    f"请指定 end_line 继续读取)"
+                    f"... (内容被截断，实际返回第 {start}-{end} 行，文件共 {total_lines} 行；"
+                    f"{ '；'.join(reasons) }。"
+                    f"请使用 start_line={next_start}, end_line={next_end} 继续读取。)"
                 )
 
             output_parts.append(f"--- END FILE: {path} ---")
@@ -343,6 +363,15 @@ class BaseTools:
         except Exception as e:
             logger.error(f"读取文件 {path} 出错: {e}")
             return ToolResult(f"错误: {str(e)}", success=False)
+
+    @staticmethod
+    def _limit_read_output(content: str) -> str:
+        """Apply character and UTF-8 byte limits without splitting a codepoint."""
+        limited = content[:READ_FILE_MAX_CHARS]
+        encoded = limited.encode('utf-8')
+        if len(encoded) <= READ_FILE_MAX_BYTES:
+            return limited
+        return encoded[:READ_FILE_MAX_BYTES].decode('utf-8', errors='ignore')
 
     def write_file(self, path: str, content: str) -> ToolResult:
         """

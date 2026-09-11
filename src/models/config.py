@@ -54,7 +54,6 @@ class TeamConfig:
 class CompressionConfig:
     token_threshold: int = 100000
     max_transcripts: int = 100
-    microcompact_threshold: int = 3
 
 
 @dataclass

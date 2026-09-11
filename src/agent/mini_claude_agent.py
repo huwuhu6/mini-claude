@@ -11,6 +11,7 @@ import uuid
 import time
 import shutil
 import socket
+import copy
 from collections import Counter
 from pathlib import Path
 from typing import Callable, List, Dict, Any, Optional
@@ -31,7 +32,7 @@ from models.todo import TodoManager
 from providers.base import Message, ToolDefinition as ProviderToolDef
 from providers.manager import ProviderManager
 
-from core.tools.base_tools import BaseTools, ToolResult
+from core.tools.base_tools import BaseTools, ToolResult, READ_FILE_MAX_LINES
 from core.features import FeatureManager, FeatureDefinition, FeatureDependency
 from core.messaging import MessageBus, Message as BusMessage, MessagePriority
 from core.teammate_manager import TeammateManager, TeammateConfig
@@ -232,7 +233,6 @@ class MiniClaudeAgent:
         compression_config = {
             'token_threshold': self.config.compression.token_threshold,
             'max_transcripts': self.config.compression.max_transcripts,
-            'microcompact_threshold': self.config.compression.microcompact_threshold,
             'transcript_dir': str(self.data_paths.root / 'transcripts'),
         }
         self.compressor = Compressor(compression_config)
@@ -727,13 +727,13 @@ class MiniClaudeAgent:
             },
             {
                 'name': 'read_file',
-                'description': '读取文件的指定行范围（视窗读取）。对长文件请务必使用 start_line/end_line 限定行号范围，以节省 Token 并提升聚焦度。不传参则读取全文。行号从 1 开始计数。',
+                'description': f'按行读取文件，默认最多返回 {READ_FILE_MAX_LINES} 行；start_line/end_line 为 1-based 窗口，超过行数或字符/字节硬上限会截断。长文件请使用后续窗口继续读取。',
                 'input_schema': {
                     'type': 'object',
                     'properties': {
                         'path': {'type': 'string', 'description': '文件路径'},
                         'start_line': {'type': 'integer', 'description': '起始行号（包含），从 1 开始。不传则从头读取'},
-                        'end_line': {'type': 'integer', 'description': '结束行号（包含）。不传则读到文件末尾'},
+                        'end_line': {'type': 'integer', 'description': '结束行号（包含）；仍受后端硬上限约束，超出会截断'},
                     },
                     'required': ['path'],
                 },
@@ -1388,14 +1388,14 @@ class MiniClaudeAgent:
             True if compression (full or micro) was actually triggered.
         """
         if self.feature_manager.is_enabled('compression'):
+            before = copy.deepcopy(self.messages)
             if self.compressor.should_compress(self.messages):
                 logger.info("触发自动压缩")
                 self.messages = self.compressor.compress(self.messages)
-                return True
             elif self.compressor.should_microcompact(self.messages):
                 logger.info("触发微压缩")
                 self.messages = self.compressor.microcompact(self.messages)
-                return True
+            return self.messages != before
         return False
 
     def _drain_background_notifications(self) -> Optional[str]:

@@ -51,7 +51,6 @@ team:
 compression:
   token_threshold: 100000
   max_transcripts: 100
-  microcompact_threshold: 3
 
 # Background Processing
 background:

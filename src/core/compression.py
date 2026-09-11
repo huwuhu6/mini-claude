@@ -7,6 +7,7 @@ import logging
 import json
 import time
 import uuid
+import re
 from pathlib import Path
 from dataclasses import dataclass, field
 from typing import List, Optional, Dict, Any
@@ -22,8 +23,11 @@ try:
     import tiktoken
     _ENCODING = tiktoken.get_encoding("cl100k_base")
     _TIKTOKEN_AVAILABLE = True
-except ImportError:
-    logger.info("tiktoken 未安装，将使用粗略估算（1 token ≈ 4 字符）")
+except Exception as exc:
+    logger.info(
+        "tiktoken 不可用，将使用粗略估算（1 token ≈ 4 字符）: %s",
+        exc,
+    )
 
 
 @dataclass
@@ -58,7 +62,6 @@ class Compressor:
         cfg = config or {}
         self.token_threshold = cfg.get('token_threshold', 100000)
         self.max_transcripts = cfg.get('max_transcripts', 100)
-        self.microcompact_threshold = cfg.get('microcompact_threshold', 3)
         self._transcripts: Dict[str, CompressedTranscript] = {}
         self._transcript_dir: Optional[Path] = None
         self._provider: Any = None  # LLMProvider for real summarization
@@ -84,14 +87,34 @@ class Compressor:
         if _TIKTOKEN_AVAILABLE and _ENCODING is not None:
             total = 0
             for msg in messages:
-                # Encode the content text
                 total += len(_ENCODING.encode(msg.content or ""))
+                total += len(_ENCODING.encode(self._message_metadata_text(msg)))
                 # Add overhead for message role formatting (~4 tokens per message)
                 total += 4
             return total
         # Fallback: rough estimate
-        total_chars = sum(len(m.content or "") for m in messages)
+        total_chars = sum(
+            len(m.content or "") + len(self._message_metadata_text(m))
+            for m in messages
+        )
         return total_chars // 4
+
+    @staticmethod
+    def _message_metadata_text(message: Message) -> str:
+        """Serialize persisted message fields that are not part of ``content``."""
+        metadata: Dict[str, Any] = {}
+        if message.name:
+            metadata['name'] = message.name
+        if message.tool_calls:
+            metadata['tool_calls'] = message.tool_calls
+        if message.tool_call_id:
+            metadata['tool_call_id'] = message.tool_call_id
+        if not metadata:
+            return ""
+        try:
+            return json.dumps(metadata, ensure_ascii=False, sort_keys=True, default=str)
+        except (TypeError, ValueError):
+            return str(metadata)
 
     def estimate_tokens_for_text(self, text: str) -> int:
         """Accurate token count for a single text string."""
@@ -107,7 +130,33 @@ class Compressor:
 
     def should_microcompact(self, messages: List[Message]) -> bool:
         """Check if rapid growth suggests micro-compaction."""
-        return self.estimate_tokens(messages) > self.token_threshold * 0.7
+        return (
+            self.estimate_tokens(messages) > self.token_threshold * 0.7
+            and self._has_microcompact_candidates(messages)
+        )
+
+    def _has_microcompact_candidates(self, messages: List[Message]) -> bool:
+        """Return whether micro-compaction can make a meaningful change."""
+        if len(messages) < 10:
+            return False
+
+        protect_start = max(len(messages) - 6, 2)
+        todo_count = 0
+        for i, msg in enumerate(messages):
+            if i < 2 or i >= protect_start or msg.role != 'tool':
+                continue
+
+            tool_name = self._infer_tool_name(messages, i)
+            if tool_name in ('bash', 'search_code', 'count_occurrences'):
+                if len(msg.content or '') > 300:
+                    return True
+            elif tool_name == 'TodoWrite':
+                todo_count += 1
+            elif tool_name in ('read_file', 'edit_file'):
+                if len(msg.content or '') > 5000:
+                    return True
+
+        return todo_count > 1
 
     # ── Compression Actions ───────────────────────────────────
 
@@ -140,10 +189,20 @@ class Compressor:
 
             # ── Tier 1：重型标准输出工具 ──
             if tool_name in ('bash', 'search_code', 'count_occurrences'):
-                if len(msg.content) > 300:
+                if len(msg.content or '') > 300:
+                    status = self._infer_tool_execution_status(msg.content)
+                    if status is True:
+                        status_text = "Execution completed; output details were omitted."
+                    elif status is False:
+                        status_text = "Execution failed; output details were omitted."
+                    else:
+                        status_text = (
+                            "Execution status was not encoded in this message; "
+                            "output details were omitted."
+                        )
                     msg.content = (
-                        "[System: Command output truncated to save context window. "
-                        "Execution was recorded as successful.]"
+                        "[System: Tool output truncated to save context window. "
+                        f"{status_text}]"
                     )
                 continue
 
@@ -153,7 +212,7 @@ class Compressor:
                 continue
 
             # ── Tier 3：核心资产（read_file / edit_file） ──
-            if tool_name in ('read_file', 'edit_file') and len(msg.content) > 5000:
+            if tool_name in ('read_file', 'edit_file') and len(msg.content or '') > 5000:
                 head = msg.content[:500]
                 tail = msg.content[-500:]
                 msg.content = (
@@ -168,6 +227,18 @@ class Compressor:
             messages[idx].content = "[System: State superseded by newer TodoWrite.]"
 
         return messages
+
+    @staticmethod
+    def _infer_tool_execution_status(content: str) -> Optional[bool]:
+        """Read only explicit exit-code facts; never infer status from tool name."""
+        first_line = (content or '').splitlines()[0] if content else ''
+        match = re.match(
+            r'^\[(?:Command executed with exit code|Exit Code:)\s*(-?\d+)\]',
+            first_line,
+        )
+        if not match:
+            return None
+        return int(match.group(1)) == 0
 
     @staticmethod
     def _infer_tool_name(messages: List[Message], tool_idx: int) -> str:
@@ -202,27 +273,24 @@ class Compressor:
         token_estimate = self.estimate_tokens(messages)
         message_count = len(messages)
 
-        # Keep first 2 (system + intro) and last 15 messages
-        head = messages[:2]
-        tail = list(messages[-15:])
+        # Keep first 2 (system + intro) and last 15 messages, but never split
+        # an assistant(tool_calls) -> tool result segment at the tail boundary.
+        tail_start = max(2, len(messages) - 15)
+        if tail_start < len(messages) and messages[tail_start].role == 'tool':
+            while tail_start > 2 and messages[tail_start - 1].role == 'tool':
+                tail_start -= 1
+            if (
+                tail_start > 2
+                and messages[tail_start - 1].role == 'assistant'
+                and messages[tail_start - 1].tool_calls
+            ):
+                tail_start -= 1
 
-        # Extend tail to include any tool messages that belong to a
-        # tool_calls assistant message at the start of the tail window.
-        # Only adds messages NOT already in tail to avoid duplicates.
-        tail_set = set(id(m) for m in tail)
-        for i, msg in enumerate(tail):
-            if msg.role == 'assistant' and msg.tool_calls:
-                tool_call_ids = {tc.get('id', '') for tc in msg.tool_calls}
-                idx = len(messages) - 15 + i + 1
-                while idx < len(messages) and messages[idx].role == 'tool':
-                    if messages[idx].tool_call_id in tool_call_ids and id(messages[idx]) not in tail_set:
-                        tail.append(messages[idx])
-                        tail_set.add(id(messages[idx]))
-                    idx += 1
-                break
+        head = messages[:2]
+        tail = list(messages[tail_start:])
 
         # Summarize the middle
-        middle = messages[2:-15]
+        middle = messages[2:tail_start]
         summary = self._generate_summary(middle)
 
         # Create a compressed transcript record
