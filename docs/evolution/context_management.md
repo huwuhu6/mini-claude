@@ -68,8 +68,8 @@ Transcript retention 现在会在 Compressor 初始化时加载目录中的有�
 
 ## 2026-09-11
 
-Commit: `PENDING`
-Commit Description: `fix(context): 修复 Mainline Context Foundation 审计缺陷`
+Commit: `a543b62`
+Commit Description: `fix(context): 收敛上下文与工具链基础可靠性问题`
 
 ### Description
 
@@ -79,10 +79,12 @@ Final Audit 发现了三组会直接破坏 Context correctness 的问题。压�
 
 ### Result / Evidence
 
-新增 deterministic regression tests 覆盖 Audit 001~009：空 middle 的 4/10/15/17 条消息连续压缩保持 no-op；Provider malformed response 在 assistant 写入前进入 Agent FAILED 路径；工具巨型单行、超大 `context_lines` 和超长文件均受字符/字节边界约束；read_file 使用固定大小分块读取；初始化 retention、重复 Transcript ID 以及 save/unlink 失败均可观察。相关 Context 测试通过；未运行真实 Provider Benchmark 或 Evaluation。
+新增 deterministic regression tests 覆盖 Audit 001~009：空 middle 的 4/10/15/17 条消息连续压缩保持 no-op；Provider malformed response 在 assistant 写入前进入 Agent FAILED 路径；工具巨型单行、超大 `context_lines` 和超长文件均受字符/字节边界约束；read_file 使用固定大小分块读取并验证 UTF-8/CRLF 跨 chunk、EOF 和范围边界；初始化 retention、重复 Transcript ID 以及 save/unlink 失败均可观察。当前实现排除既有评测变体后的 unit/integration deterministic suite 为 `253 passed`。
 
 Audit 009 不再在 Agent 主循环中建设第二套 validator，而是由 parser 在 durable message append 前拒绝 malformed response，并补充 sanitizer 的少量类型防御，因此标记为 `RESOLVED_BY_OTHER_FIX`。
 
+此前全量 unit/integration 检查中的两个失败已在 clean detached `5ccecf8` baseline 独立复现，均为 `PRE_EXISTING / BASELINE FAILURE`：`test_node_behavioral_alternate_shape_passes_dynamic_hidden_verifier` 与 `test_java_behavioral_alternate_shape_passes_hidden_verifier`，原因分别是评测自有 `tests/run_tests.js` 和 `src/test/java/com/example/InvoiceTest.java` 被检测为 modified。未运行真实 Provider Benchmark 或 Evaluation。
+
 ### Decision / Limitation
 
-本阶段保留 recent 15、0.7 micro-compaction 阈值和现有摘要策略。删除 Transcript 遇到文件系统拒绝时，索引保留该 durable record，因而 retention 只能保持可观察的一致性而不能绕过外部 I/O 故障。没有引入事务日志、Provider-aware Budget、Summary 新算法、Project Context、长期 Memory、Anthropic compatibility、Multi-Agent、Team、Inbox/MessageBus 或 Background delivery 机制；Hot Context 的 CTX-006 继续作为 follow-up。
+本阶段保留 recent 15、0.7 micro-compaction 阈值和现有摘要策略。删除 Transcript 遇到文件系统拒绝时，索引保留该 durable record，因而 retention 只能保持可观察的一致性而不能绕过外部 I/O 故障。当前剩余 Context 问题主要进入 Architecture / Benchmark 阶段：Provider-aware Context Budget、Summary 12K tail-only limitation、Recent 15 retention strategy、Summary Trust Boundary / Prompt Injection、Value-aware Retention 和 Project Context Discovery。没有引入事务日志、Summary 新算法、长期 Memory、Anthropic compatibility、Multi-Agent、Team、Inbox/MessageBus 或 Background delivery 机制；Hot Context 的 CTX-006 继续作为 follow-up。
