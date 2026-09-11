@@ -155,3 +155,25 @@ Smoke 为 8/12，正式 Candidate 的 verifier 通过数为 24/36（`eval_result
 【如何验证】新增 deterministic regression 覆盖：HTTP 503→无关写文件仍未解决；HTTP 503→echo READY 仍未解决；同一 health probe 的结构化健康结果可以解决；Permission denied→同一业务 intent 成功可以恢复；pytest 失败→改源码→同一测试成功可以完成，而改 README→同样失败不能洗掉证据；`unhealthy`、`not ready`、`compiled with errors` 等文本不会成为 verification improvement；LoopController、observer、completion gate 引用同一 Policy；带决策字段的 AttemptHistory 可以由新 RuntimePolicy 重放出相同 final decision。定向 Runtime/Observation 测试 49 passed；unit+integration（排除已知依赖外部受限目录的 `test_all_modules.py`）167 passed。没有请求 Provider，没有运行 DEV/HOLDOUT。
 
 【还剩什么风险】当前解析器仍只实现了最少的通用 resolver：同一 normalized intent 的成功和 probe-scoped health positive。它还不能可靠比较 pytest 错误集合从 10 个降到 5 个，也不能自动证明任意 package fallback 的业务结果；这些属于后续 Observation/Outcome 设计，不应通过降低 Loop threshold 解决。归档的 019/020/021 Trace 是旧版本生成的事实快照，能够证明当时的 Evidence→Completion 问题，但不能替代新代码下的 Provider benchmark。
+
+## Failure Resolution Boundary Validation（2026-09-11）
+
+【观察到的问题】“同一 normalized intent 成功”对同一服务的跨 Tool 恢复太严格：`curl localhost:8080/health → HTTP 503` 后改用 `health_check(port=8080) → healthy=true`，两个 Tool 的 intent 不同，旧规则会把已恢复的服务继续当成 unresolved。相反，当前归一化也必须继续区分 `pytest tests/user` 和 `pytest tests/order`，不能只看它们都像 pytest。
+
+【为什么原设计会这样】intent 同时承担了“做了什么”和“观察了哪个对象”两个职责。对同一个 Tool，它通常足够；跨 Tool 时，Tool 名称会把同一个服务拆成两个 intent。我们没有证据表明需要完整资源图，只需要一个能稳定提取的、可审计的观察对象身份。
+
+【考虑过的方案】方案 A：把不同 Tool 强行合并成同一 intent，放弃，因为会破坏原有 Tool/action/target 语义。方案 B：建立 Resource Graph 或跨任务 BlockerMemory，放弃，因为状态和推断都过重。采用最小 `subject_key`：服务按 host/port、pytest 按 scope、安装命令按 package 生成；Resolution 仍必须有同 subject 的结构化 positive evidence，subject 相同但 HTTP 404/503 仍不算恢复。
+
+【最终怎么改】`subject_key` 作为 AttemptEvent 事实字段写入唯一 AttemptHistory 和 Trace。服务恢复可以跨 `bash/curl` 与 `health_check` 关联；pytest scope 仍按具体 target 区分；不同路径默认不自动建立业务等价关系，只有调用方明确提供 artifact subject 时才允许路径迁移恢复。没有可靠 subject 时继续退回 same-intent 规则，不猜测全量测试覆盖关系，也不把任意本地脚本当成远端 package fallback。
+
+【如何验证】12-case deterministic matrix：Case 1/2 跨 Tool 同服务 Resolve；Case 3 不同服务不 Resolve；Case 4 不同 pytest scope 不 Resolve；Case 5 同 scope Resolve；Case 6 broader suite 与 Case 10 未显式提供可验证覆盖/依赖身份时保持模型边界；Case 7 缩小 suite、Case 8 无关路径、Case 11 fake fallback、Case 12 普通诊断均不 Resolve；Case 9 同 artifact subject 的合法路径迁移 Resolve。新增 subject/replay/regression 后相关测试通过，`eval_runner.py --validate-only` 通过。本轮没有跑完整 DEV，避免把 Provider 动态状态混入边界结论。
+
+【还剩什么风险】当前没有 False Resolve 的确定性样例；False Unresolved 仍存在于“全量 suite 覆盖子集”和“工具没有提供 fallback 对象身份”的场景。这些会导致额外验证或保守 REPLAN，不会让任务在未证明恢复时宣布成功。后续若要支持它们，应从结构化 test coverage 或业务 tool contract 获取事实，而不是降低阈值或用文本关键词猜测。
+
+## Resolution Boundary DEV×1（2026-09-11）
+
+【评测怎么证明】Resolution matrix 和回归通过后运行了 Candidate DEV×1，共 12/12 个 Trial，未运行 DEV×3。完整账本在 `sandbox/eval_results/anti_loop_resolution_candidate_smoke/run_results_20260911T025829Z.json`。结果为 TP/FP/TN/FN=`5/0/6/1`，Governance Accuracy=`11/12=91.67%`，Stop Precision=`5/5=100%`，Stop Recall=`5/6=83.33%`，False Stop Rate=`0/6=0%`，Solvable Success Rate=`4/6=66.67%`，Appropriate Stop Rate=`5/6=83.33%`，Verifier Pass Rate=`9/12=75%`，Infra Error=`3/12`。
+
+【如何解释】019、020、021 都没有反弹，均为 valid TP；023、025、031、032 为 valid TN。018、022、024 的三次 Provider timeout 被完整保留为 Infra Error，没有从治理分母删除，因此 Infra Error 超过 2 的门槛，本轮停止，不把短轨迹当成成本优化，也不继续跑 DEV×3。全量均值为 8.92 turns、54,783 tokens、43.35s；去掉 Infra Error 后为 8.89 turns、55,852 tokens、40.24s，这两个均值都不应被当作稳定的正式成本结论。
+
+【还剩什么风险】DEV×1 只证明当前版本没有立刻出现结构性 False Stop，不能证明跨 run 稳定性。Provider 仍不稳定，最终状态应为 `READY_TO_MERGE_WITH_EVAL_PENDING`，动态 DEV×3 需要在 Provider 稳定后补跑。

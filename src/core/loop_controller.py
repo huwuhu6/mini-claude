@@ -15,6 +15,7 @@ from collections import deque
 from dataclasses import dataclass, replace
 from enum import Enum
 from typing import Deque, Dict, List, Optional, Any, Iterable
+from urllib.parse import urlsplit
 
 logger = logging.getLogger(__name__)
 
@@ -210,6 +211,39 @@ class CommandNormalizer:
         target = cls._extract_target(action, clean)
 
         return NormalizedIntent(action=action, target=target, tool=tool_name)
+
+    @classmethod
+    def subject_key(cls, tool_name: str, args: Dict[str, Any]) -> str:
+        """Return a small, deterministic identity for cross-tool resolution."""
+        args = args if isinstance(args, dict) else {}
+        if tool_name == "health_check":
+            port = args.get("port")
+            if port is not None:
+                return f"service://localhost:{int(port)}"
+            url = str(args.get("url", ""))
+            if url:
+                return cls._service_subject(url)
+            return ""
+
+        command = str(args.get("command", "")) if tool_name == "bash" else ""
+        urls = re.findall(r"https?://[^\s'\"]+", command, re.IGNORECASE)
+        if urls:
+            return cls._service_subject(urls[0])
+
+        intent = cls.normalize(tool_name, args)
+        if re.search(r"\bpytest\b", command, re.IGNORECASE):
+            return f"test://pytest/{intent.target or 'full'}"
+        if intent.action == "INSTALL_PACKAGE" and intent.target:
+            return f"dependency://{intent.target.lower()}"
+        return ""
+
+    @staticmethod
+    def _service_subject(url: str) -> str:
+        parsed = urlsplit(url if "://" in url else f"http://{url}")
+        if not parsed.hostname:
+            return ""
+        port = parsed.port or (443 if parsed.scheme.lower() == "https" else 80)
+        return f"service://{parsed.hostname.lower()}:{port}"
 
     # ── Pipeline helpers ───────────────────────────────────────────────
 
@@ -407,7 +441,8 @@ class AttemptEvent:
     changed_paths: tuple[str, ...] = ()
     semantic_state: str = ""
     verification_improved: bool = False
-    resolution_intent_key: str = ""
+    subject_key: str = ""
+    resolution_key: str = ""
     resolution_reason: str = ""
     governance_decision: str = ""
     governance_reason: str = ""
@@ -437,7 +472,8 @@ class AttemptEvent:
             "timestamp": round(self.timestamp, 3), "changed_paths": list(self.changed_paths),
             "semantic_state": self.semantic_state,
             "verification_improved": self.verification_improved,
-            "resolution_intent_key": self.resolution_intent_key,
+            "subject_key": self.subject_key,
+            "resolution_key": self.resolution_key,
             "resolution_reason": self.resolution_reason,
             "governance_decision": self.governance_decision,
             "governance_reason": self.governance_reason,
@@ -762,7 +798,11 @@ class RuntimePolicy:
             event for index, event in enumerate(events)
             if index in unresolved_indexes
             and not any(
-                later.resolution_intent_key == event.intent_key
+                later.resolution_key
+                and later.resolution_key in {
+                    event.intent_key,
+                    event.subject_key,
+                }
                 for later in events[index + 1:]
             )
         ]
@@ -799,7 +839,7 @@ class RuntimePolicy:
                        observed_failure: bool = False, semantic_status: str = "",
                        observation: str = "", exit_code: Optional[int] = None,
                        segment_exit_codes: Iterable[int] = (),
-                       resolution_evidence: str = "") -> tuple[AttemptEvent, RuntimePolicyDecision]:
+                       resolution_evidence: str = "", subject_key: str = "") -> tuple[AttemptEvent, RuntimePolicyDecision]:
         """Append exactly one outcome event, then derive a decision from it."""
         before = workspace_before or {}
         after = workspace_after or {}
@@ -810,8 +850,9 @@ class RuntimePolicy:
         normalized = " ".join(str(result_text or "").split()).lower()
         observation_fingerprint = hashlib.sha256(normalized.encode("utf-8")).hexdigest()[:16]
         semantic_state = self._semantic_state(result_text)
-        resolution_intent_key, resolution_reason = self._resolution_for(
+        resolution_key, resolution_reason = self._resolution_for(
             intent_key=intent_key,
+            subject_key=subject_key,
             status=AttemptStatus.SUCCESS if success else AttemptStatus.BLOCKED if block_reason else AttemptStatus.FAILURE,
             execution_success=(success if execution_success is None else execution_success),
             observed_failure=observed_failure,
@@ -831,8 +872,9 @@ class RuntimePolicy:
             observation_fingerprint=observation_fingerprint, block_reason=block_reason,
             duration_ms=duration_ms, timestamp=time.time(), changed_paths=changed_paths,
             semantic_state=semantic_state,
-            verification_improved=bool(resolution_intent_key),
-            resolution_intent_key=resolution_intent_key,
+            verification_improved=bool(resolution_key),
+            subject_key=subject_key,
+            resolution_key=resolution_key,
             resolution_reason=resolution_reason,
             workspace_before_digest=before_digest,
             workspace_after_digest=after_digest,
@@ -845,7 +887,7 @@ class RuntimePolicy:
         return event, decision
 
     def _resolution_for(
-        self, *, intent_key: str, status: AttemptStatus,
+        self, *, intent_key: str, subject_key: str, status: AttemptStatus,
         execution_success: bool, observed_failure: bool,
         resolution_evidence: str,
     ) -> tuple[str, str]:
@@ -860,7 +902,10 @@ class RuntimePolicy:
         prior = list(self.history)
         matching = [
             event for event in prior
-            if event.intent_key == intent_key
+            if (
+                event.intent_key == intent_key
+                or (subject_key and event.subject_key == subject_key)
+            )
             and (event.status is AttemptStatus.FAILURE or event.observed_failure)
         ]
         if not matching:
@@ -872,7 +917,7 @@ class RuntimePolicy:
         if latest.semantic_status == "UNHEALTHY" and not resolution_evidence:
             return "", ""
         reason = resolution_evidence or "same normalized intent completed successfully"
-        return intent_key, reason
+        return intent_key if latest.intent_key == intent_key else subject_key, reason
 
     @staticmethod
     def _semantic_state(result_text: str) -> str:
@@ -969,7 +1014,8 @@ class RuntimePolicyAdapter:
                 args_fingerprint: str = "", execution_success: Optional[bool] = None,
                 observed_failure: bool = False, semantic_status: str = "",
                 observation: str = "", exit_code: Optional[int] = None,
-                segment_exit_codes: Iterable[int] = (), resolution_evidence: str = ""):
+                segment_exit_codes: Iterable[int] = (), resolution_evidence: str = "",
+                subject_key: str = ""):
         event, decision = self.policy.record_attempt(
             turn=turn, tool_name=tool_name, intent_key=intent_key,
             args_fingerprint=args_fingerprint, success=success, result_text=result_text,
@@ -985,6 +1031,7 @@ class RuntimePolicyAdapter:
             exit_code=exit_code,
             segment_exit_codes=segment_exit_codes,
             resolution_evidence=resolution_evidence,
+            subject_key=subject_key,
         )
         previous = self.policy.history.recent(2)
         progress = len(previous) < 2 or event.observation_fingerprint != previous[-2].observation_fingerprint

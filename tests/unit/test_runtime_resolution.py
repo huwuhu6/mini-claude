@@ -18,7 +18,7 @@ def _intent(tool, args):
 
 def _record(policy, tool, args, result, *, success=True, category="",
             observed_failure=False, semantic_status="", changed=False,
-            resolution_evidence="", block_reason=""):
+            resolution_evidence="", block_reason="", subject_key=""):
     intent = _intent(tool, args)
     return policy.record_attempt(
         turn=len(policy.history) + 1,
@@ -35,6 +35,7 @@ def _record(policy, tool, args, result, *, success=True, category="",
         workspace_before={"state": "before"},
         workspace_after={"state": "after" if changed else "before"},
         block_reason=block_reason,
+        subject_key=subject_key,
     )
 
 
@@ -99,7 +100,7 @@ def test_health_resolution_requires_probe_scoped_structured_observation():
         resolution_evidence=good.resolution_evidence,
     )
     assert event.verification_improved is True
-    assert event.resolution_intent_key == _intent("health_check", {})
+    assert event.resolution_key == _intent("health_check", {})
     assert policy.finalize().action is RuntimeDecision.ALLOW
 
 
@@ -175,3 +176,122 @@ def test_history_keeps_success_failure_and_blocked_order_without_duplicate_event
     assert [event.status for event in events] == [
         AttemptStatus.SUCCESS, AttemptStatus.FAILURE, AttemptStatus.BLOCKED,
     ]
+
+
+def test_subject_key_is_deterministic_for_cross_tool_services_and_scopes():
+    assert CommandNormalizer.subject_key(
+        "bash", {"command": "curl http://localhost:8080/health"}
+    ) == "service://localhost:8080"
+    assert CommandNormalizer.subject_key(
+        "health_check", {"port": 8080}
+    ) == "service://localhost:8080"
+    assert CommandNormalizer.subject_key(
+        "bash", {"command": "pytest tests/user"}
+    ) == "test://pytest/tests/user"
+    assert CommandNormalizer.subject_key(
+        "bash", {"command": "pytest tests/order"}
+    ) == "test://pytest/tests/order"
+
+
+def test_resolution_matrix_has_no_false_resolve_and_only_known_boundaries():
+    service = "service://localhost:8080"
+    cases = []
+
+    policy = RuntimePolicy()
+    _record(policy, "bash", {"command": "curl http://localhost:8080/health"},
+            "HTTP 503", success=True, category="NETWORK_UNREACHABLE",
+            observed_failure=True, semantic_status="UNHEALTHY", subject_key=service)
+    _record(policy, "health_check", {"port": 8080}, '{"healthy":true}',
+            subject_key=service, semantic_status="HEALTHY",
+            resolution_evidence="structured healthy probe")
+    cases.append(("same service across tools", policy, True))
+
+    policy = RuntimePolicy()
+    _record(policy, "health_check", {"port": 8080}, '{"healthy":false}',
+            category="NETWORK_UNREACHABLE", observed_failure=True,
+            semantic_status="UNHEALTHY", subject_key=service)
+    _record(policy, "bash", {"command": "curl http://localhost:8080/health"},
+            "HTTP 200", subject_key=service, semantic_status="HEALTHY",
+            resolution_evidence="structured HTTP 200 probe")
+    cases.append(("same service reverse tools", policy, True))
+
+    policy = RuntimePolicy()
+    _record(policy, "bash", {"command": "curl http://localhost:8080/health"},
+            "HTTP 503", category="NETWORK_UNREACHABLE", observed_failure=True,
+            semantic_status="UNHEALTHY", subject_key=service)
+    _record(policy, "health_check", {"port": 9090}, '{"healthy":true}',
+            subject_key="service://localhost:9090", semantic_status="HEALTHY",
+            resolution_evidence="structured healthy probe")
+    cases.append(("different service", policy, False))
+
+    def pytest_case(failing, succeeding, expected, label):
+        p = RuntimePolicy()
+        _record(p, "bash", {"command": f"pytest {failing}"}, "1 failed",
+                success=False, category="PROCESS_FAILURE",
+                subject_key=f"test://pytest/{failing}")
+        _record(p, "bash", {"command": f"pytest {succeeding}"}, "0 failed",
+                subject_key=f"test://pytest/{succeeding}")
+        cases.append((label, p, expected))
+
+    pytest_case("tests/user", "tests/order", False, "different pytest scope")
+    p = RuntimePolicy()
+    _record(p, "bash", {"command": "pytest tests/user"}, "1 failed",
+            success=False, category="PROCESS_FAILURE",
+            subject_key="test://pytest/tests/user")
+    _record(p, "edit_file", {"path": "app.py", "edits": [{"search": "x", "replace": "y"}]},
+            "changed", changed=True)
+    _record(p, "bash", {"command": "pytest tests/user"}, "0 failed",
+            subject_key="test://pytest/tests/user")
+    cases.append(("same pytest scope", p, True))
+    pytest_case("tests/user", "", False, "broader pytest scope")
+    pytest_case("", "tests/order", False, "narrower pytest scope")
+
+    p = RuntimePolicy()
+    _record(p, "write_file", {"path": "protected/cache/output.json"},
+            "Permission denied", success=False, category="PERMISSION_DENIED",
+            observed_failure=True, semantic_status="RESOURCE_DENIED",
+            subject_key="path://protected/cache/output.json")
+    _record(p, "write_file", {"path": "workspace/report.md"}, "written",
+            subject_key="path://workspace/report.md")
+    cases.append(("different permission path", p, False))
+
+    p = RuntimePolicy()
+    _record(p, "write_file", {"path": "protected/output.json"},
+            "Permission denied", success=False, category="PERMISSION_DENIED",
+            observed_failure=True, semantic_status="RESOURCE_DENIED",
+            subject_key="artifact://output.json")
+    _record(p, "write_file", {"path": "workspace/output.json"}, "artifact valid",
+            subject_key="artifact://output.json", resolution_evidence="artifact verified")
+    cases.append(("same artifact moved to legal path", p, True))
+
+    p = RuntimePolicy()
+    _record(p, "bash", {"command": "pip install metrics-core"},
+            "package not found", success=False, category="PACKAGE_NOT_FOUND",
+            observed_failure=True, semantic_status="UNHEALTHY",
+            subject_key="dependency://metrics-core")
+    _record(p, "bash", {"command": "python fallback.py"}, "score=125",
+            subject_key="dependency://metrics-core",
+            resolution_evidence="fallback business command succeeded")
+    cases.append(("dependency fallback with explicit subject", p, True))
+
+    p = RuntimePolicy()
+    _record(p, "bash", {"command": "pip install metrics-core"},
+            "package not found", success=False, category="PACKAGE_NOT_FOUND",
+            observed_failure=True, semantic_status="UNHEALTHY",
+            subject_key="dependency://metrics-core")
+    _record(p, "bash", {"command": "python fake_dependency.py"}, "echo ok")
+    cases.append(("fake dependency fallback", p, False))
+
+    p = RuntimePolicy()
+    _record(p, "bash", {"command": "curl http://localhost:8080/health"},
+            "HTTP 503", category="NETWORK_UNREACHABLE", observed_failure=True,
+            semantic_status="UNHEALTHY", subject_key=service)
+    _record(p, "read_file", {"path": "config.json"}, "config")
+    _record(p, "list_files", {"path": "."}, "files")
+    _record(p, "write_file", {"path": "report.md"}, "written")
+    _record(p, "bash", {"command": "echo READY"}, "READY")
+    cases.append(("ordinary diagnosis", p, False))
+
+    for label, policy, expected_resolved in cases:
+        actual_resolved = policy.finalize().action is RuntimeDecision.ALLOW
+        assert actual_resolved is expected_resolved, label

@@ -2012,6 +2012,7 @@ class MiniClaudeAgent:
                         exit_code=tool_result.exit_code,
                         segment_exit_codes=tool_result.segment_exit_codes,
                         resolution_evidence=observation_evidence.resolution_evidence,
+                        subject_key=CommandNormalizer.subject_key(tname, args),
                     )
                     self.trace.record_attempt_event(progress_decision.event.to_dict())
                     self.trace.annotate_current_tool(
