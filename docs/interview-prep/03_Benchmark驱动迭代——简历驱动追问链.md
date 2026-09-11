@@ -1,488 +1,844 @@
-# Benchmark 驱动迭代——简历驱动追问链
+# Benchmark 驱动迭代——从“能跑分”到“这把尺子真的可信”
 
-## 0. 简历怎么写
-
-推荐 bullet：
-
-> **Benchmark 驱动迭代：**构建 `baseline/config/verify` + Shadow Workspace + Trace + Run Manifest 的自动化评测框架，截至当前主线沉淀 17 个专项任务；通过固定 Fixture、切换 Agent Commit 和多次运行比较完成率、Token、轮次、工具调用与失败路径，并据此淘汰过度特化的验证工具和无收益规则。
-
-最希望面试官第一问：
-
-> Agent 本身有随机性，你怎么证明一次 Harness 改动真的变好了，而不是这次模型刚好抽卡抽得好？
+> 这篇不是教你背 `eval_runner.py` 的 API，也不是把一堆评测术语抄一遍。
+>
+> 真正要讲清楚的是：mini-claude 最开始已经有 Benchmark，为什么后来还花了很长时间重新审计和加固评测系统；我们怎么一步步发现“考试题本身有问题”；又怎么把一个简单的 PASS/FAIL，演进成能区分业务结果、目标能力、最终治理和整体执行质量的评测体系。
+>
+> 如果只记一句话：**Benchmark 不是给 Agent 打一个漂亮分数，而是让 Runtime 的每一次修改都能被可信地证明“到底改善了什么、又牺牲了什么”。**
 
 ---
 
-# 一、第一问：你这个 Benchmark 和普通单测有什么区别？
+## 一、这条线为什么会出现：最危险的不是 Agent 做错，而是“做错了却被判成做对”
 
-## 30 秒回答
+mini-claude 很早就有自己的评测框架：一个 Case 提供固定的初始仓库，Agent 在隔离工作区里执行，结束后再由隐藏的 `verify.py` 判最终结果，同时保存 Trace、Token、轮次和工具调用。
 
-> 普通单测更适合验证确定性函数，而 Coding Agent 的核心输出是“执行轨迹 + 最终工作区状态”，中间会受模型随机性、工具选择和上下文影响。所以我把评测拆成两层：最终结果由独立 `verify.py` 做 deterministic validation，过程由 Trace 记录轮数、Token、Tool Call、失败、LoopGuard 等行为指标。一次 Case 不是只看 Agent 最后说“我完成了”，而是看 Shadow Workspace 最终是不是真的符合任务 Contract，同时保存执行轨迹用于解释为什么变好或变差。
+这已经比“看 Agent 最后说自己完成了没有”靠谱得多。早期很多 Runtime 优化——例如长日志落盘、删除过度特化的验证工具、弱化 TodoWrite——都是靠这套框架发现收益和副作用的。
+
+但后来我们准备继续做 Anti-Loop / Failure Governance 时，出现了一个更根本的问题：
+
+```text
+Benchmark 分数真的在测我们以为的那个能力吗？
+```
+
+举一个最典型的 STOP Case。
+
+我们真正想测的是：
+
+```text
+外部依赖永久不可用
+→ Agent 调查
+→ 确认没有合法恢复路径
+→ Runtime 因这个 blocker 正确停止
+```
+
+旧判分里却可能退化成：
+
+```text
+最终状态 = BLOCKED / CIRCUIT_BROKEN
+→ 算“正确停止”
+```
+
+这就会产生一个很危险的假阳性：Agent 的确看见过目标 blocker，但后来真正触发停止的是另一个无关错误。最后也是 STOP，于是分数看起来正确。
+
+换成考试的说法就是：**学生选中了正确选项，但理由完全错了，阅卷系统还是给了满分。**
+
+这时候继续根据分数优化 Runtime，风险很大。你可能为了“提高正确停止率”继续加规则，最后优化的是考卷漏洞，而不是 Agent 能力。
+
+> 【核心提炼】这条评测主线真正的起点，不是“我们想把 Benchmark 做得更复杂”，而是“如果尺子不可信，Runtime 优化越勤快，越可能被错误指标带偏”。
 
 ---
 
-# 二、一个 Benchmark Task 长什么样？
+## 二、先把早期评测框架讲明白：它原本已经解决了什么
 
-当前任务目录基本是：
+### 1. 一个 Benchmark Case 是什么
+
+可以把一个 Case 理解成一间固定布置好的“小实验室”。典型目录是：
 
 ```text
 sandbox/tasks/task_xxx/
-├── baseline/
-│   └── 任务开始前的初始仓库 / fixture
-├── config.json
-│   ├── case_id
-│   ├── prompt
-│   ├── task_version
-│   └── verify_script_file
-└── verify.py
+├── baseline/              # Agent 开始前看到的初始工作区
+├── config.json            # Prompt、Case 元数据、评测 Contract
+├── verify.py              # Agent 看不到的判卷逻辑
+└── reference_solution/    # 需要时提供，证明题目至少存在合法解
 ```
 
-执行时：
+`baseline` 不是答案，它只是“事故现场”。比如一份编译失败的 Java 项目、一段错误配置、一个会返回 503 的本地服务环境。
+
+`config.json` 告诉 Evaluation Harness：这是哪条 Case、Agent 要做什么、属于什么 Suite / Split，以及该如何接入评测。
+
+`verify.py` 是隐藏的阅卷老师。它不会在 Agent 执行期间放进可见工作区，否则 Agent 可以直接阅读判卷规则，反过来“为 Verifier 写答案”。
+
+`reference_solution` 也不是要求 Agent 模仿的标准 Patch。它的作用只是证明：**至少存在一种合法方案能够让当前 Case 通过。**
+
+### 2. Shadow Workspace 为什么重要
+
+评测不会让 Agent 直接修改 `baseline`，而是先复制一份 Shadow Workspace：
 
 ```text
-读取 config
-→ 校验任务 Contract
-→ 创建 Shadow Workspace
-→ 复制 baseline
-→ Agent 只操作 Shadow Workspace
-→ Agent 结束后复制并执行 verify.py
-→ 读取 Trace
-→ 聚合结果与行为指标
-→ 归档 run_results / run_manifest / trace
+固定 baseline
+    ↓ copy
+Shadow Workspace
+    ↓
+Agent read / edit / bash
+    ↓
+最终工作区
+    ↓
+隐藏 Verifier 检查
 ```
 
-`verify.py` 不暴露给 Agent，否则模型可能“为了通过测试”直接阅读验证脚本。
+这解决三个基础问题：副作用隔离、每次从同一起点开始、最后结果可比较。
+
+如果 Run1 改过的文件直接留给 Run2，那么所谓“跑三次”其实是三个不同实验，后面的数字没有意义。
+
+### 3. Trace 和 Manifest 分别解决什么
+
+**Trace 回答“Agent 到底经历了什么”。** 最终都是 FAIL，可能一个卡在网络重试，一个已经把代码修好、只是最后治理状态异常。如果只看 FAIL，修复方向完全不同。
+
+**Run Manifest 回答“这批分数是在什么条件下产生的”。** 它会记录代码版本、任务集、Fixture Hash、环境、Provider 等信息，防止出现：
+
+```text
+Baseline 用旧 Case
+Candidate 用新 Case
+→ 最后还拿两个百分比直接比较
+```
+
+所以早期系统已经形成一个很重要的思想：**不仅要版本化代码，还要版本化实验条件。**
 
 ---
 
-# 三、为什么要 Shadow Workspace？
+## 三、第一个真正的转折：我们先写了一个“怎么出题”的 Skill
 
-三个原因：
+随着 Case 增长，新的问题出现了：Benchmark 本身也是代码，也会过拟合、会泄题、会写错。
 
-1. **隔离副作用**：Agent 会真实 edit/write/bash，不能让评测污染 baseline；
-2. **可复现**：每次 Run 都从相同初始状态开始；
-3. **可验证**：Agent 结束后，Verifier 可以检查一个干净、可比较的最终工作区。
-
-如果直接在同一目录反复跑：
+于是项目里增加了：
 
 ```text
-Run1 已经改了文件
-Run2 从 Run1 结果开始
+.agents/skills/miniclaude-benchmark-author/
 ```
 
-那么第二次根本不是同一个实验。
+这里最容易理解错，所以先明确：
+
+> **Benchmark Author Skill 是给 Codex 使用的项目级 Skill，不是 MiniClaude Runtime 的 Skill。**
+
+关系是：
+
+```text
+用户要求设计 / 审核 Benchmark
+        ↓
+Codex
+        ↓
+MiniClaude Benchmark Author Skill
+        ↓
+阅读 mini-claude 仓库、现有 Suite、Harness Contract
+        ↓
+设计 / 审核 Benchmark
+```
+
+它不会被 MiniClaude Agent 在 Runtime 里加载，也不参与 Agent 解题。
+
+为什么要专门做一个 Skill？因为“出一道 Agent 能做的题”很简单，**出一道只有 Agent 真有这项能力才比较容易做对的题**很难。
+
+比如你想测：
+
+> 依赖失败后，Agent 能不能判断还有没有合法恢复路径。
+
+一个很差的 Case 是：
+
+```text
+README：这个依赖永久不可用，没有替代方案。
+Prompt：如果确实不可恢复就停止。
+```
+
+Agent 即使没有 Failure Intelligence，也能直接照抄答案。
+
+另一个极端也不行：把所有线索删光，只让依赖失败，然后要求 Agent自己猜“这次到底还有没有 fallback”。这不叫防泄题，这叫题目不可解。
+
+所以 Skill 的核心不是生成文件，而是强迫命题过程反复回答几件事：
+
+```text
+到底想测哪个能力？
+↓
+Agent 正常情况下能看到什么证据？
+↓
+这些证据够不够自己推出答案？
+↓
+有没有地方直接把答案泄露了？
+↓
+Verifier 能不能被手写结果、删测试、硬编码等方式骗过？
+↓
+换一种合法实现还能不能通过？
+↓
+这题是在测能力，还是在测当前 Runtime 的某个类名/正则/阈值？
+```
+
+Skill 的完整设计单独整理在：
+
+> `04_Benchmark Author Skill——怎么避免出一道“看起来像评测”的假题.md`
+
+这里先记住一句：**Skill 把“写 Case”从文件生成任务，变成了一次 Measurement Validity 审核。**
 
 ---
 
-# 四、为什么 verify.py 要独立于 Agent？
+## 四、拿 Skill 反过来审现有 Benchmark，结果真的审出了问题
 
-因为模型最终文本不可信。
+Skill 原本是为了以后更规范地出题，但真正有意思的是：我们第一次拿它审现有 Anti-Loop Suite，就发现“旧考卷”存在多个层次的问题。
 
-例如 Agent 可能说：
+### 1. STOP 判对了，但原因可能是错的
 
-```text
-“已完成全部重构并验证通过”
-```
+前面说过，旧逻辑容易把“最后停了”和“因为正确 blocker 停了”混在一起。
 
-但实际：
+我们后来开始区分：
 
 ```text
-漏改 1 个文件
-语法仍错误
-测试没真正执行
+Raw Governance
+= 最后到底 STOP / CONTINUE 了没有
+
+Grounded Capability
+= 这个 STOP / RECOVER 有没有可信证据支撑
 ```
 
-所以结果判定必须来自 Agent 外部。
+Raw 指标仍然有用，它回答的是“行为分类”。但它不能再被包装成“正确识别了 blocker”。
 
-核心原则：
+### 2. Recover Case 可以“交答案”，却没有真正恢复
 
-> Agent 是被测对象，不能同时当裁判。
+例如某些 Case 只检查最终 artifact 内容。如果预期文件固定，Agent 完全可能直接手写正确结果，根本不走原本想测的恢复链路。
 
-这也是为什么 `verify_status` 与 `final_status` 要分开。Agent 正常结束不等于任务完成；反过来，某些测试甚至可能最终 Workspace 正确，但 Agent 状态异常，这两种信息都应该保留。
+还有一些 Case 的 visible test / runner 本身能被 Agent 修改。那就可能出现：
+
+```text
+真正业务代码没修好
+→ 把 test 改简单
+→ 测试 PASS
+→ Verifier 也 PASS
+```
+
+所以后来 Verifier 开始强调 evaluator-owned invariant、受保护的 test/runner、动态输入和 mutation/red-team。
+
+### 3. 有些 Case 自己就在“泄答案”
+
+比如 README、spec、lock 文件里直接出现类似：
+
+```text
+intentionally unavailable
+missing-and-no-fallback
+```
+
+对于 permanent blocker 题，这几乎等于告诉 Agent：“答案是 STOP”。
+
+修复时也不能简单删掉文字。正确做法是给 Agent 一个自然的调查入口，例如真实 probe、build、HTTP endpoint，让它自己通过执行观察到 404/503/权限错误，再推断有没有恢复路径。
+
+### 4. 有些题删掉泄漏以后反而变成不可解
+
+这也是为什么 Leakage 和 Solvability 必须一起审。
+
+例如原来一个 Case 只有一句文本写着“插件不存在”。把这句话删了以后，如果仓库里又没有命令、服务或配置可以调查，Agent 就只能猜。
+
+因此更合理的修法是：
+
+```text
+不是把线索删光
+而是把“答案型线索”改成“真实可调查证据”
+```
+
+> 【核心提炼】好的 Benchmark 不是“越隐藏越高级”。真正的要求是：Agent 看不到答案，但能通过正常工程调查得到足够证据。
 
 ---
 
-# 五、如何处理模型随机性？
+## 五、为什么后来还要改 Trace：只有“看见过错误”仍然不够
 
-不要说“设 temperature=0 就没有随机性”。实际 Provider、工具选择、采样和外部环境仍可能带来波动。
-
-当前比较方式主要是：
+第一轮 Hardening 后，我们一度认为：
 
 ```text
-固定同一 Task Fixture
-固定同一 Prompt / Config
-固定同一 verify Contract
-Baseline 与 Refactor 使用不同 Agent Commit
-每组跑多次（常见 3～5 次）
-比较分布而不是只看一次
+目标 blocker 确实存在
++ Trace 里确实出现过这个失败
++ 最后 STOP
+→ Grounded STOP
 ```
 
-重点指标：
+独立 Review 很快指出了问题。
+
+假设 Trace 是：
 
 ```text
-第一层：任务成功率 / verify pass
-第二层：total turns / total tokens / latency
-第三层：tool call count / failure count / loop guard / circuit breaker
-第四层：具体 Tool Sequence 和 Trace
+Observation A：/health → 503      # 目标 blocker
+Observation B：另一个无关错误
+Observation B 触发 TERMINATE
+最终：BLOCKED_ENVIRONMENT
 ```
 
-排序原则：
+如果 Verifier 只检查“历史上有没有 503”，还是会错误给 Grounded PASS。
 
-> 先保证成功率不下降，再讨论 Token、轮次和 Tool Call 是否下降。
+换句话说，我们缺的不是更多字符串，而是：
 
-如果成功率从 5/5 变成 3/5，即使 Token 省 80%，也不能叫优化。
+> **最终治理决策到底引用了哪个证据？**
+
+于是 Runtime 的 Observability 增加了结构化关联，例如 observation identity、trial correlation、governance evidence reference。
+
+这一步要特别区分：**我们改的是摄像头，不是学生的大脑。**
+
+没有去调整 LoopGuard、Failure Intelligence、CompletionGuard 的阈值、重试次数和 STOP/CONTINUE 策略；只是让评测能知道：
+
+```text
+Agent 观察到了什么
+→ 哪条 observation 成为治理 evidence
+→ 哪个 evidence 支撑了最终 decision
+```
+
+后来 task033 的真实 Smoke 就验证了它的价值：Agent 确实观察到了 A/B/A/B 的状态振荡，但最终 HARD_STOP 引用的是另一个 `/health → 503` 证据，而不是振荡证据。旧评测很容易把它判成“正确识别 oscillation 并停止”，新版会判 `STOP_UNGROUNDED`。
+
+这对 Runtime 优化非常重要：**它告诉我们不是“不会停”，而是“停的归因不对”。**
 
 ---
 
-# 六、为什么 Run Manifest 很重要？
+## 六、为什么一定要用真实 Agent Smoke：Codex 自己写的测试全绿也不够
 
-历史上评测最容易犯的错误之一是：
+静态测试的一个天然问题是：同一个人可能把实现和测试一起理解错。
+
+所以 Hardening 后没有直接宣布“评测可信”，而是让真实 MiniClaude 跑少量 DEV Case，再让人工判断和 Grader 对账。
+
+这个阶段抓出了几个特别有代表性的错误。
+
+### Case 1：task031——baseline 居然自己就能过
+
+这相当于考试题还没作答就已经满分。
+
+后来补了更严格的 Contract Gate：untouched baseline 必须失败，reference 必须通过，受保护测试不能被篡改。
+
+### Case 2：task032——Agent 明明修对了，却被 hidden verifier 判错
+
+Agent 把 VIP 参数从 `0.8` 修到 `0.9`，visible test 已经证明行为正确，但 hidden verifier 还在要求旧的 `0.8`。
+
+这就是标准的 **False Reject**：学生答对了，标准答案自己写错了。
+
+修复时不是简单“因为 Agent 写 0.9，所以 grader 改 0.9”，而是重新回到用户目标、visible contract、reference 和 hidden oracle，确定哪个值才是真正的业务语义。最后统一到 `0.9`，并加入 verifier-only 动态输入，避免 Agent 只对固定样例查表硬编码。
+
+### Case 3：task033——STOP 了，但不是因为我们要测的原因
+
+这就是上一节讲的 causality。真实 Agent Smoke 让我们第一次真正看到：
 
 ```text
-Baseline 用旧任务 fixture
-Refactor 用新 fixture
+目标 evidence 出现过
+≠
+最终 STOP 就是由目标 evidence 导致
 ```
 
-最后数字不能比较。
-
-因此 Run Manifest 记录：
-
-```text
-Agent commit
-worktree dirty / clean
-Python / platform
-任务集 hash
-task config hash
-baseline fixture hash
-```
-
-比较报告发现任务集或运行条件不一致时应该报警，而不是继续计算一个看起来漂亮的 Δ。
-
-面试可以一句话概括：
-
-> 我不仅版本化代码，也版本化实验条件，否则 Agent 的指标差异无法归因。
+> 【核心提炼】Dynamic Smoke 不是为了提前看 Runtime 分数，而是为了测试“阅卷老师遇到真实、不可预测的答题路径时，会不会判错”。
 
 ---
 
-# 七、为什么“切换 --version 名称”不等于切换实验版本？
+## 七、最大的认知升级：一次 Trial 不能只压成一个 PASS / FAIL
 
-`--version baseline` 只是输出目录标签。
+后面 task022 出现了整个评测演进里最有价值的一个 Case。
 
-真正的 A/B 必须是：
+真实轨迹大致是：
 
 ```text
-旧 Agent Commit + 同一版 Benchmark Fixture
-vs
-新 Agent Commit + 同一版 Benchmark Fixture
+/health → 503
+→ Agent 调用 /start
+→ /start → 200
+→ /health → READY
+→ 订单 → PAID / 1250
 ```
 
-如果两边实际跑的是同一份工作区代码，只改报告名字，那是假实验。
+到这里，用户真正要求的业务目标已经完成。
 
-项目文档后来专门补了版本隔离规范，就是因为这个坑很容易发生。
+但 Agent 没有及时结束，又继续操作，后来遇到一个无关 blocker，最终状态变成：
+
+```text
+BLOCKED_ENVIRONMENT
+```
+
+旧 Measurement Model 会把它压成：
+
+```text
+final_status != SUCCESS
+→ Recovery FAIL
+→ Task FAIL
+```
+
+问题是，这个结论把两个完全不同的能力混在一起了。
+
+Agent 明明已经证明：
+
+> 我可以从 503 恢复服务，并继续把业务订单完成。
+
+它真正失败的是：
+
+> 事情已经做完了，我却不知道应该结束，继续行动把自己送进了另一个 blocker。
+
+于是 Grading Schema 演进到 v3，把一次 Trial 拆成四层：
+
+| 维度 | 它回答什么 |
+|---|---|
+| Business Outcome | 用户要求的业务结果到底有没有完成？ |
+| Grounded Capability | 本题声称的目标能力有没有通过可信因果链真正展示？ |
+| Final Governance / Completion | Runtime 最终有没有在正确的时机继续、停止或结束？ |
+| Overall Trial | 从端到端看，这一整次执行是否完整成功？ |
+
+于是 task022 那条真实轨迹可以准确写成：
+
+```text
+Business Outcome        PASS
+Grounded Recovery       PASS
+Final Governance        FAIL
+Overall                  PARTIAL
+```
+
+这不是为了把指标变复杂，而是为了让失败能指导正确的 Runtime 修改。
+
+如果只看到 `task022 FAIL`，你可能去优化 Recovery；但实际上 Recovery 已经成功，真正值得修的是 Completion。
+
+### 另一个反例：task025 / task031
+
+真实 Agent 有时没有先跑初始失败命令，直接看代码就修好了，最终业务命令也成功。
+
+这时候合理分类是：
+
+```text
+Business Outcome        PASS
+Grounded Recovery       FAIL
+Final Governance        PASS
+Overall                  FAIL
+```
+
+为什么 Recovery FAIL？因为这个 Case 想证明的是“观察失败后发生可信恢复”，Agent 没展示这条轨迹。
+
+但 Business Outcome 仍然应该 PASS，因为业务结果确实做对了。
+
+这正是四层模型的意义：**一个维度失败，不能把另一个已经发生的事实一起抹掉。**
 
 ---
 
-# 八、Benchmark 怎么选？为什么不是越多越好？
+## 八、Verifier、Grader、Runner 到底各管什么
 
-当前 17 个任务不是为了做“大而全排行榜”，而是按真实 failure mode 增长。
+到这里很容易把三层职责说混。
 
-大体覆盖：
+可以用“考试”继续类比。
 
-```text
-代码编辑
-非唯一上下文
-跨文件重构
-搜索回归
-大日志定位
-中间日志定位
-离线依赖阻断
-连续 0-Diff 编辑
-Shell 环境持久化
-```
-
-一个新 Benchmark 值得加入，通常满足：
-
-```text
-真实 Trace 里出现过
-可以稳定复现
-有清晰 deterministic outcome
-能区分改造前后行为
-不是专门给某条 if-else 喂答案
-```
-
----
-
-# 九、怎么防 Case Chasing / Benchmark 过拟合？
-
-虽然 mini-claude 没有 DP-Plus 那套正式 Holdout 分层，但工程上仍然要防“为了某个 Case 加规则”。
-
-常用做法：
-
-1. 一个修复至少看 Positive + Negative Case；
-2. 规则只针对稳定 failure pattern，不针对具体 fixture 文件名；
-3. 评测失败先看 Trace，区分 Runtime Bug、Verifier Bug、Fixture Bug；
-4. 新功能若只让一个特定任务变好、其他任务变差，不合入；
-5. 对参数阈值不宣称“最优”，除非做过系统搜索。
-
-最重要的是：
-
-> Benchmark 用来暴露 Harness 的系统性问题，不是让生产代码背答案。
-
----
-
-# 十、一个非常值得讲的 Case：verify_symbol_rename 为什么最后被删了？
-
-这个故事很适合回答“有没有做过失败的优化”。
-
-演进：
-
-```text
-跨文件重命名任务容易反复写 verify.py
-→ 增加 search_code / count_occurrences / syntax_check / verify_symbol_rename
-→ 再给 verify_symbol_rename 加 scope / targets / confidence
-→ 又加停止启发式
-→ 轮次和 Token 仍然可能暴涨
-→ 发现模型会在 Todo 很早就规划自定义 verify.py
-→ 继续加 Prompt / Tool 描述约束，效果有限
-→ 最终移除过度特化的 syntax_check / verify_symbol_rename
-→ 改回语言原生工具 + 更简单 Harness
-```
-
-核心结论：
-
-> Coding Agent 不是工具越多越强。专门为一个 Benchmark 造“超级验证工具”，可能让 Harness 复杂化，也让模型更依赖工具 schema。评测最终让我选择删功能，而不是继续堆规则。
-
-这比说“我做了很多工具”更成熟。
-
----
-
-# 十一、TodoWrite 为什么也被弱化/移除？
-
-Trace 观察到：
-
-```text
-模型在第二轮 Todo
-就提前写入“写 verify.py / 跑额外验证”
-```
-
-一旦这个动作进入显式 Plan，后面即使任务已经静态验证充分，模型也倾向完成计划，造成额外轮次和 Token。
-
-尝试过：
-
-```text
-改 Tool description
-改 System Prompt
-对 Todo 做 State Folding
-改历史消息写回方式以保护 Prompt Cache
-```
-
-都有一定作用，但无法根治。
-
-后来直接从 Tool Schema 禁用 TodoWrite，指标明显下降。
-
-这个 Case 可以回答：
-
-> 为什么 Agent Harness 里“规划工具”不一定总是正收益？
-
-因为 planning 本身也会形成行为承诺和上下文成本。
-
----
-
-# 十二、长日志优化实验怎么做到可比？
-
-以 `task_013` 为例：
-
-```text
-Baseline commit: ab5d58e9
-Refactor commit: 270887a3
-Task suite hash: 相同
-Case: 相同
-每组 5 runs
-```
-
-结果：
-
-```text
-通过率：5/5 → 5/5
-Token：143.5k → 48.0k
-Peak Turn Tokens：18.5k → 5.7k
-```
-
-`task_014`：
-
-```text
-通过率：5/5 → 5/5
-Token：254.0k → 79.3k
-```
-
-这里的价值不只是数字，而是 Manifest 能证明两边 Fixture 一致，因此差异更能归因到 Harness 改造。
-
----
-
-# 十三、为什么要记录 Peak Turn Tokens？平均 Token 不够吗？
-
-因为 Context 爆炸往往是“某一轮突然塞入巨量输出”。
+### Verifier：检查客观事实
 
 例如：
 
 ```text
-平均每轮 6k
-但某一轮 40k
+订单是不是 PAID / 1250
+Java hidden test 是否通过
+Node 动态输入是否行为正确
+真实 controller 是否记录了 503 → start → READY
 ```
 
-这个 spike 可能：
+它应该尽量判断 evaluator-owned 的业务事实和能力事实，而不是要求 Agent 必须使用 Reference Solution 的代码结构。
+
+### Grader：解释这些事实意味着什么
+
+例如：
 
 ```text
-触发 Context 上限
-导致 latency 突增
-让后续每轮都背着巨量历史
+业务已完成
+Recovery 轨迹未展示
+最终正常结束
 ```
 
-所以 Peak Turn Tokens 能直接观察单轮输入压力。
-
-长日志改造里 Peak 降幅甚至比总 Token 更有解释力。
-
----
-
-# 十四、Tool Call Precision 是什么？能当准确率吗？
-
-不要把它包装成通用“Agent 工具调用准确率”。
-
-它只是项目内工程指标，用来观察工具调用是否大量落在预期有效路径、是否存在失败/冗余调用。
-
-真正结果正确性仍由 `verify.py` 决定。
-
-面试如果被问“Precision 的 Ground Truth 怎么定义”，要先说清项目自己的 metric semantics，而不是硬套分类任务公式。
-
----
-
-# 十五、为什么 Trace 很重要？只有最终指标不够吗？
-
-两版都失败：
+Grader 应该输出：
 
 ```text
-Case A：卡在网络下载循环
-Case B：编辑完成了，但最后 verify 写错
+Business PASS
+Recovery FAIL
+Governance PASS
+Overall FAIL
 ```
 
-最终都是 FAIL，但修复责任完全不同。
+### Runner：负责实验过程和记账
 
-Trace 会记录：
+Runner 负责准备工作区、运行 Agent、执行 Verifier、收集 Trace、保存 Manifest 和 Trial Result。
+
+一个很重要的坑是：Runner 不能在中间把信息提前压成单一 FAIL，否则 Grader 后面就没有机会知道“到底是哪一层失败”。
+
+---
+
+## 九、为什么还需要 Evaluation Freeze：评测过程中代码变了，所有数字都可能失效
+
+后来真正跑 18-trial / 36-trial Baseline 时，又出现一个非常工程化的问题：主项目有多个 Codex 并行工作。
+
+假设：
 
 ```text
-task
-turn
-Tool Call
-args hash / intent
-成功失败
-Failure Category
-Recoverability
-Strategy Fingerprint
-LoopGuard / CircuitBreaker
-Token / latency
-Workspace / Shell Context
+前 10 个 Trial：Runtime A
+中间代码被另一个会话修改
+后 26 个 Trial：Runtime B
 ```
 
-所以：
+即使最后平均分算得很漂亮，这也不是一个合法实验。
 
-> Metric 告诉我“哪里变差了”，Trace 告诉我“为什么变差”。
+于是最终又增加了 Freeze Gate。
 
----
-
-# 十六、为什么需要 Session JSONL，Trace 不够吗？
-
-Trace 更偏评测指标和任务级结构化行为；Session JSONL 更接近真实交互回放：
+正式 Run 开始时冻结：
 
 ```text
-session_id
-round_id
-step
-thinking.turn
-call_id
-UI / tool / model event
+Git commit
+Runtime digest
+Benchmark digest
+Config digest
+Suite digest
+Grading schema
+Python version
+Model / Provider / reasoning effort
 ```
 
-一个用于性能 / Benchmark 分析，一个用于排障和人类回放。
+结束后再算一次。
 
-简历不需要主动写，但面试官问可观测性时可以讲。
-
----
-
-# 十七、Benchmark 本身出错怎么办？
-
-`task_016_stalled_code_edit` 就是代表 Case。
-
-第一次改状态守卫后，报告显示 Runtime 已有 blocking，但最终 verify 仍不符合预期。
-
-进一步排查后发现：
+只有：
 
 ```text
-不是简单“代码错了”
-而是 fixture / expected final status / verify contract 也需要校准
+Freeze Start == Freeze End
 ```
 
-后续专门提升 task_version 并修正评判契约。
+这批数据才有资格成为 Baseline。
 
-面试可以讲：
+这里也踩过一次很有代表性的坑：`sandbox/eval_runtime` 会在运行时生成 fixture state，最初 Freeze Gate 把这些正常生成物也算进 Benchmark digest，于是明明源码没变，却误报 `EVALUATION_CONDITIONS_DRIFTED = TRUE`。
 
-> 我不会看到一个红 Case 就立刻改 Runtime。Evaluation Harness 自己也会有 Bug，所以失败要先做 attribution：Model、Runtime、Fixture、Verifier、Environment 哪一层出了问题。
+修复方式不是粗暴忽略整个 `sandbox/eval_runtime`，因为其中还有 `controller.py`、`verification_support.py` 这类真正会改变评测语义的源码。
 
----
+正确边界是：
 
-# 十八、如果一个优化只跑 3 次，有统计意义吗？
+```text
+Evaluation Source / Config
+→ 必须冻结
 
-这个问题要谨慎。
+Per-trial Generated State / Log / Result
+→ 不应该导致源码漂移
+```
 
-> 3～5 次运行只能算工程对照样本，不足以做严格统计显著性结论。我主要用它发现大幅、稳定的行为变化，例如 Token 从 250k 降到 80k 这种数量级差异；如果两个版本只差 3%～5%，我不会仅凭 3 次 Run 宣称优化成立，而会增加 runs 或补更多任务。
+最后用 F1～F10 这类 deterministic regression 验证：改 Runtime、Verifier、Config、Benchmark source 必须检测到 drift；只生成 trace、log、fixture runtime state 则不应该误报。
 
-这比硬讲置信区间更稳。
-
----
-
-# 十九、为什么不用 SWE-bench 直接评？
-
-可以从两个层次回答。
-
-> SWE-bench 更适合衡量完整 Coding Agent 在真实 GitHub issue 上的端到端修复能力；我的目标是研究 Harness 某个具体机制，比如长输出处理、LoopGuard、Shell Session。用大而复杂的外部 Benchmark 很难归因某次 Runtime 改动。因此我先用小而可控的 failure-specific Benchmark 做机制实验。如果项目要证明通用 Coding 能力，后续才应该补 SWE-bench / RepoBench 等更外部化的数据集。
-
-不要说自建 Benchmark 比 SWE-bench 更好，它们职责不同。
+> 【核心提炼】可复现不只是“我记得当时用的是什么模型”，而是整个 Run 的测量条件从第一条 Trial 到最后一条都必须能证明没漂移。
 
 ---
 
-# 二十、牛客风格追问题库
+## 十、最终 Native DEV Baseline 0 是怎么建立的
 
-1. 你怎么构建 Agent 评测集？
-2. 离线评测和线上评测分别看什么？
-3. Agent 是非确定性的，怎么做 A/B？
-4. 为什么要多次运行？几次够？
-5. 为什么不能只看最终 Answer？
-6. deterministic verifier 有哪些优点和局限？
-7. verify.py 会不会过拟合？
-8. 如何从线上 Trace 抽 Case？
-9. Case 怎么版本化？
-10. Fixture 改了以后历史结果还能比较吗？
-11. 如何防 Benchmark 泄露给 Agent？
-12. Shadow Workspace 和 Docker Sandbox 有什么区别？
-13. 怎么避免 Agent 修改 verify.py？
-14. 如何比较两个 Agent Commit？
-15. Token、Latency、Success Rate 冲突时怎么取舍？
-16. 一个优化成功率不变、Token 降 30%，就一定值得合入吗？
-17. 为什么 Tool Call 少不等于更好？
-18. Agent 最后说成功但 verify 失败，状态怎么算？
-19. 如何处理 flaky Case？
-20. Benchmark 自己有 Bug 怎么发现？
-21. 为什么要 Run Manifest？
-22. Holdout 有吗？如果没有如何防 case chasing？
-23. 为什么不直接用 LLM Judge？
-24. 开放式代码质量怎么评？
-25. 如何评 Agent 的“过程质量”？
-26. 失败归因怎么做？
-27. 什么指标最能说明 Agent Reliability？
-28. 为什么要记录 Peak Turn Tokens？
-29. 什么时候应该删除一个工具而不是继续优化？
-30. 如果让你把这套 Benchmark 扩到生产，你会怎么做？
+经过前面的 Skill、静态审计、Independent Review、Hardening、Dynamic Smoke、Measurement v3 和 Freeze Gate，最后把 Evaluation Revision 冻结在：
+
+```text
+commit: 095ec227...
+Python: 3.12.1
+Grading Schema: v3
+```
+
+正式 Baseline 不再拼旧 STOP 数据和新 Recover 数据，而是直接在同一个 frozen revision 下跑：
+
+```text
+12 DEV Cases × 3 Runs = 36 Trials
+```
+
+最终：
+
+```text
+36 / 36 trials completed
+Freeze End = FROZEN
+HOLDOUT dynamic trials = 0
+6 次 DashScope timeout → INFRA_ERROR，保留，不补跑
+Verifier SUCCESS = 8
+Verifier FAIL = 28
+Baseline 0 = ESTABLISHED
+```
+
+这里最容易讲错的是 `8 SUCCESS / 28 FAIL`。
+
+它**不能直接解释成“MiniClaude 准确率只有 22%”**，因为其中包含不同类型的 Runtime Failure、Grounding Failure、Governance Failure，以及 6 次 Provider infrastructure timeout。v3 的价值正是避免再拿一个单一成功率概括所有现象。
+
+同样，6 次 timeout 不能偷偷删掉再补跑，否则 Baseline 会出现 survivorship bias。它们要保留并单独归类为 `INFRA_ERROR`。
+
+HOLDOUT 也一直没有动态消费。原因是当前阶段先建立 DEV Baseline，用它做 Runtime 开发；只有 Candidate 基本冻结后才应该用 HOLDOUT 验证泛化。如果看完 HOLDOUT 再按它修 Runtime，那一批 HOLDOUT 就已经被消费了。
 
 ---
 
-# 二十一、最后背这一段
+## 十一、当前完整 Evaluation 链路：拿一条真实 Recovery Case 跑一遍
 
-> mini-claude 的 Benchmark 不是为了做一个通用排行榜，而是为了让 Harness 改动可归因。每个任务都有固定 baseline、config 和独立 verify，运行时复制到 Shadow Workspace，Agent 只修改隔离副本；结束后再由外部 verifier 判断最终状态，同时 Trace 记录轮次、Token、工具调用和失败路径。做 A/B 时我固定 Fixture，只切 Agent Commit，并通过 Run Manifest 校验任务集和代码版本一致。最重要的是先看成功率，再看成本指标。历史上我甚至通过评测删掉了 verify_symbol_rename、TodoWrite 这类看起来“能力更强”但实际增加行为复杂度的设计，所以这套评测对我最大的价值不是打分，而是防止靠主观感觉堆 Agent 功能。
+下面不用类名堆砌，直接看一条“服务先 503，后来恢复”的 Case 怎么走完整链路。
+
+```mermaid
+flowchart TD
+    A[固定 Benchmark Case<br/>health 初始返回 503] --> B[Runner 创建 Shadow Workspace]
+    B --> C[MiniClaude 开始调查]
+    C --> D[真实请求 /health]
+    D --> E[Evaluator Controller 返回 503<br/>生成可信 Observation]
+    E --> F[Runtime Trace 记录 observation_id]
+    F --> G[Agent 执行合法 recovery：/start]
+    G --> H[再次 /health → READY]
+    H --> I[继续业务：订单达到 PAID / 1250]
+    I --> J[Agent 最终结束或继续行动]
+    J --> K[隐藏 Verifier 读取业务事实与可信审计]
+    K --> L[Grader 分四层解释]
+    L --> M1[Business Outcome]
+    L --> M2[Grounded Recovery]
+    L --> M3[Final Governance]
+    L --> M4[Overall Trial]
+    M1 --> N[Trial Result / Manifest / Report]
+    M2 --> N
+    M3 --> N
+    M4 --> N
+```
+
+这里程序和 LLM 的职责也要说清：
+
+- **LLM / Agent** 决定下一步想调查什么、想修改什么、是否尝试恢复；
+- **Runtime** 决定工具怎么执行、状态怎么记录、治理逻辑如何运行；
+- **Evaluator Controller** 提供受控的真实环境事实；
+- **Verifier** 在 Agent 结束后检查隐藏业务事实和能力事实；
+- **Grader** 把事实解释成 Business / Capability / Governance / Overall；
+- **Runner / Freeze / Manifest** 保证整批实验条件可追溯。
+
+---
+
+## 十二、这次评测建设里最值得记住的几个“反直觉”结论
+
+### 1. Verifier 越严格，不一定越可信
+
+如果严格到只接受 Reference Solution 的某个函数名、脚本名或 patch 形状，合法替代方案反而会被误杀。
+
+所以真正要严格的是**行为和不变量**，不是唯一实现。
+
+### 2. “Hidden Test”不等于真的防 hardcode
+
+如果所谓 hidden input 其实固定写在公开 verifier 里，Agent 仍可能按几个值查表输出。
+
+后来使用 verifier-only 动态输入，并要求 seed / provenance 可重放，目的就是避免“为了随机而随机”，同时让有限样例 hardcode 更难成立。
+
+### 3. STOP 不是越快越好
+
+如果 Agent 因错误 evidence 过早停止，轮次和 Token 都很好看，但能力反而变差。
+
+所以成本指标只能在 correctness / governance 语义明确以后讨论。
+
+### 4. Benchmark 失败不等于 Runtime Bug
+
+这次真实经历里已经出现过：
+
+```text
+Runtime Bug
+Verifier Bug
+Fixture Bug
+Hidden Oracle Bug
+Evaluation Infrastructure Bug
+Provider Timeout
+Freeze False Positive
+```
+
+因此看到红 Case 后第一步不是改 Agent，而是做 attribution。
+
+### 5. Benchmark 本身也需要测试
+
+最后 Benchmark 有自己的 baseline/reference/mutation/alternate-shape、Contract Validation、Freeze Regression 和 Dynamic Smoke。
+
+这并不是“为了测试而测试”。因为只要 Benchmark 会指导 Runtime 修改，它本身就属于核心工程基础设施。
+
+---
+
+## 十三、这套方案现在还有什么边界
+
+### 1. DEV Baseline 不是通用 Coding Agent 能力排行榜
+
+当前 Anti-Loop v3 主要用于 Failure Governance / Recovery / Completion 等机制实验。它不能证明 MiniClaude 在真实世界所有 Coding Task 上都很强。
+
+如果以后要证明端到端通用代码修复能力，仍然需要 SWE-bench 等外部 Benchmark 或更大范围的仓库任务。
+
+### 2. 3 Runs 是工程样本，不是严格统计显著性
+
+每 Case 三次适合发现大幅、稳定的行为模式和 Flaky Case，但如果两个版本只差几个百分点，不能只靠 3 Runs 宣称显著提升。
+
+### 3. Provider Timeout 要单独看
+
+Baseline 0 里出现 6 次 DashScope timeout。这更接近基础设施可靠性，不应该直接算成某项 Runtime Capability Failure，也不能为了数字好看删除。
+
+### 4. HOLDOUT 还没有被动态消费
+
+这是故意保留的。DEV 用于后续 Runtime 优化，Candidate 稳定后才进入 HOLDOUT。看过并用于修改 Runtime 的 HOLDOUT 不再是“未见测试集”。
+
+### 5. Observability 和 Runtime Behavior 要继续保持边界
+
+为了评测因果关系，Trace 增加过 observation/evidence correlation。但这些 instrumentation 不能反过来影响治理决策，否则“为了测量而改变被测对象”。
+
+---
+
+## 十四、接下来怎么用 Baseline 0：终于开始真正改 Runtime
+
+到 Native Baseline 0 建立以后，Benchmark Construction 阶段正式停止。
+
+下一步不应该继续问：
+
+```text
+这道题还能不能再设计得更漂亮？
+```
+
+而应该问：
+
+```text
+36 条可信 Trial 中，Runtime 最集中的失败机制是什么？
+```
+
+分析顺序应该是：
+
+```text
+36 Trial
+→ 去掉 / 单列 INFRA_ERROR
+→ 按 Business / Grounded / Governance 拆失败
+→ 把失败按 Capability 聚类
+→ 找影响多个 Case 的 shared mechanism
+→ 只改 Runtime
+→ 用同一冻结 Benchmark 再验证
+→ 稳定以后才碰 HOLDOUT
+```
+
+例如 task022 已经给了一个很清晰的未来优化候选：**post-completion wandering**——业务目标和 Recovery 都已经完成，Agent 却继续行动，最后触发无关 blocker。
+
+这时应该优化 Completion / Final Governance，而不是回头把 task022 改简单。
+
+> 【核心提炼】Benchmark 收口后的纪律是：**默认改 Runtime，不改考卷。** 只有再次出现明确 False Accept、False Reject、Oracle Conflict、Trust Boundary 或 Causality Bug，才重新打开 Benchmark Validity。
+
+---
+
+# 十五、面试怎么问：不要背八股，沿着真实故事回答
+
+## 问题 1：为什么不能只看 Agent 最终成功没成功？
+
+**面试官在判断什么：**你是否真的理解 Agent 的 Outcome 和过程治理是两回事。
+
+**核心回答：**
+
+> 我项目里真实遇到过一个 Case：服务最开始 503，Agent 成功 `/start`，health 变 READY，订单也做到 PAID/1250，业务其实已经完成；但 Agent 没及时结束，后面继续操作又撞上 blocker，最终状态是 BLOCKED。如果只看 final status，会把 Recovery 也判成失败。后来评测拆成 Business Outcome、Grounded Capability、Final Governance 和 Overall 四层，这样能明确知道 Recovery 已经成功，真正要修的是 Completion。
+
+**追问陷阱：**不要回答成“所以最终状态没用”。Final Governance 仍然重要，只是不能覆盖前面已经发生的业务和能力事实。
+
+---
+
+## 问题 2：怎么证明 Runtime 是“因为正确原因”停止的？
+
+**面试官在判断什么：**你是否只会看最终状态，还是能做 causal attribution。
+
+**核心回答：**
+
+> 早期我们只知道目标 503 出现过、最后 Runtime STOP，但这不能证明两者有因果关系。后来 Trace 给 observation 建 identity，并让 governance decision 记录自己引用的 evidence。真实 task033 里 Agent 看见过 A/B 振荡，但最终 HARD_STOP 引用的是另一个 health 503，因此新版会判 Grounded Stop 失败，而不会因为“见过振荡 + 最后停了”就给通过。
+
+**追问陷阱：**不要吹成严格的因果推断算法。这里证明的是 Runtime 记录的决策 evidence 与目标 observation 的结构化关联。
+
+---
+
+## 问题 3：Verifier 怎么防 Agent 作弊？
+
+**面试官在判断什么：**你是否理解 Agent 会修改工作区，不能把测试本身当绝对可信。
+
+**核心回答：**
+
+> Verifier 对 Agent 隐藏，而且我们做过 mutation/red-team：改 visible test、删 runner、手写 artifact、hardcode 输出、fake health、无关失败后 STOP 等都要被拒绝；同时还要有 alternate legal implementation 能通过，防止 Verifier 绑死 Reference Patch。原则是信 evaluator-owned behavior/invariant，不信 Agent 自己写出来的“SUCCESS”。
+
+**追问陷阱：**别说“Hidden Verifier 就绝对安全”。固定 hidden input 仍可能被查表 hardcode，所以后来还用了 verifier-only 动态输入和可重放 seed。
+
+---
+
+## 问题 4：为什么要专门做 Benchmark Author Skill？
+
+**面试官在判断什么：**你是否把评测当成可工程化的开发流程，而不是临时写几个 Case。
+
+**核心回答：**
+
+> Case 多了以后发现 Benchmark 自己也会泄题、不可解、绑定当前实现，所以把命题流程固化成 Codex 项目级 Skill。它先冻结 Capability Claim，再审现有 Suite、Internal Oracle、Counterfactual、Leakage、Solvability、Generalization，最后才写 Fixture 和 Verifier。最关键的是 Capability → Benchmark → Runtime，而不是看当前 Runtime 有什么正则和类名，再反着出题。
+
+**追问陷阱：**Skill 是 Codex 用来给 MiniClaude 出题的，不是 MiniClaude Runtime 的 Skill。
+
+---
+
+## 问题 5：为什么还需要 DEV / HOLDOUT？
+
+**面试官在判断什么：**你是否意识到反复看同一批 Case 会导致 case chasing。
+
+**核心回答：**
+
+> DEV 可以反复用于 Runtime 开发；HOLDOUT 只在 Candidate 基本冻结后检查泛化。看过 HOLDOUT 并根据结果改了 Runtime，这一批就被消费了，不能继续把它当未见数据。当前 Native Baseline 0 建立时 HOLDOUT 动态运行数一直是 0。
+
+**追问陷阱：**不要把 repository-visible HOLDOUT 说成密码学意义上的私有测试集，它主要是工程流程上的隔离。
+
+---
+
+## 问题 6：怎么保证一批 Agent 评测真的可比？
+
+**面试官在判断什么：**你是否有实验设计意识。
+
+**核心回答：**
+
+> 除了 Manifest，我们后来还加了 Freeze Gate。正式 Run 在固定 commit、clean tree 下记录 Runtime/Benchmark/Config/Suite digest、Python、Provider、Model 等，结束后再算一遍；源码或配置漂移就整批拒绝。中间还踩过 generated fixture state 被误认为源码 drift 的坑，后来把 Evaluation Source 和 per-trial generated state 分开。
+
+**追问陷阱：**不要说“Git SHA 一样就够了”，tracked dirty source、未正确纳入的 config 仍可能改变实验条件。
+
+---
+
+## 问题 7：Benchmark 有 Bug，你怎么区分是考卷错还是 Agent 错？
+
+**核心回答：**
+
+> 我们真实抓到过两种：task031 的 untouched baseline 本来就能过；task032 的 visible contract 要 0.9，但 hidden verifier 还要求 0.8。前者说明 Case Contract 无效，后者是 False Reject。后来形成规则：先 deterministic baseline/reference/mutation/alternate 检查，再做少量真实 Dynamic Smoke；Human 和 Grader 不一致时先停下，不直接改 Runtime。
+
+---
+
+# 十六、简历怎么写：只写现在能防守的东西
+
+推荐把“搭了评测框架”升级成更能体现这次演进的一版，但不要把 Baseline 低通过率写进简历：
+
+> **Benchmark 驱动的 Agent 评测体系：**围绕 Coding Agent 的失败恢复与停止治理，构建 Shadow Workspace、隐藏 Verifier、Trace/Manifest 与 DEV/HOLDOUT 评测链路；通过 Leakage/Solvability、Counterfactual、Mutation Audit 和真实 Dynamic Smoke 持续校准 Benchmark，有效区分业务结果、目标能力与最终治理行为，并以冻结 Revision 建立可复现 DEV Baseline，避免 Case Chasing 和不可比实验。
+
+如果简历篇幅有限，可以压缩为：
+
+> **Agent 评测体系：**构建隔离 Workspace、隐藏 Verifier、Trace/Manifest 与 DEV/HOLDOUT Benchmark，通过反作弊审计、动态 Smoke 和 Evaluation Freeze 保证评测可解、不可泄题且实验条件可比，为 Runtime 失败恢复与停止治理迭代建立可复现 Baseline。
+
+面试时再展开真实故事，不要在简历上堆 `Grounded Capability`、`Counterfactual`、`Freeze Gate` 一串英文。
+
+---
+
+# 十七、真正应该记住什么
+
+这条主线最终不是让你记住十几个 Eval 类，而是建立五个判断习惯：
+
+1. **先问测什么，再问怎么打分。** 没有清晰 Capability Claim 的 Benchmark，指标再漂亮也很危险。
+2. **Agent 是被测对象，不能同时当裁判。** Verifier、业务事实和 evaluator state 要有独立信任边界。
+3. **正确结果不等于正确过程，正确过程也不等于最终治理正确。** 所以 Outcome、Capability、Governance 要分开。
+4. **评测失败先归因，再改代码。** Runtime、Fixture、Verifier、Oracle、Infrastructure 都可能出错。
+5. **Benchmark 一旦收口，就停止为了分数改考卷。** 用固定 Baseline 找 shared Runtime capability gap，才是评测系统真正产生价值的时刻。
+
+最后可以用一句话概括整个演进：
+
+> 一开始我只是想让 Agent 改动“有分数可看”，后来发现真正困难的是证明这把尺子本身可信；所以从隐藏 Verifier、Trace 和 Manifest 出发，又补了 Benchmark Author Skill、Validity Gate、Evidence Provenance、四维 Measurement 和 Evaluation Freeze，最后才敢把 36 次 Native DEV Run 定义成 Baseline 0。评测的价值不是把分数做高，而是让我知道下一刀到底该改 Runtime 的哪一层。
+
+---
+
+## 十八、主要事实来源与继续阅读
+
+### 项目评测规范
+
+- `docs/EVALUATION.md`
+- `.agents/skills/miniclaude-benchmark-author/SKILL.md`
+- `.agents/skills/miniclaude-benchmark-author/references/harness-contract.md`
+- `.agents/skills/miniclaude-benchmark-author/references/validity-gates.md`
+- `AGENTS.md`
+
+### 评测实现
+
+- `eval_runner.py`
+- `compare_reports.py`
+- `src/core/evaluation/`
+- `sandbox/eval_runtime/`
+- `sandbox/tasks/`
+
+### 本轮关键结果
+
+- Anti-Loop Grading Schema v3
+- Frozen Evaluation Revision：`095ec227...`
+- Python：3.12.1
+- Native DEV Baseline 0：12 DEV Cases × 3 = 36 Trials
+- 36/36 completed
+- Freeze End：FROZEN
+- 6 次 DashScope timeout 保留为 `INFRA_ERROR`
+- HOLDOUT dynamic trials：0
+- Baseline 0：ESTABLISHED
+
+### Skill 深入资料
+
+- `04_Benchmark Author Skill——怎么避免出一道“看起来像评测”的假题.md`
