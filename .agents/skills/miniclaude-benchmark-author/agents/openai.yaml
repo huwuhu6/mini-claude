@@ -1,0 +1,7 @@
+interface:
+  display_name: "MiniClaude Benchmark Author"
+  short_description: "Design and audit mini-claude Benchmark Families"
+  default_prompt: "Use $miniclaude-benchmark-author to design or generate a valid mini-claude Benchmark Family for a Runtime capability."
+
+policy:
+  allow_implicit_invocation: true
