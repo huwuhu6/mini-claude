@@ -1,5 +1,6 @@
 import os
 import ast
+import codecs
 import re
 import tempfile
 import logging
@@ -17,11 +18,43 @@ if TYPE_CHECKING:
 
 logger = logging.getLogger(__name__)
 
+# Shared output/resource limits.  Tool-specific limits below are derived from
+# these values so a caller cannot trade one unbounded output path for another.
+TOOL_OUTPUT_MAX_CHARS = 120_000
+TOOL_OUTPUT_MAX_BYTES = 300 * 1024
+TOOL_OUTPUT_PREVIEW_CHARS = 4_000
+FILE_READ_CHUNK_BYTES = 64 * 1024
+
 # Backend limits for read_file.  These are hard bounds even when the model
 # supplies an explicit end_line; max_lines remains only a caller-facing hint.
 READ_FILE_MAX_LINES = 200
 READ_FILE_MAX_CHARS = 100_000
 READ_FILE_MAX_BYTES = 256 * 1024
+SEARCH_CODE_MAX_CONTEXT_LINES = 50
+
+
+def _truncate_utf8(text: str, max_chars: int, max_bytes: int) -> str:
+    """Truncate text by both character and UTF-8 byte limits."""
+    limited = (text or '')[:max_chars]
+    encoded = limited.encode('utf-8')
+    if len(encoded) <= max_bytes:
+        return limited
+    return encoded[:max_bytes].decode('utf-8', errors='ignore')
+
+
+def _bound_tool_output(text: str, notice: str = '') -> str:
+    """Keep a tool result below the absolute shared output bound."""
+    text = text or ''
+    if (len(text) <= TOOL_OUTPUT_MAX_CHARS
+            and len(text.encode('utf-8')) <= TOOL_OUTPUT_MAX_BYTES):
+        return text
+    suffix = f"\n\n{notice}" if notice else ''
+    bounded = _truncate_utf8(
+        text,
+        max(0, TOOL_OUTPUT_MAX_CHARS - len(suffix)),
+        max(0, TOOL_OUTPUT_MAX_BYTES - len(suffix.encode('utf-8'))),
+    )
+    return bounded + suffix
 
 
 @dataclass
@@ -228,9 +261,17 @@ class BaseTools:
             saved_path = f"<failed: {exc}>"
 
         code = exit_code if exit_code is not None else (0 if success else 1)
-        head = "\n".join(lines[:10]) or "(empty)"
-        tail = "\n".join(lines[-20:]) or "(empty)"
-        return (
+        head = _truncate_utf8(
+            "\n".join(lines[:10]) or "(empty)",
+            TOOL_OUTPUT_PREVIEW_CHARS,
+            TOOL_OUTPUT_PREVIEW_CHARS * 4,
+        )
+        tail = _truncate_utf8(
+            "\n".join(lines[-20:]) or "(empty)",
+            TOOL_OUTPUT_PREVIEW_CHARS,
+            TOOL_OUTPUT_PREVIEW_CHARS * 4,
+        )
+        formatted = (
             f"[Command executed with exit code {code}]\n"
             f"[Output is too long (Total {total_lines} lines / {total_chars} chars). "
             "Truncated for context efficiency.]\n"
@@ -242,16 +283,92 @@ class BaseTools:
             "[Tip]: Use `search_code` or `read_file` with line ranges on the saved "
             "log file to inspect specific errors or sections."
         )
+        return _bound_tool_output(
+            formatted,
+            "⚠️ 工具输出预览达到硬上限，已进一步截断；请使用保存的日志路径分段读取。",
+        )
 
     @staticmethod
-    def _read_lines(file_path: Path, encoding: str):
-        """Read file with the given encoding and return (lines_list, total_lines).
+    def _read_file_window(file_path: Path, encoding: str,
+                          start_line: int, end_line: int):
+        """Stream a file while retaining only the requested bounded window.
 
-        Raises UnicodeDecodeError when the encoding cannot decode the file.
+        The whole file is still scanned to report its line count, but neither
+        a full ``read()`` nor an unbounded line buffer is used.  Incremental
+        decoding keeps UTF-8 validation behavior while limiting retained text
+        from a single pathological line.
         """
-        with open(file_path, 'r', encoding=encoding) as f:
-            lines = f.read().splitlines(keepends=False)
-        return lines, len(lines)
+        selected: List[str] = []
+        total_lines = 0
+        current_line = 1
+        decoder = codecs.getincrementaldecoder(encoding)(errors='strict')
+        captured: List[str] = []
+        captured_chars = 0
+        window_chars = 0
+        line_started = False
+        selected_line_truncated = False
+        window_truncated = False
+
+        def feed(part: bytes) -> None:
+            nonlocal captured_chars, window_chars, line_started
+            nonlocal selected_line_truncated
+            if part:
+                line_started = True
+            decoded = decoder.decode(part, final=False)
+            if not (start_line <= current_line <= end_line):
+                return
+            remaining = READ_FILE_MAX_CHARS - window_chars - captured_chars
+            if remaining > 0:
+                piece = decoded[:remaining]
+                captured.append(piece)
+                captured_chars += len(piece)
+            if len(decoded) > remaining:
+                selected_line_truncated = True
+
+        def finish_line() -> None:
+            nonlocal total_lines, current_line, decoder, window_truncated
+            nonlocal captured, captured_chars, window_chars, line_started
+            nonlocal selected_line_truncated
+            decoded_tail = decoder.decode(b'', final=True)
+            if start_line <= current_line <= end_line:
+                remaining = READ_FILE_MAX_CHARS - window_chars - captured_chars
+                if remaining > 0:
+                    captured.append(decoded_tail[:remaining])
+                    captured_chars += min(len(decoded_tail), remaining)
+                if len(decoded_tail) > remaining:
+                    selected_line_truncated = True
+                window_truncated = window_truncated or selected_line_truncated
+                text = ''.join(captured)
+                if text.endswith('\r'):
+                    text = text[:-1]
+                selected.append(text)
+                window_chars += len(text)
+            total_lines += 1
+            current_line += 1
+            decoder = codecs.getincrementaldecoder(encoding)(errors='strict')
+            captured = []
+            captured_chars = 0
+            line_started = False
+            selected_line_truncated = False
+
+        with open(file_path, 'rb') as file_handle:
+            while True:
+                chunk = file_handle.read(FILE_READ_CHUNK_BYTES)
+                if not chunk:
+                    break
+                parts = chunk.split(b'\n')
+                for index, part in enumerate(parts):
+                    feed(part)
+                    if index < len(parts) - 1:
+                        finish_line()
+
+        if line_started:
+            finish_line()
+
+        # The flag is meaningful only for the selected window.  The final
+        # _limit_read_output pass remains the byte guard.
+        body = '\n'.join(selected)
+        return selected, total_lines, window_truncated
 
     def read_file(self, path: str, start_line: int = None,
                   end_line: int = None,
@@ -289,12 +406,26 @@ class BaseTools:
             if not file_path.is_file():
                 return ToolResult(f"错误: 路径不是文件: {path}", success=False)
 
+            # Resolve the bounded requested window before streaming.  The
+            # final total line count is discovered during the same scan.
+            start = 1 if start_line is None else max(1, int(start_line))
+            line_limit = min(max(1, int(max_lines)), READ_FILE_MAX_LINES)
+            requested_end_hint = (
+                start + line_limit - 1
+                if end_line is None
+                else min(start + line_limit - 1, int(end_line))
+            )
+
             # ── Read with encoding fallback ──────────────────────────
             try:
-                lines, total_lines = self._read_lines(file_path, 'utf-8')
+                lines, total_lines, window_truncated = self._read_file_window(
+                    file_path, 'utf-8', start, requested_end_hint,
+                )
             except UnicodeDecodeError:
                 try:
-                    lines, total_lines = self._read_lines(file_path, 'latin-1')
+                    lines, total_lines, window_truncated = self._read_file_window(
+                        file_path, 'latin-1', start, requested_end_hint,
+                    )
                 except Exception as e:
                     return ToolResult(
                         f"读取文件时出错（编码问题）: {str(e)}", success=False,
@@ -303,10 +434,6 @@ class BaseTools:
                 logger.error(f"读取文件 {path} 出错: {e}")
                 return ToolResult(f"错误: {str(e)}", success=False)
 
-            # Resolve slice boundaries (1-based inclusive)
-            start = 1 if start_line is None else max(1, int(start_line))
-
-            line_limit = min(max(1, int(max_lines)), READ_FILE_MAX_LINES)
             requested_end = (
                 total_lines if end_line is None
                 else min(total_lines, int(end_line))
@@ -321,8 +448,9 @@ class BaseTools:
                     success=False,
                 )
 
-            # Slice the line list (convert 1-based → 0-based indexing)
-            chunk = lines[start - 1:end]
+            # The streaming reader already retained exactly this bounded
+            # window; no full-file list or second slice is needed.
+            chunk = lines[:end - start + 1]
 
             # Build anchor-delimited output (no per-line prefix)
             output_parts = [
@@ -333,7 +461,7 @@ class BaseTools:
             output_parts.append(limited_body)
 
             line_truncated = end < requested_end
-            char_truncated = len(limited_body) < len(body)
+            char_truncated = window_truncated or len(limited_body) < len(body)
             if line_truncated or char_truncated:
                 reasons = []
                 if line_truncated:
@@ -351,7 +479,10 @@ class BaseTools:
                 )
 
             output_parts.append(f"--- END FILE: {path} ---")
-            output = '\n'.join(output_parts)
+            output = _bound_tool_output(
+                '\n'.join(output_parts),
+                "⚠️ read_file 输出达到硬上限，已截断；请使用提示中的行窗口继续读取。",
+            )
 
             logger.debug(
                 f"读取文件: {path} [{start}-{end}/{total_lines} 行] "
@@ -367,11 +498,7 @@ class BaseTools:
     @staticmethod
     def _limit_read_output(content: str) -> str:
         """Apply character and UTF-8 byte limits without splitting a codepoint."""
-        limited = content[:READ_FILE_MAX_CHARS]
-        encoded = limited.encode('utf-8')
-        if len(encoded) <= READ_FILE_MAX_BYTES:
-            return limited
-        return encoded[:READ_FILE_MAX_BYTES].decode('utf-8', errors='ignore')
+        return _truncate_utf8(content, READ_FILE_MAX_CHARS, READ_FILE_MAX_BYTES)
 
     def write_file(self, path: str, content: str) -> ToolResult:
         """
@@ -798,7 +925,9 @@ class BaseTools:
             return ToolResult("错误: 需要至少提供一个模式 (patterns)", success=False)
 
         try:
-            context_lines = max(0, int(context_lines))
+            context_lines = min(
+                max(0, int(context_lines)), SEARCH_CODE_MAX_CONTEXT_LINES,
+            )
             max_matches = max(1, min(200, int(max_matches)))
         except (ValueError, TypeError):
             return ToolResult("错误: 数值参数无效", success=False)
@@ -980,7 +1109,10 @@ class BaseTools:
         if file_warnings:
             result_parts.append("\n警告日志:\n" + "\n".join(file_warnings))
 
-        return ToolResult("\n".join(result_parts))
+        return ToolResult(_bound_tool_output(
+            "\n".join(result_parts),
+            "⚠️ search_code 输出达到硬上限，结果已截断；请缩小 paths、patterns 或 context_lines。",
+        ))
 
     # ── count_occurrences ────────────────────────────────────────────
 

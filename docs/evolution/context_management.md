@@ -65,3 +65,24 @@ Transcript retention 现在会在 Compressor 初始化时加载目录中的有�
 ### Decision / Limitation
 
 根据当前项目主线，本轮不修改 Anthropic 等非 OpenAI-compatible Provider 适配，不实现 Hot Context peek/deliver/ack，也不修改 MessageBus、Inbox、Team 或 Background 投递语义。CTX-006 留作 follow-up；Provider-aware Budget、Summary 架构和长期 Memory 同样不在本轮范围内。
+
+## 2026-09-11
+
+Commit: `PENDING`
+Commit Description: `fix(context): 修复 Mainline Context Foundation 审计缺陷`
+
+### Description
+
+Final Audit 发现了三组会直接破坏 Context correctness 的问题。压缩在没有可压缩 middle segment 时仍会插入摘要并制造 Transcript，OpenAI-compatible Provider 的 malformed response 会被伪装成空 assistant 响应；工具输出还可能被巨型单行或过大的搜索上下文绕过边界，`read_file` 则会在返回小窗口前全量读入文件。Transcript 初始化、重复 ID 以及保存/删除 I/O 失败也可能让内存索引与磁盘事实静默分叉。
+
+本阶段在现有机制上做最小修复：空 middle 直接 no-op；Deepseek parser 对缺少 choices、非法 message 和 malformed tool call 抛出明确错误，但合法 response 缺失 usage 时使用零值；Bash/search_code 使用共享的输出边界，`read_file` 改为有界分块扫描并只保留请求窗口。Transcript 在加载后立即执行 retention，重复 ID 保留最新有效记录并清理重复文件，持久化写入成功后才发布到内存索引，删除失败则保留记录并记录警告。
+
+### Result / Evidence
+
+新增 deterministic regression tests 覆盖 Audit 001~009：空 middle 的 4/10/15/17 条消息连续压缩保持 no-op；Provider malformed response 在 assistant 写入前进入 Agent FAILED 路径；工具巨型单行、超大 `context_lines` 和超长文件均受字符/字节边界约束；read_file 使用固定大小分块读取；初始化 retention、重复 Transcript ID 以及 save/unlink 失败均可观察。相关 Context 测试通过；未运行真实 Provider Benchmark 或 Evaluation。
+
+Audit 009 不再在 Agent 主循环中建设第二套 validator，而是由 parser 在 durable message append 前拒绝 malformed response，并补充 sanitizer 的少量类型防御，因此标记为 `RESOLVED_BY_OTHER_FIX`。
+
+### Decision / Limitation
+
+本阶段保留 recent 15、0.7 micro-compaction 阈值和现有摘要策略。删除 Transcript 遇到文件系统拒绝时，索引保留该 durable record，因而 retention 只能保持可观察的一致性而不能绕过外部 I/O 故障。没有引入事务日志、Provider-aware Budget、Summary 新算法、Project Context、长期 Memory、Anthropic compatibility、Multi-Agent、Team、Inbox/MessageBus 或 Background delivery 机制；Hot Context 的 CTX-006 继续作为 follow-up。

@@ -61,7 +61,7 @@ class Compressor:
     def __init__(self, config: Optional[Dict[str, Any]] = None):
         cfg = config or {}
         self.token_threshold = cfg.get('token_threshold', 100000)
-        self.max_transcripts = cfg.get('max_transcripts', 100)
+        self.max_transcripts = max(0, int(cfg.get('max_transcripts', 100)))
         self._transcripts: Dict[str, CompressedTranscript] = {}
         self._transcript_dir: Optional[Path] = None
         self._provider: Any = None  # LLMProvider for real summarization
@@ -71,6 +71,7 @@ class Compressor:
             self._transcript_dir = Path(transcript_dir)
             self._transcript_dir.mkdir(parents=True, exist_ok=True)
             self._load_persisted_transcripts()
+            self._prune_old_transcripts()
 
     def set_provider(self, provider: Any) -> None:
         """Inject an LLM provider for AI-powered summarization.
@@ -292,6 +293,10 @@ class Compressor:
 
         # Summarize the middle
         middle = messages[2:tail_start]
+        if not middle:
+            # A summary without a source segment would expand the history and
+            # create a false compression event on every subsequent turn.
+            return messages
         summary = self._generate_summary(middle)
         if not isinstance(summary, str) or not summary.strip():
             logger.warning("Full Compression 未生成可用摘要，保留原始消息")
@@ -403,7 +408,8 @@ class Compressor:
         for msg in messages:
             if msg.role == 'assistant' and msg.tool_calls:
                 for tc in msg.tool_calls:
-                    from_assistant.add(tc.get('id', ''))
+                    if isinstance(tc, dict) and tc.get('id'):
+                        from_assistant.add(tc['id'])
             elif msg.role == 'tool' and msg.tool_call_id:
                 from_tool.add(msg.tool_call_id)
 
@@ -417,7 +423,10 @@ class Compressor:
                     valid_ids.discard(msg.tool_call_id)
                     cleaned.append(msg)
             elif msg.role == 'assistant' and msg.tool_calls:
-                valid = [tc for tc in msg.tool_calls if tc.get('id', '') in valid_ids]
+                valid = [
+                    tc for tc in msg.tool_calls
+                    if isinstance(tc, dict) and tc.get('id', '') in valid_ids
+                ]
                 if valid:
                     new = copy.deepcopy(msg)
                     new.tool_calls = valid
@@ -530,6 +539,7 @@ class Compressor:
         if not self._transcript_dir or not self._transcript_dir.exists():
             return
 
+        candidates: Dict[str, List[CompressedTranscript]] = {}
         for path in self._transcript_dir.glob("transcript_*.json"):
             try:
                 with path.open('r', encoding='utf-8') as f:
@@ -550,9 +560,38 @@ class Compressor:
                     created_at=float(data.get('created_at', path.stat().st_mtime)),
                     store_path=str(path),
                 )
-                self._transcripts[transcript.id] = transcript
+                filename_id = path.name[len("transcript_"):-len(".json")]
+                if filename_id != transcript.id:
+                    logger.warning(
+                        "Transcript 文件名 ID 与内容 ID 不一致: %s -> %s",
+                        path,
+                        transcript.id,
+                    )
+                candidates.setdefault(transcript.id, []).append(transcript)
             except (OSError, TypeError, ValueError, json.JSONDecodeError) as exc:
                 logger.warning("跳过无效 Transcript %s: %s", path, exc)
+
+        for transcript_id, entries in candidates.items():
+            # If duplicate artifacts claim one ID, retain the newest valid
+            # record (path name is a deterministic tie-breaker) and remove
+            # the other managed artifacts.  They must not silently become
+            # unmanaged files after the in-memory dict collapses the ID.
+            canonical = max(
+                entries,
+                key=lambda item: (item.created_at, item.store_path or ""),
+            )
+            self._transcripts[transcript_id] = canonical
+            for duplicate in entries:
+                if duplicate is canonical or not duplicate.store_path:
+                    continue
+                try:
+                    Path(duplicate.store_path).unlink()
+                except OSError as exc:
+                    logger.warning(
+                        "删除重复 Transcript %s 失败，已从索引排除: %s",
+                        duplicate.store_path,
+                        exc,
+                    )
 
     def _prune_old_transcripts(self) -> None:
         """Apply retention to both in-memory and persisted transcripts."""
@@ -562,15 +601,19 @@ class Compressor:
         )
         while len(transcripts) > self.max_transcripts:
             old = transcripts.pop(0)
-            self._transcripts.pop(old.id, None)
             if old.store_path:
                 try:
                     Path(old.store_path).unlink()
-                except OSError:
-                    pass
+                except OSError as exc:
+                    # Keep the index aligned with the durable record when
+                    # deletion fails; silently dropping it would make a
+                    # later process rediscover the same retained artifact.
+                    logger.warning("删除旧 Transcript %s 失败: %s", old.store_path, exc)
+                    continue
+            self._transcripts.pop(old.id, None)
 
-    def _save_transcript(self, transcript: CompressedTranscript) -> None:
-        self._transcripts[transcript.id] = transcript
+    def _save_transcript(self, transcript: CompressedTranscript) -> bool:
+        """Persist a transcript before publishing it in the in-memory index."""
         if self._transcript_dir:
             path = self._transcript_dir / f"transcript_{transcript.id}.json"
             transcript.store_path = str(path)
@@ -580,8 +623,11 @@ class Compressor:
                     json.dump(transcript.to_dict(), f, indent=2)
             except Exception as e:
                 logger.error(f"保存对话记录失败: {e}")
+                return False
 
+        self._transcripts[transcript.id] = transcript
         self._prune_old_transcripts()
+        return True
 
     def get_transcripts(self) -> List[CompressedTranscript]:
         return sorted(self._transcripts.values(),
