@@ -25,6 +25,7 @@ class ObservationEvidence:
     recoverability: str = ""
     evidence_text: str = ""
     source: str = ""
+    resolution_evidence: str = ""
 
 
 class ObservationNormalizer:
@@ -38,6 +39,17 @@ class ObservationNormalizer:
     )
     _JSON_STATUS = re.compile(
         r"[\"']status_code[\"']\s*:\s*([45]\d\d)", re.IGNORECASE
+    )
+    _HEALTHY_HTTP = re.compile(
+        r"HTTP(?:/\d(?:\.\d)?)?\s*(?:OK\s*)?(2\d\d)|"
+        r"HTTP_CODE\s*[=:]\s*(2\d\d)|"
+        r"status[_ ]?code\s*[=:]\s*[\"']?(2\d\d)",
+        re.IGNORECASE,
+    )
+    _HEALTHY_JSON = re.compile(
+        r"[\"']healthy[\"']\s*:\s*true\b|"
+        r"[\"']status[\"']\s*:\s*[\"'](?:ready|healthy|ok)[\"']",
+        re.IGNORECASE,
     )
     _PROCESS_COMMAND = re.compile(
         r"(?:^|[\s;&|])(python(?:\d+(?:\.\d+)*)?|py|node|java|pytest|"
@@ -93,6 +105,10 @@ class ObservationNormalizer:
                 evidence_text=f"[OBSERVED HTTP_{status}]\n{combined}",
                 source="structured_http_observation",
             )
+
+        healthy = cls._healthy_observation(tool_name, command, combined)
+        if healthy:
+            return healthy
 
         if cls._permission_observation(tool_name, command, combined):
             return ObservationEvidence(
@@ -176,7 +192,44 @@ class ObservationNormalizer:
 
     @classmethod
     def _http_status(cls, tool_name: str, command: str, text: str) -> str:
-        probe_context = tool_name in {"health_check", "get_background_status"} or bool(
+        probe_context = cls._probe_context(tool_name, command)
+        if not probe_context:
+            return ""
+        match = cls._HTTP_STATUS.search(text) or cls._JSON_STATUS.search(text)
+        if not match:
+            return ""
+        return next(group for group in match.groups() if group)
+
+    @classmethod
+    def _healthy_observation(
+        cls, tool_name: str, command: str, text: str
+    ) -> ObservationEvidence | None:
+        """Recognise only labelled, probe-scoped positive observations."""
+        if not cls._probe_context(tool_name, command):
+            return None
+        http = cls._HEALTHY_HTTP.search(text)
+        if http:
+            status = next(group for group in http.groups() if group)
+            return ObservationEvidence(
+                semantic_status="HEALTHY",
+                observation=f"HTTP_{status}",
+                evidence_text=f"[OBSERVED HTTP_{status}]\n{text}",
+                source="structured_http_observation",
+                resolution_evidence=f"health probe returned HTTP_{status}",
+            )
+        if cls._HEALTHY_JSON.search(text):
+            return ObservationEvidence(
+                semantic_status="HEALTHY",
+                observation="HEALTHY_TRUE",
+                evidence_text=f"[OBSERVED HEALTHY]\n{text}",
+                source="structured_health_observation",
+                resolution_evidence="health probe returned an explicit healthy/ready state",
+            )
+        return None
+
+    @staticmethod
+    def _probe_context(tool_name: str, command: str) -> bool:
+        return tool_name in {"health_check", "get_background_status"} or bool(
             re.search(
                 r"\b(?:curl|wget|Invoke-WebRequest|urlopen)\b|"
                 r"(?:health|probe|/resource|/toolchain|/dependency)",
@@ -184,12 +237,6 @@ class ObservationNormalizer:
                 re.IGNORECASE,
             )
         )
-        if not probe_context:
-            return ""
-        match = cls._HTTP_STATUS.search(text) or cls._JSON_STATUS.search(text)
-        if not match:
-            return ""
-        return next(group for group in match.groups() if group)
 
     @classmethod
     def _permission_observation(cls, tool_name: str, command: str, text: str) -> bool:

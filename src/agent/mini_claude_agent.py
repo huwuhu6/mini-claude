@@ -251,9 +251,10 @@ class MiniClaudeAgent:
         self.observation_normalizer = ObservationNormalizer()
         self.attempt_history = AttemptHistory(maxlen=32)
         self.runtime_policy = RuntimePolicy(self.attempt_history)
-        self.loop_controller = LoopController(history=self.attempt_history)
-        # The adapter exists only until the remaining trace wiring is folded
-        # into RuntimePolicy; it has no state or second event store.
+        # LoopController is only a facade over this exact policy instance.
+        self.loop_controller = LoopController(policy=self.runtime_policy)
+        # The adapter exists only for trace compatibility; it has no state or
+        # second event store.
         self.runtime_observer = RuntimePolicyAdapter(self.runtime_policy)
         self.completion_guard = _RuntimeCompletionGate(self.runtime_policy)
         # Runtime trace system — append-only, hook-based observability
@@ -1610,6 +1611,11 @@ class MiniClaudeAgent:
                         self.trace.end_task("FAILED")
                         return content
                     completion_decision = self.completion_guard.check(self.runtime_observer)
+                    latest_event = self.runtime_policy.history.all()[-1:]
+                    if latest_event:
+                        # finalize() annotates the existing attempt; refresh
+                        # the trace entry in place so this is not a duplicate.
+                        self.trace.update_last_attempt_event(latest_event[0].to_dict())
                     if completion_decision.should_terminate:
                         self.trace.record_completion_guard(
                             completion_decision.reason,
@@ -2005,6 +2011,7 @@ class MiniClaudeAgent:
                         observation=observation_evidence.observation,
                         exit_code=tool_result.exit_code,
                         segment_exit_codes=tool_result.segment_exit_codes,
+                        resolution_evidence=observation_evidence.resolution_evidence,
                     )
                     self.trace.record_attempt_event(progress_decision.event.to_dict())
                     self.trace.annotate_current_tool(

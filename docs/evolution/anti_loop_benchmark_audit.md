@@ -141,3 +141,17 @@ Smoke 为 8/12，正式 Candidate 的 verifier 通过数为 24/36（`eval_result
 【还剩什么风险】缺失 Trace/runner crash 的保守 FN/TN 是“没有观察到 stop”的审计归类，不等于证明了真实 Agent 决策；如果未来要求区分“未知”而不是保守归类，需要额外报告 Crash/Invalid 子类，但不能把它们从主分母删除。当前 Candidate 的 5 个 FN 仍需按真实 Trace 分析，尚未据此调整 Runtime，也未运行 Holdout。
 
 【还剩什么风险】AttemptEvent 目前只有 observation fingerprint 和少量显式状态 token，没有可靠的 test error delta；真实进展仍可能依赖模型主动采取 fallback。`EnvironmentBlocker.check_command` 兼容入口还可能被外部调用方误当成决定，后续应改成明确的 evidence API。未通过的 018/019/020/021/024 说明“治理架构正确”不能替代“Agent 完成了任务动作”。
+
+## Runtime Policy 与 Failure Resolution 收敛（2026-09-11）
+
+【观察到的问题】AttemptHistory 虽然已经统一，但 Agent 同时创建了自己的 `RuntimePolicy` 和 `LoopController` 内部的另一个 `RuntimePolicy`。前者负责执行后的 observe/finalize，后者负责 before_execution；两个对象各自保存 `_replan_count` 和 `_completion_replan_count`，所以同一份历史可能因为调用了哪个对象而得到不同判断。归档 Trace 还暴露出另一个问题：`verification_improved` 原来只要文本包含 `pass`、`ready`、`healthy` 或 `compiled` 就为真，`unhealthy`、`not ready`、`0 passed, 5 failed` 和 `echo READY` 都能伪装成恢复证据。workspace mutation 也曾被当成 Loop/Failure 的窗口边界，写 README 就可能把旧 blocker 的近期证据切掉。
+
+【为什么原设计会这样】第一轮只统一了“尝试事实”的存放位置，没有同时统一 Policy 的生命周期和 completion 的证明标准。结果是历史只有一份，决策状态却还有两份；而完成校验仍把自然语言展示文本当作业务验证结果。workspace 改动能说明“文件变了”，但不能说明网络、依赖、权限或测试结果已经变好。
+
+【考虑过的方案】方案 A：保留两个 Policy，只在每次成功后互相 reset，放弃，因为 reset 不能解决同一轨迹由两个状态机解释的问题。方案 B：把所有决策状态塞进新的 BlockerMemory/ProgressMemory，放弃，因为会重新制造第二套事实库。采用方案 C：LoopController 变成已有 RuntimePolicy 的 facade；每个 AttemptEvent 保存 attempt-level governance decision 和 completion decision，replan 次数从事件流派生。恢复只接受同一 normalized intent 的真实成功，健康类恢复还必须有 health/probe 作用域的结构化正向观察；workspace_changed 只作为弱反证，不再清空 Failure history。
+
+【最终怎么改】Agent 将同一个 Policy 注入 LoopController、RuntimePolicyAdapter 和 Completion Gate，整个 Run 只有一个 decision state machine。`AttemptHistory` 增加对最后一条事件附加派生事实的能力，保存 `governance_decision`、`completion_decision`、`resolution_intent_key` 和解释原因，避免用对象私有 counter 记账。ObservationNormalizer 只在 health_check/curl 等 probe 上下文看到明确 HTTP 2xx、`healthy=true` 或 `status=ready` 时产生正向 evidence；普通输出、README、stderr warning 和 echo 不具备恢复权。Failure recurrence 保留完整近期窗口；Loop detector 只用 mutation 作为弱 counter-evidence，以免正常 edit→test 被误杀，也不让无关写文件抹掉 blocker。
+
+【如何验证】新增 deterministic regression 覆盖：HTTP 503→无关写文件仍未解决；HTTP 503→echo READY 仍未解决；同一 health probe 的结构化健康结果可以解决；Permission denied→同一业务 intent 成功可以恢复；pytest 失败→改源码→同一测试成功可以完成，而改 README→同样失败不能洗掉证据；`unhealthy`、`not ready`、`compiled with errors` 等文本不会成为 verification improvement；LoopController、observer、completion gate 引用同一 Policy；带决策字段的 AttemptHistory 可以由新 RuntimePolicy 重放出相同 final decision。定向 Runtime/Observation 测试 49 passed；unit+integration（排除已知依赖外部受限目录的 `test_all_modules.py`）167 passed。没有请求 Provider，没有运行 DEV/HOLDOUT。
+
+【还剩什么风险】当前解析器仍只实现了最少的通用 resolver：同一 normalized intent 的成功和 probe-scoped health positive。它还不能可靠比较 pytest 错误集合从 10 个降到 5 个，也不能自动证明任意 package fallback 的业务结果；这些属于后续 Observation/Outcome 设计，不应通过降低 Loop threshold 解决。归档的 019/020/021 Trace 是旧版本生成的事实快照，能够证明当时的 Evidence→Completion 问题，但不能替代新代码下的 Provider benchmark。

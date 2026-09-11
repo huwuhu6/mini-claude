@@ -270,6 +270,11 @@ class TraceManager:
         if self.current_task is not None:
             self.current_task.attempt_events.append(dict(event))
 
+    def update_last_attempt_event(self, event: Dict[str, Any]) -> None:
+        """Refresh derived decision facts without duplicating an attempt."""
+        if self.current_task is not None and self.current_task.attempt_events:
+            self.current_task.attempt_events[-1] = dict(event)
+
     def annotate_current_tool(self, **fields: Any) -> None:
         """Attach post-execution governance evidence to the latest tool trace."""
         if not self.current_turn or not self.current_turn.tools:
