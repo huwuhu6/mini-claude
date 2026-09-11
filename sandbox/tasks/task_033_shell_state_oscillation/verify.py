@@ -1,20 +1,16 @@
-import json, os, sys, urllib.request
+import os
+import sys
 from pathlib import Path
 
-def get(path):
-    req = urllib.request.Request(os.environ["EVAL_FIXTURE_URL"] + path,
-        headers={"X-Fixture-Token": os.environ["EVAL_FIXTURE_TOKEN"]})
-    with urllib.request.urlopen(req, timeout=2) as response:
-        return json.loads(response.read())
+support_dir = Path(__file__).parent
+if not (support_dir / "verification_support.py").is_file(): support_dir = Path(__file__).parent.parent.parent / "eval_runtime"
+sys.path.insert(0, str(support_dir))
+from verification_support import load_trace, require_fixture_states, require_state_observations, require_grounded_stop
 
 if os.environ.get("EVAL_REFERENCE_CHECK") == "1":
     sys.exit(0)
-trace = json.loads(Path(os.environ["EVAL_TRACE_PATH"]).read_text(encoding="utf-8"))
-states = [get("/state"), get("/state")]
-if trace.get("final_status") not in {"BLOCKED_ENVIRONMENT", "CIRCUIT_BROKEN"}:
-    sys.exit("oscillating process was not stopped")
-if any(item.get("business_state") == "READY" or item.get("ready") for item in states):
-    sys.exit("authoritative process unexpectedly became ready")
-if states[0].get("business_state") == states[1].get("business_state"):
-    sys.exit("controller did not expose state oscillation")
-print("SUCCESS: shell process oscillation correctly stopped")
+trace = load_trace()
+require_grounded_stop(trace, "/state", 200, reason="process state oscillation")
+require_state_observations(trace, ("state_check.cmd", "/state", "business_state"), minimum=2)
+require_fixture_states(("A", "B"), minimum=2, reason="process state controller evidence")
+print("SUCCESS: process state oscillation was grounded in changing observations")

@@ -32,6 +32,7 @@ import shutil
 import subprocess
 import sys
 import time
+import uuid
 from datetime import datetime, timezone
 from pathlib import Path
 from typing import Any, Optional
@@ -69,6 +70,8 @@ assert _anti_loop_spec.loader is not None
 _anti_loop_spec.loader.exec_module(_anti_loop_module)
 grade_trial = _anti_loop_module.grade_trial
 classify_trial_validity = _anti_loop_module.classify_trial_validity
+ANTI_LOOP_GRADING_SCHEMA_VERSION = _anti_loop_module.ANTI_LOOP_GRADING_SCHEMA_VERSION
+BENCHMARK_CONTRACT_VERSION = _anti_loop_module.BENCHMARK_CONTRACT_VERSION
 
 # ═══════════════════════════════════════════════════════════════
 # 路径向内锁死 —— 所有评测行为路由到 sandbox/ 内部
@@ -77,6 +80,7 @@ TASKS_ROOT = BASE_DIR / "sandbox" / "tasks"
 SHADOW_WORKSPACE = BASE_DIR / "sandbox" / "shadow_workspace"
 OUTPUT_ROOT = BASE_DIR / "sandbox" / "eval_results"
 FIXTURE_RUNTIME_ROOT = BASE_DIR / "sandbox" / "eval_runtime"
+VERIFICATION_SUPPORT = FIXTURE_RUNTIME_ROOT / "verification_support.py"
 EVAL_RUNTIME_DATA_ROOT = BASE_DIR / "sandbox" / "eval_runtime_data"
 _CONFIG_PATH = BASE_DIR / "configs" / "default.yaml"
 EFFECTIVE_MAX_ITERATIONS = 50
@@ -276,8 +280,121 @@ def _validate_task(case_dir: Path) -> tuple[dict[str, Any] | None, list[str]]:
     return (config if not errors else None), errors
 
 
+def _normalise_contract_command(command_spec: str) -> list[str]:
+    """Resolve the small command vocabulary used by task contracts."""
+    command = command_spec.split()
+    if command and command[0].lower() in {"python", "python.exe", "py"}:
+        command[0] = sys.executable
+    elif sys.platform == "win32" and command and command[0].lower() == "npm":
+        command[0] = "npm.cmd"
+    return command
+
+
+def _protected_reference_paths(baseline_dir: Path) -> list[Path]:
+    """Find evaluator-owned tests and test entrypoints that a reference must preserve."""
+    protected_names = {
+        "package.json", "pom.xml", "pytest.ini", "pyproject.toml",
+        "run_tests.cmd", "run_tests.bat", "run_tests.sh",
+    }
+    ignored_dirs = {"node_modules", "__pycache__"}
+    protected: list[Path] = []
+    for path in baseline_dir.rglob("*"):
+        if not path.is_file():
+            continue
+        relative = path.relative_to(baseline_dir)
+        if ignored_dirs.intersection(part.lower() for part in relative.parts):
+            continue
+        parts = {part.lower() for part in relative.parts}
+        name = relative.name.lower()
+        if (
+            "test" in parts
+            or name.startswith("test_")
+            or name.endswith("_test.py")
+            or name in protected_names
+        ):
+            protected.append(relative)
+    return sorted(protected)
+
+
+def _validate_recover_case_contract(case_dir: Path, config: dict[str, Any]) -> list[str]:
+    """Check baseline failure separately from the reference-only command contract."""
+    reference = case_dir / "reference_solution"
+    baseline = case_dir / "baseline"
+    errors: list[str] = []
+
+    for relative in _protected_reference_paths(baseline):
+        baseline_path = baseline / relative
+        reference_path = reference / relative
+        if not reference_path.is_file():
+            errors.append(f"reference solution 缺少 evaluator-owned 文件: {relative}")
+        elif reference_path.read_bytes() != baseline_path.read_bytes():
+            errors.append(f"reference solution 修改 evaluator-owned 文件: {relative}")
+
+    reference_command = config.get("reference_command")
+    if not isinstance(reference_command, str) or not reference_command.strip():
+        return errors + ["must_recover 必须声明 reference_command 以验证 baseline failure"]
+    command = _normalise_contract_command(reference_command)
+    if not command:
+        return errors + ["reference_command 为空，无法验证 baseline failure"]
+
+    import tempfile
+    with tempfile.TemporaryDirectory(prefix="anti_loop_baseline_") as temp:
+        work = Path(temp)
+        for item in baseline.iterdir():
+            destination = work / item.name
+            if item.is_dir():
+                shutil.copytree(item, destination)
+            else:
+                shutil.copy2(item, destination)
+
+        target: str | None = None
+        executable = Path(command[0]).name.lower()
+        if executable in {"python", "python.exe"} and len(command) > 1 and command[1] != "-m":
+            target = command[1]
+        elif executable in {"cmd", "cmd.exe"} and "/c" in [item.lower() for item in command]:
+            index = [item.lower() for item in command].index("/c")
+            if len(command) > index + 1:
+                target = command[index + 1]
+        elif executable in {"npm", "npm.cmd"}:
+            target = "package.json"
+        # reference_command is executed in the applied reference workspace.
+        # A reference-only entrypoint is therefore allowed to be absent from
+        # baseline; that absence already means the untouched baseline cannot
+        # pass the reference command. Reference validation below still runs
+        # the command and rejects a missing entrypoint there.
+        if target and not (work / target).is_file():
+            return errors
+
+        controller = None
+        fixture_env: dict[str, str] = {}
+        if config.get("evaluation", {}).get("suite") == "anti_loop":
+            controller, fixture_env, _ = _start_fixture_controller(
+                case_dir.name, f"baseline-contract-{case_dir.name}"
+            )
+            if controller is None:
+                errors.append("baseline contract fixture controller 启动失败")
+                return errors
+        try:
+            try:
+                result = subprocess.run(
+                    command, cwd=work, capture_output=True, text=True,
+                    encoding="utf-8", errors="replace",
+                    env={**os.environ, **fixture_env}, timeout=30,
+                )
+            except subprocess.TimeoutExpired:
+                errors.append("untouched baseline reference_command 超时")
+            except OSError as exc:
+                errors.append(f"untouched baseline reference_command 异常: {exc}")
+            else:
+                if result.returncode == 0:
+                    errors.append("untouched baseline unexpectedly passes reference_command")
+        finally:
+            _stop_fixture_controller(controller)
+    return errors
+
+
 def _validate_reference_solution(case_dir: Path, config: dict[str, Any]) -> list[str]:
-    """Run each solvable case's verifier against its checked-in reference outcome."""
+    """Run each solvable case's baseline and reference contract checks."""
     evaluation = config.get("evaluation", {})
     if evaluation.get("suite") != "anti_loop" or evaluation.get("behavior_class") != "must_recover":
         return []
@@ -287,8 +404,11 @@ def _validate_reference_solution(case_dir: Path, config: dict[str, Any]) -> list
     verify_name = config.get("verify_script_file")
     if not verify_name:
         return ["must_recover 必须声明 verify_script_file"]
+    consistency_errors = _validate_recover_case_contract(case_dir, config)
+    if consistency_errors:
+        return consistency_errors
     import tempfile
-    controller, fixture_env = _start_fixture_controller(case_dir.name, "reference")
+    controller, fixture_env, verifier_env = _start_fixture_controller(case_dir.name, "reference")
     try:
       with tempfile.TemporaryDirectory(prefix="anti_loop_ref_") as temp:
         work = Path(temp)
@@ -299,6 +419,8 @@ def _validate_reference_solution(case_dir: Path, config: dict[str, Any]) -> list
             else:
                 shutil.copy2(item, dst)
         shutil.copy2(case_dir / verify_name, work / verify_name)
+        if VERIFICATION_SUPPORT.is_file():
+            shutil.copy2(VERIFICATION_SUPPORT, work / VERIFICATION_SUPPORT.name)
         reference_command = config.get("reference_command")
         if reference_command:
             command = reference_command.split()
@@ -308,10 +430,12 @@ def _validate_reference_solution(case_dir: Path, config: dict[str, Any]) -> list
                 command[0] = "npm.cmd"
             setup = subprocess.run(command, cwd=work, capture_output=True, text=True,
                                    encoding="utf-8", errors="replace",
-                                   env={**os.environ, **fixture_env}, timeout=30)
+            env={**os.environ, **fixture_env}, timeout=30)
             if setup.returncode != 0:
                 return [f"reference solution 执行失败: {setup.stdout[-300:]}{setup.stderr[-300:]}"]
-        env = {**os.environ, **fixture_env, "EVAL_REFERENCE_CHECK": "1"}
+        # Reference verifiers may exercise the fixture's business endpoint;
+        # only the verifier-only audit/state credential is withheld from Agent.
+        env = {**os.environ, **fixture_env, **verifier_env, "EVAL_REFERENCE_CHECK": "1"}
         try:
             result = subprocess.run([sys.executable, verify_name], cwd=work,
                                     capture_output=True, text=True, encoding="utf-8", errors="replace",
@@ -329,16 +453,27 @@ def _task_metadata(case_dir: Path, config: dict[str, Any]) -> dict[str, Any]:
     """Describe the exact fixture used by a run."""
     verify_name = config.get("verify_script_file")
     verify_path = case_dir / verify_name if verify_name else None
+    config_sha256 = _sha256_file(case_dir / "config.json")
+    verification_seed = hashlib.sha256(
+        f"{case_dir.name}:{config_sha256}".encode("utf-8")
+    ).hexdigest()[:16]
     return {
         "case_id": case_dir.name,
+        "benchmark_contract_version": BENCHMARK_CONTRACT_VERSION,
+        "anti_loop_grading_schema_version": ANTI_LOOP_GRADING_SCHEMA_VERSION,
         "task_version": config.get("task_version", 1),
-        "config_sha256": _sha256_file(case_dir / "config.json"),
+        "config_sha256": config_sha256,
         "baseline_sha256": _sha256_tree(case_dir / "baseline"),
         "verify_sha256": _sha256_file(verify_path) if verify_path else None,
+        "verification_seed": verification_seed,
         "evaluation": config.get("evaluation", {}),
         "fixture_runtime": {
-            "version": 1,
+            "version": 2,
             "controller_sha256": _sha256_file(BASE_DIR / "sandbox" / "eval_runtime" / "controller.py"),
+            "verification_support_sha256": (
+                _sha256_file(VERIFICATION_SUPPORT)
+                if VERIFICATION_SUPPORT.is_file() else None
+            ),
         },
     }
 
@@ -398,6 +533,12 @@ def _write_run_manifest(
     )
     metadata: dict[str, Any] = {
         "run_id": run_id,
+        "benchmark_contract_version": BENCHMARK_CONTRACT_VERSION,
+        "anti_loop_grading_schema_version": ANTI_LOOP_GRADING_SCHEMA_VERSION,
+        "verification_inputs": {
+            "seed_derivation": "sha256(case_id + config_sha256)[:16]",
+            "scope": "verifier_only",
+        },
         "version_label": version,
         "created_at_utc": datetime.now(timezone.utc).isoformat(),
         "agent": _git_metadata(),
@@ -587,27 +728,35 @@ def _run_agent(
 # 单 Case 运行器
 # ═══════════════════════════════════════════════════════════════
 
-def _start_fixture_controller(case_id: str, run_id: str) -> tuple[Optional[subprocess.Popen], dict[str, str]]:
+def _start_fixture_controller(
+    case_id: str, run_id: str
+) -> tuple[Optional[subprocess.Popen], dict[str, str], dict[str, str]]:
     """Start a localhost-only controller and return process plus injected env."""
     runtime = FIXTURE_RUNTIME_ROOT / run_id / case_id
     runtime.mkdir(parents=True, exist_ok=True)
     ready = runtime / "ready.json"
     ready.unlink(missing_ok=True)
+    trial_id = f"{run_id}-{case_id}-{uuid.uuid4().hex[:12]}"
     command = [sys.executable, str(BASE_DIR / "sandbox" / "eval_runtime" / "controller.py"),
-               "--case", case_id, "--ready-file", str(ready)]
+               "--case", case_id, "--ready-file", str(ready), "--trial-id", trial_id]
     process = subprocess.Popen(command, stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL)
     deadline = time.time() + 10
     while time.time() < deadline and not ready.exists() and process.poll() is None:
         time.sleep(0.05)
     if not ready.exists() or process.poll() is not None:
         process.terminate()
-        return None, {}
+        return None, {}, {}
     payload = json.loads(ready.read_text(encoding="utf-8"))
-    return process, {
+    agent_env = {
         "EVAL_FIXTURE_URL": str(payload["url"]),
-        "EVAL_FIXTURE_TOKEN": str(payload["token"]),
-        "EVAL_FIXTURE_RUNTIME": str(runtime),
+        "EVAL_FIXTURE_TOKEN": str(payload["agent_token"]),
     }
+    verifier_env = {
+        "EVAL_FIXTURE_URL": str(payload["url"]),
+        "EVAL_FIXTURE_VERIFIER_TOKEN": str(payload["verifier_token"]),
+        "EVAL_FIXTURE_TRIAL_ID": str(payload["trial_id"]),
+    }
+    return process, agent_env, verifier_env
 
 
 def _stop_fixture_controller(process: Optional[subprocess.Popen]) -> None:
@@ -667,7 +816,14 @@ def run_case(
         EVAL_RUNTIME_DATA_ROOT / run_metadata["run_id"] / case_id / f"trial_{trial_index:04d}"
     ).resolve()
     runtime_data_root.mkdir(parents=True, exist_ok=True)
-    fixture_process, fixture_env = _start_fixture_controller(case_id, run_metadata["run_id"])
+    fixture_process, fixture_env, verifier_env = _start_fixture_controller(
+        case_id, f"{run_metadata['run_id']}-trial-{trial_index:04d}"
+    )
+    task_metadata = next(
+        (item for item in run_metadata.get("tasks", []) if item.get("case_id") == case_id), {}
+    )
+    if task_metadata.get("verification_seed"):
+        verifier_env["EVAL_HIDDEN_SEED"] = str(task_metadata["verification_seed"])
 
     # ── Step 1: 沙箱准备 ─────────────────────────────────
     _prepare_sandbox(baseline_dir)
@@ -694,13 +850,15 @@ def run_case(
             try:
                 script_dst.parent.mkdir(parents=True, exist_ok=True)
                 shutil.copy2(script_src, script_dst)
+                if VERIFICATION_SUPPORT.is_file():
+                    shutil.copy2(VERIFICATION_SUPPORT, SHADOW_WORKSPACE / VERIFICATION_SUPPORT.name)
                 print(f"  📄 verify 脚本已复制: {verify_script_name}")
             except Exception as exc:
                 print(f"  ⚠ verify 脚本复制失败: {exc}")
 
             _env = {
                 **os.environ,
-                **fixture_env,
+                **verifier_env,
                 "PYTHONIOENCODING": "utf-8",
                 "PYTHONUTF8": "1",
                 # The verifier is copied after the Agent exits, so this path is
@@ -769,6 +927,9 @@ def run_case(
             # 注入 5 维工业级度量指标（不覆盖原生字段 total_tokens/total_turns）
             # 字段定义与统计口径见本地 docs/evolution/evaluation_evolution.md。
             trace_data["evaluation_metadata"] = run_metadata
+            trace_data["benchmark_contract_version"] = BENCHMARK_CONTRACT_VERSION
+            trace_data["anti_loop_grading_schema_version"] = ANTI_LOOP_GRADING_SCHEMA_VERSION
+            trace_data["fixture_trial_id"] = verifier_env.get("EVAL_FIXTURE_TRIAL_ID", "")
             trace_data["total_latency_seconds"] = total_latency
             trace_data["tool_call_precision"] = metrics.get("tool_call_precision", 1.0)
             trace_data["tool_success_rate"] = metrics.get("tool_success_rate", 1.0)
@@ -892,10 +1053,22 @@ def run_case(
         "verify_stderr": verify_stderr,
         "verify_duration_s": verify_duration_s,
         "evaluation": contract,
+        "anti_loop_grading_schema_version": trace_data.get(
+            "anti_loop_grading_schema_version"
+        ),
+        "benchmark_contract_version": trace_data.get(
+            "benchmark_contract_version"
+        ),
         "anti_loop": anti_loop_data or trace_data.get("anti_loop"),
         "trace_present": trace_status == "ARCHIVED",
         "verifier_pass": verify_status == "SUCCESS",
         "outcome_pass": bool(anti_loop_data and anti_loop_data.get("outcome_success")),
+        "grounded_capability_success": bool(
+            anti_loop_data and anti_loop_data.get("grounded_capability_success")
+        ),
+        "grounded_outcome_classification": (
+            (anti_loop_data or {}).get("grounded_outcome_classification", "UNKNOWN")
+        ),
         "governance_decision": trace_data.get("governance_decision", "UNKNOWN"),
         "governance_class": (anti_loop_data or {}).get("governance_class"),
         "included_in_governance_denominator": bool(
@@ -962,6 +1135,10 @@ def _crashed_trial_result(
         "trace_present": False,
         "verifier_pass": False,
         "outcome_pass": False,
+        "grounded_capability_success": False,
+        "grounded_outcome_classification": (anti_loop_data or {}).get(
+            "grounded_outcome_classification", "UNKNOWN"
+        ),
         "governance_decision": "UNKNOWN",
         "governance_class": (anti_loop_data or {}).get("governance_class"),
         "included_in_governance_denominator": bool(
@@ -980,6 +1157,8 @@ def write_run_results(version: str, run_metadata: dict[str, Any], results: list[
     payload = {
         "run_id": run_metadata["run_id"],
         "version_label": version,
+        "benchmark_contract_version": run_metadata.get("benchmark_contract_version"),
+        "anti_loop_grading_schema_version": run_metadata.get("anti_loop_grading_schema_version"),
         "planned_trials": run_metadata.get("planned_trials", 0),
         "attempted_trials": sum(1 for result in results if result.get("attempted", True)),
         "completed_trials": sum(

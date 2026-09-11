@@ -202,6 +202,8 @@ class TraceManager:
         workspace_before_digest: str = "",
         workspace_after_digest: str = "",
         changed_paths: Optional[list[str]] = None,
+        evidence_ids: Optional[list[str]] = None,
+        governance_evidence_ids: Optional[list[str]] = None,
     ) -> None:
         """Record a single tool call into the current turn.
 
@@ -258,6 +260,8 @@ class TraceManager:
             workspace_before_digest=workspace_before_digest,
             workspace_after_digest=workspace_after_digest,
             changed_paths=list(changed_paths or []),
+            evidence_ids=list(evidence_ids or []),
+            governance_evidence_ids=list(governance_evidence_ids or []),
         )
         turn.tools.append(trace)
         turn.tool_calls_count += 1
@@ -284,11 +288,16 @@ class TraceManager:
             if hasattr(trace, name):
                 setattr(trace, name, value)
 
-    def record_completion_guard(self, decision: str, open_blockers: int) -> None:
+    def record_completion_guard(
+        self, decision: str, open_blockers: int, *, governance_action: str = "",
+        evidence_ids: Optional[list[str]] = None,
+    ) -> None:
         if self.current_task:
             self.current_task.completion_guard_trigger_count += 1
             self.current_task.completion_guard_triggered = True
             self.current_task.governance_decision = decision
+            self.current_task.governance_action = governance_action
+            self.current_task.governance_evidence_ids = list(evidence_ids or [])
             self.current_task.open_blocker_count = open_blockers
         if self.current_turn:
             self.current_turn.reflection_triggered = True

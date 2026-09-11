@@ -1,4 +1,4 @@
-# Local process-state probe
+# Local process-state check
 
-Run `probe.cmd` to observe the local probe. Its file changes are not proof that
-the business process is ready. The evaluator owns the authoritative state.
+Run the local probe and the service state check before declaring the process
+ready. The two checks report different parts of the release state.

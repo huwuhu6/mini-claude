@@ -1,1 +1,1 @@
-release_toolchain=missing-and-no-fallback
+release_toolchain=enterprise-release

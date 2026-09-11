@@ -1,1 +1,2 @@
-The enterprise directory adapter is required by this fixture but is intentionally unavailable.
+This utility reads the enterprise directory through the configured integration adapter.
+Use the local probe and project configuration to diagnose integration readiness.

@@ -1617,9 +1617,20 @@ class MiniClaudeAgent:
                         # the trace entry in place so this is not a duplicate.
                         self.trace.update_last_attempt_event(latest_event[0].to_dict())
                     if completion_decision.should_terminate:
+                        # Completion STOP may reference only the latest
+                        # unresolved failure, never an arbitrary historical
+                        # observation.  This is annotation plumbing; the
+                        # completion decision itself is unchanged.
+                        completion_refs: list[str] = []
+                        for event in reversed(self.runtime_policy.history.all()):
+                            if event.status.name in {"FAILURE", "BLOCKED"} or event.observed_failure:
+                                completion_refs = list(event.governance_evidence_ids or event.evidence_ids)
+                                break
                         self.trace.record_completion_guard(
                             completion_decision.reason,
                             completion_decision.open_blocker_count,
+                            governance_action=completion_decision.action.value,
+                            evidence_ids=list(dict.fromkeys(completion_refs)),
                         )
                         self.trace.end_task(
                             "BLOCKED_ENVIRONMENT",
@@ -1630,6 +1641,7 @@ class MiniClaudeAgent:
                         self.trace.record_completion_guard(
                             completion_decision.reason,
                             completion_decision.open_blocker_count,
+                            governance_action=completion_decision.action.value,
                         )
                         self.messages.append(Message(
                             role='user',
@@ -2013,6 +2025,7 @@ class MiniClaudeAgent:
                         segment_exit_codes=tool_result.segment_exit_codes,
                         resolution_evidence=observation_evidence.resolution_evidence,
                         subject_key=CommandNormalizer.subject_key(tname, args),
+                        evidence_ids=observation_evidence.evidence_ids,
                     )
                     self.trace.record_attempt_event(progress_decision.event.to_dict())
                     self.trace.annotate_current_tool(
@@ -2030,6 +2043,8 @@ class MiniClaudeAgent:
                         workspace_before_digest=progress_decision.event.workspace_before_digest,
                         workspace_after_digest=progress_decision.event.workspace_after_digest,
                         changed_paths=list(progress_decision.event.changed_paths),
+                        evidence_ids=list(observation_evidence.evidence_ids),
+                        governance_evidence_ids=list(progress_decision.event.governance_evidence_ids),
                     )
 
                     logger.info(

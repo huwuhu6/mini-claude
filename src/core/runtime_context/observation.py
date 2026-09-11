@@ -26,6 +26,7 @@ class ObservationEvidence:
     evidence_text: str = ""
     source: str = ""
     resolution_evidence: str = ""
+    evidence_ids: tuple[str, ...] = ()
 
 
 class ObservationNormalizer:
@@ -67,6 +68,10 @@ class ObservationNormalizer:
         command = str((args or {}).get("command", ""))
         execution_success, exit_code, stdout, stderr, segment_codes, text = cls._facts(result)
         combined = "\n".join(part for part in (stdout, stderr) if part).strip() or text
+        evidence_ids = (
+            tuple(dict.fromkeys(re.findall(r"\bobs-[0-9]{6}\b", combined)))
+            if cls._probe_context(tool_name, command) else ()
+        )
 
         if segment_codes and any(code != 0 for code in segment_codes):
             code = next(code for code in segment_codes if code != 0)
@@ -78,6 +83,7 @@ class ObservationNormalizer:
                 recoverability="PARTIALLY_RECOVERABLE",
                 evidence_text=f"[PROCESS_SEGMENT_EXIT={code}]\n{combined}",
                 source="shell_segment_exit",
+                evidence_ids=evidence_ids,
             )
 
         if not execution_success:
@@ -88,6 +94,7 @@ class ObservationNormalizer:
                 observation=f"PROCESS_EXIT{code_label}",
                 evidence_text=combined or text,
                 source="process_result",
+                evidence_ids=evidence_ids,
             )
 
         background = cls._background_failure(tool_name, combined)
@@ -104,6 +111,7 @@ class ObservationNormalizer:
                 recoverability="PARTIALLY_RECOVERABLE",
                 evidence_text=f"[OBSERVED HTTP_{status}]\n{combined}",
                 source="structured_http_observation",
+                evidence_ids=evidence_ids,
             )
 
         healthy = cls._healthy_observation(tool_name, command, combined)
@@ -119,6 +127,7 @@ class ObservationNormalizer:
                 recoverability="PARTIALLY_RECOVERABLE",
                 evidence_text=f"[OBSERVED RESOURCE_DENIED]\n{combined}",
                 source="probe_output",
+                evidence_ids=evidence_ids,
             )
 
         if cls._masked_traceback(command, combined):
@@ -130,9 +139,10 @@ class ObservationNormalizer:
                 recoverability="PARTIALLY_RECOVERABLE",
                 evidence_text=f"[OBSERVED TRACEBACK]\n{combined}",
                 source="probe_output",
+                evidence_ids=evidence_ids,
             )
 
-        return ObservationEvidence(evidence_text=combined, source="ordinary_output")
+        return ObservationEvidence(evidence_text=combined, source="ordinary_output", evidence_ids=evidence_ids)
 
     @classmethod
     def _facts(
@@ -187,6 +197,7 @@ class ObservationNormalizer:
                 recoverability="PARTIALLY_RECOVERABLE",
                 evidence_text=f"[BACKGROUND_STATUS={status} EXIT_CODE={exit_code}]\n{text}",
                 source="background_status",
+                evidence_ids=tuple(dict.fromkeys(re.findall(r"\bobs-[0-9]{6}\b", text))) if cls._probe_context(tool_name, "") else (),
             )
         return None
 
@@ -216,6 +227,7 @@ class ObservationNormalizer:
                 evidence_text=f"[OBSERVED HTTP_{status}]\n{text}",
                 source="structured_http_observation",
                 resolution_evidence=f"health probe returned HTTP_{status}",
+                evidence_ids=tuple(dict.fromkeys(re.findall(r"\bobs-[0-9]{6}\b", text))) if cls._probe_context(tool_name, "") else (),
             )
         if cls._HEALTHY_JSON.search(text):
             return ObservationEvidence(
@@ -224,6 +236,7 @@ class ObservationNormalizer:
                 evidence_text=f"[OBSERVED HEALTHY]\n{text}",
                 source="structured_health_observation",
                 resolution_evidence="health probe returned an explicit healthy/ready state",
+                evidence_ids=tuple(dict.fromkeys(re.findall(r"\bobs-[0-9]{6}\b", text))) if cls._probe_context(tool_name, "") else (),
             )
         return None
 
@@ -232,7 +245,7 @@ class ObservationNormalizer:
         return tool_name in {"health_check", "get_background_status"} or bool(
             re.search(
                 r"\b(?:curl|wget|Invoke-WebRequest|urlopen)\b|"
-                r"(?:health|probe|/resource|/toolchain|/dependency)",
+                r"(?:health|probe|/resource|/toolchain|/dependency|/state|/signer|/orders|/export)",
                 command,
                 re.IGNORECASE,
             )

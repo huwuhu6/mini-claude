@@ -69,6 +69,8 @@ class ToolTrace:
     workspace_before_digest: str = ""
     workspace_after_digest: str = ""
     changed_paths: List[str] = field(default_factory=list)
+    evidence_ids: List[str] = field(default_factory=list)
+    governance_evidence_ids: List[str] = field(default_factory=list)
 
     def to_dict(self) -> Dict[str, Any]:
         return {
@@ -116,6 +118,8 @@ class ToolTrace:
             'workspace_before_digest': self.workspace_before_digest,
             'workspace_after_digest': self.workspace_after_digest,
             'changed_paths': list(self.changed_paths),
+            'evidence_ids': list(self.evidence_ids),
+            'governance_evidence_ids': list(self.governance_evidence_ids),
         }
 
 
@@ -176,6 +180,8 @@ class TaskTrace:
     completion_guard_trigger_count: int = 0
     completion_guard_triggered: bool = False
     governance_decision: str = ""
+    governance_action: str = ""
+    governance_evidence_ids: List[str] = field(default_factory=list)
     open_blocker_count: int = 0
     environment: Dict[str, Any] = field(default_factory=dict)
     attempt_events: List[Dict[str, Any]] = field(default_factory=list)
@@ -206,6 +212,8 @@ class TaskTrace:
             'completion_guard_trigger_count': self.completion_guard_trigger_count,
             'completion_guard_triggered': self.completion_guard_triggered,
             'governance_decision': self.governance_decision,
+            'governance_action': self.governance_action,
+            'governance_evidence_ids': list(self.governance_evidence_ids),
             'open_blocker_count': self.open_blocker_count,
             'environment': dict(self.environment),
             'attempt_events': [dict(event) for event in self.attempt_events],

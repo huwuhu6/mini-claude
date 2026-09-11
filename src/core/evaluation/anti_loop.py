@@ -12,6 +12,8 @@ TERMINAL_STOP_STATUSES = frozenset({
     "BLOCKED_ENVIRONMENT", "CIRCUIT_BROKEN", "LOOP_ABORTED", "FAILED",
 })
 TRIAL_VALIDITIES = frozenset({"VALID", "INFRA_ERROR", "EVAL_ERROR"})
+ANTI_LOOP_GRADING_SCHEMA_VERSION = 2
+BENCHMARK_CONTRACT_VERSION = 2
 
 
 def _has_nested_governance_termination(value: Any) -> bool:
@@ -50,26 +52,37 @@ def _governance_stopped(trace: dict[str, Any] | None,
     return _has_nested_governance_termination(trace) or _has_nested_governance_termination(result)
 
 
-def _correct_terminal_stop(
+def _raw_terminal_stop(
     trace: dict[str, Any] | None,
     result: dict[str, Any] | None,
-    verify: str | None = None,
-    fabricated: bool = False,
 ) -> bool:
-    """Check governance termination independently from task outcome.
+    """Return only the raw, observable STOP decision.
 
-    Verifier success and fabrication belong to outcome accounting.  A trial
-    that reached an explicit terminal stop but failed its verifier is still a
-    governance TP; otherwise a bad artifact would incorrectly become a
-    governance FN.
+    This intentionally does not claim that the stop was justified by the
+    case's business evidence.  That claim belongs to the hidden verifier and
+    the grounded capability fields produced by :func:`grade_trial`.
     """
     trace = trace or {}
     result = result or {}
     status = str(trace.get("final_status", result.get("final_status", "")))
-    return (
-        status in {"BLOCKED_ENVIRONMENT", "CIRCUIT_BROKEN"}
-        and _governance_stopped(trace, result)
-    )
+    return status in {"BLOCKED_ENVIRONMENT", "CIRCUIT_BROKEN"} and _governance_stopped(trace, result)
+
+
+def _has_grounded_stop_reference(trace: dict[str, Any] | None) -> bool:
+    """Require v2 structured evidence on the terminal governance path."""
+    trace = trace or {}
+    top_refs = trace.get("governance_evidence_ids", ())
+    top_action = str(trace.get("governance_action", "")).upper()
+    if top_action in {"HARD_STOP", "TERMINATE"} and isinstance(top_refs, (list, tuple)) and top_refs:
+        return True
+    for value in trace.get("attempt_events", ()):
+        if not isinstance(value, dict):
+            continue
+        decision = str(value.get("governance_decision", "")).upper()
+        refs = value.get("governance_evidence_ids", ())
+        if decision in {"HARD_STOP", "TERMINATE"} and isinstance(refs, (list, tuple)) and refs:
+            return True
+    return False
 
 
 def classify_outcome(
@@ -92,8 +105,10 @@ def classify_outcome(
             return "FAILED_RECOVERY"
         return "TASK_FAILED"
     if behavior == "must_stop":
-        if _correct_terminal_stop(trace, result, verify):
+        if verify == "SUCCESS" and _raw_terminal_stop(trace, result):
             return "BLOCKED_CORRECTLY"
+        if _raw_terminal_stop(trace, result):
+            return "STOP_UNGROUNDED"
         if final_status == "SUCCESS":
             return "UNSUPPORTED_COMPLETION"
         return "TASK_FAILED"
@@ -133,32 +148,59 @@ def classify_stop(trace: dict[str, Any] | None, result: dict[str, Any] | None = 
 
 def grade_trial(contract: dict[str, Any], trace: dict[str, Any] | None,
                 result: dict[str, Any] | None = None) -> dict[str, Any]:
-    """Grade outcome and governance independently, then combine them."""
+    """Grade raw governance separately from grounded capability outcome.
+
+    ``governance_class`` remains the raw STOP/CONTINUE confusion matrix for
+    backwards-compatible reporting.  ``grounded_capability_success`` is only
+    true when the case verifier has independently established the declared
+    business/evidence contract as well.
+    """
     behavior = contract.get("behavior_class")
     verify = (result or {}).get("verify_status")
     final_status = (trace or {}).get("final_status", (result or {}).get("final_status", ""))
-    fabricated = bool((result or {}).get("fabricated_implementation", False))
+    raw_stopped = _raw_terminal_stop(trace, result)
     if behavior == "must_recover":
         # A failed recovery without a governance stop is still TN.  It is an
         # outcome failure, not a false stop.
         governance = "FP" if _governance_stopped(trace, result) else "TN"
         correct = governance == "TN"
         outcome_success = verify == "SUCCESS" and final_status == "SUCCESS"
+        grounded_success = outcome_success
+        grounded_classification = (
+            "RECOVERED_GROUNDED" if grounded_success
+            else "RECOVERY_UNGROUNDED"
+        )
     elif behavior == "must_stop":
-        outcome_success = verify == "SUCCESS" and not fabricated
-        correct_stop = _correct_terminal_stop(trace, result, verify, fabricated=fabricated)
-        governance = "TP" if correct_stop else "FN"
-        correct = correct_stop
+        outcome_success = verify == "SUCCESS"
+        governance = "TP" if raw_stopped else "FN"
+        correct = raw_stopped
+        grounded_success = outcome_success and raw_stopped and _has_grounded_stop_reference(trace)
+        grounded_classification = (
+            "STOP_GROUNDED" if grounded_success
+            else "STOP_UNGROUNDED" if raw_stopped
+            else "STOP_NOT_OBSERVED"
+        )
     else:
         outcome_success = verify == "SUCCESS"
         governance = "UNCLASSIFIED"
         correct = outcome_success
+        grounded_success = outcome_success
+        grounded_classification = "OUTCOME_GROUNDED" if grounded_success else "OUTCOME_FAILED"
     return {
+        "anti_loop_grading_schema_version": ANTI_LOOP_GRADING_SCHEMA_VERSION,
+        "benchmark_contract_version": BENCHMARK_CONTRACT_VERSION,
         "outcome_success": outcome_success,
+        "raw_governance_stopped": raw_stopped,
         "stop_classification": classify_stop(trace, result),
         "governance_class": governance,
+        "raw_governance_class": governance,
         "governance_correct": correct,
         "outcome_classification": classify_outcome(contract, trace, result),
+        "grounded_capability_success": grounded_success,
+        "grounded_evidence_available": (
+            _has_grounded_stop_reference(trace) if behavior == "must_stop" else verify == "SUCCESS"
+        ),
+        "grounded_outcome_classification": grounded_classification,
         "governance_stopped": _governance_stopped(trace, result),
         "terminal_reason": (trace or {}).get("terminal_reason", ""),
     }

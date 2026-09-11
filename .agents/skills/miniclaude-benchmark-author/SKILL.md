@@ -14,7 +14,7 @@ description: 为 mini-claude 设计、生成并审计高质量 Benchmark Family 
 - 用户只要求讨论或评审设计时：完成调研、Capability Spec 和 Gate 审计，但不要创建或修改 `sandbox/tasks/`。
 - 用户明确要求生成 Benchmark 时：只要没有未解决的 `BLOCK`，即可创建新 Case；有明确边界和处置方式的 `WARN` 不应自动阻止有价值的 Case。可以运行低成本的 deterministic validation，不擅自启动真实 LLM Benchmark 或消耗 provider 配额。
 - 本 Skill 默认只新增任务 fixture、verifier、reference solution 及确有必要的极小 fixture 支持；不修改 Runtime、现有 Case、`eval_runner.py` 或 Evaluation Harness，不顺手重构无关代码。
-- `BLOCK` 必须回到对应设计阶段修改并重新检查，不能降级成 warning；`WARN` 可以在用户目标仍有价值时继续，但必须缩窄 Claim、调整 DEV/HOLDOUT 用途或在最终报告中明确风险；`NOT RUN` 不能冒充 `PASS`。若无法在当前权限和确定性环境中取得所需证据，标记 `BLOCKED` 并说明下一步，而不是反复拒绝。
+- `BLOCK` 必须回到对应设计阶段修改并重新检查，不能降级成 warning；已经证实的 verifier 作弊路径、答案泄露、不可解 fixture、reference 失败或唯一 patch 绑定，都是 validity `BLOCK`，即使动态 LLM eval 尚未运行也不能写成 `BLOCKED`。`WARN` 可以在用户目标仍有价值时继续，但必须缩窄 Claim、调整 DEV/HOLDOUT 用途或在最终报告中明确风险；`NOT RUN` 不能冒充 `PASS`。只有因为缺少必要外部证据、环境或依赖而无法形成该项结论时，才标记 `BLOCKED` 并说明下一步；动态评测尚未启动本身记为 `NOT RUN`。
 
 ## 决策等级与指令优先级
 

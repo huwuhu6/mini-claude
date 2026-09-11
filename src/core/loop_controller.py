@@ -450,6 +450,10 @@ class AttemptEvent:
     completion_reason: str = ""
     workspace_before_digest: str = ""
     workspace_after_digest: str = ""
+    # Evaluator-issued observation references are annotations only.  Runtime
+    # policy never reads these fields when choosing an action.
+    evidence_ids: tuple[str, ...] = ()
+    governance_evidence_ids: tuple[str, ...] = ()
 
     def to_dict(self) -> Dict[str, Any]:
         return {
@@ -481,6 +485,8 @@ class AttemptEvent:
             "completion_reason": self.completion_reason,
             "workspace_before_digest": self.workspace_before_digest,
             "workspace_after_digest": self.workspace_after_digest,
+            "evidence_ids": list(self.evidence_ids),
+            "governance_evidence_ids": list(self.governance_evidence_ids),
         }
 
 
@@ -839,7 +845,8 @@ class RuntimePolicy:
                        observed_failure: bool = False, semantic_status: str = "",
                        observation: str = "", exit_code: Optional[int] = None,
                        segment_exit_codes: Iterable[int] = (),
-                       resolution_evidence: str = "", subject_key: str = "") -> tuple[AttemptEvent, RuntimePolicyDecision]:
+                       resolution_evidence: str = "", subject_key: str = "",
+                       evidence_ids: Iterable[str] = ()) -> tuple[AttemptEvent, RuntimePolicyDecision]:
         """Append exactly one outcome event, then derive a decision from it."""
         before = workspace_before or {}
         after = workspace_after or {}
@@ -878,11 +885,15 @@ class RuntimePolicy:
             resolution_reason=resolution_reason,
             workspace_before_digest=before_digest,
             workspace_after_digest=after_digest,
+            evidence_ids=tuple(dict.fromkeys(str(item) for item in evidence_ids)),
         ))
         decision = self.observe(event)
         event = self.history.update_last(
             governance_decision=decision.action.value,
             governance_reason=decision.reason,
+            governance_evidence_ids=(
+                event.evidence_ids if decision.action is RuntimeDecision.HARD_STOP else ()
+            ),
         ) or event
         return event, decision
 
@@ -1015,7 +1026,7 @@ class RuntimePolicyAdapter:
                 observed_failure: bool = False, semantic_status: str = "",
                 observation: str = "", exit_code: Optional[int] = None,
                 segment_exit_codes: Iterable[int] = (), resolution_evidence: str = "",
-                subject_key: str = ""):
+                subject_key: str = "", evidence_ids: Iterable[str] = ()):
         event, decision = self.policy.record_attempt(
             turn=turn, tool_name=tool_name, intent_key=intent_key,
             args_fingerprint=args_fingerprint, success=success, result_text=result_text,
@@ -1032,6 +1043,7 @@ class RuntimePolicyAdapter:
             segment_exit_codes=segment_exit_codes,
             resolution_evidence=resolution_evidence,
             subject_key=subject_key,
+            evidence_ids=evidence_ids,
         )
         previous = self.policy.history.recent(2)
         progress = len(previous) < 2 or event.observation_fingerprint != previous[-2].observation_fingerprint

@@ -15,6 +15,7 @@ from eval_runner import (
     _select_cases,
     _sha256_tree,
     _truncate_output,
+    _validate_reference_solution,
     _validate_task,
     _version_label,
     write_run_results,
@@ -28,6 +29,8 @@ from compare_reports import (
     _compute_saved_log_read,
     _compute_tool_sequence,
     _fmt_cell,
+    _apply_governance_counts,
+    _render_anti_loop_summary,
     _render_coverage_notes,
     _render_provenance,
 )
@@ -46,6 +49,50 @@ def test_all_task_contracts_are_valid():
         errors.extend(f"{case_dir.name}: {error}" for error in task_errors)
 
     assert errors == []
+
+
+def test_must_recover_contracts_validate_baseline_failure_and_reference_integrity():
+    case_dirs = sorted(
+        path for path in TASKS_ROOT.iterdir()
+        if path.is_dir() and (path / "config.json").is_file()
+    )
+    errors = []
+    for case_dir in case_dirs:
+        config = json.loads((case_dir / "config.json").read_text(encoding="utf-8"))
+        evaluation = config.get("evaluation", {})
+        if (
+            evaluation.get("suite") != "anti_loop"
+            or evaluation.get("split") != "dev"
+            or evaluation.get("behavior_class") != "must_recover"
+        ):
+            continue
+        errors.extend(
+            f"{case_dir.name}: {error}"
+            for error in _validate_reference_solution(case_dir, config)
+        )
+
+    assert errors == []
+
+
+def test_reference_only_command_entrypoint_is_valid_for_reference_solution():
+    case_dir = TASKS_ROOT / "task_027_changing_poll_observation"
+    config = json.loads((case_dir / "config.json").read_text(encoding="utf-8"))
+
+    assert _validate_reference_solution(case_dir, config) == []
+
+
+def test_missing_reference_command_entrypoint_is_rejected(tmp_path):
+    import shutil
+
+    source = TASKS_ROOT / "task_027_changing_poll_observation"
+    case_dir = tmp_path / source.name
+    shutil.copytree(source, case_dir)
+    (case_dir / "reference_solution" / "reference_flow.py").unlink()
+    config = json.loads((case_dir / "config.json").read_text(encoding="utf-8"))
+
+    errors = _validate_reference_solution(case_dir, config)
+
+    assert any("reference solution 执行失败" in error for error in errors)
 
 
 def _task_configs(case_dirs):
@@ -361,3 +408,33 @@ def test_report_exposes_declared_but_missing_cases():
 
     assert "task_missing" in matrix
     assert "未覆盖: task_missing" in "\n".join(notes)
+
+
+def test_report_keeps_raw_governance_separate_from_grounded_capability():
+    metrics = [
+        {"anti_loop_governance_class": "TP", "anti_loop_grounded_capability_success": False},
+        {"anti_loop_governance_class": "TN", "anti_loop_grounded_capability_success": True},
+    ]
+    result = {}
+    _apply_governance_counts(result, metrics)
+    assert result["anti_loop_TP"] == 1
+    assert result["anti_loop_TN"] == 1
+    assert result["grounded_capability_trials"] == 2
+    assert result["grounded_capability_successes"] == 1
+    assert result["grounded_capability_rate"] == 0.5
+
+    unavailable = {"anti_loop_governance_class": "FN",
+                   "anti_loop_grounded_capability_success": False,
+                   "anti_loop_grounded_evidence_available": False}
+    result = {}
+    _apply_governance_counts(result, [unavailable])
+    assert result["grounded_capability_trials"] == 0
+
+    matrix = {"task_018": {"version": {
+        "evaluation_split": "dev", "anti_loop_TP": 1, "anti_loop_TN": 0,
+        "anti_loop_FP": 0, "anti_loop_FN": 0,
+        "grounded_capability_trials": 1, "grounded_capability_successes": 0,
+    }}}
+    report = "\n".join(_render_anti_loop_summary(matrix, [("version", Path("unused"))]))
+    assert "Grounded Capability" in report
+    assert "0/1 (0.0%)" in report

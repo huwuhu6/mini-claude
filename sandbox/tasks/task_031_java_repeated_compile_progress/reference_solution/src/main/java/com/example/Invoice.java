@@ -5,6 +5,6 @@ public final class Invoice {
         if (subtotalCents < 0 || discountPercent < 0 || discountPercent > 100) {
             throw new IllegalArgumentException("invalid invoice");
         }
-        return subtotalCents - (subtotalCents * discountPercent / 100) + 25;
+        return subtotalCents - (subtotalCents * discountPercent / 100) - 25;
     }
 }

@@ -21,9 +21,15 @@ task_list.md
 !/sandbox/tasks/**
 /sandbox/tasks/**/node_modules/
 /sandbox/tasks/**/__pycache__/
+# Keep evaluator source helpers versioned; runtime state remains ignored.
+!/sandbox/eval_runtime/
+/sandbox/eval_runtime/*
+!/sandbox/eval_runtime/controller.py
+!/sandbox/eval_runtime/verification_support.py
 
 # Personal / legacy docs
-docs/evolution/
+docs/evolution/*
+!docs/evolution/anti_loop_benchmark_validity_hardening_v2_report.md
 docs/legacy/
 docs/chat-logs/
 docs/pre-workflow-records/

@@ -22,7 +22,11 @@ from pathlib import Path
 from typing import Any
 
 sys.path.insert(0, str(Path(__file__).resolve().parent / "src"))
-from core.evaluation.anti_loop import grade_trial  # noqa: E402
+from core.evaluation.anti_loop import (  # noqa: E402
+    ANTI_LOOP_GRADING_SCHEMA_VERSION,
+    BENCHMARK_CONTRACT_VERSION,
+    grade_trial,
+)
 
 # ── 确认 stdout 使用 UTF-8 ───────────────────────────────
 if hasattr(sys.stdout, "reconfigure"):
@@ -52,6 +56,8 @@ _METRIC_FIELDS = (
     "reflection_count",
     "rollback_count",
     "anti_loop",
+    "anti_loop_grading_schema_version",
+    "benchmark_contract_version",
     "trial_validity",
     "runtime_error",
 )
@@ -212,6 +218,13 @@ def _load_trace_metrics(trace_path: Path) -> dict[str, Any]:
     """
     raw = json.loads(trace_path.read_text(encoding="utf-8"))
     result: dict[str, Any] = {}
+    schema = raw.get("anti_loop_grading_schema_version")
+    result["anti_loop_grading_schema_version"] = schema
+    result["benchmark_contract_version"] = raw.get("benchmark_contract_version")
+    result["anti_loop_schema_status"] = (
+        "CURRENT" if schema == ANTI_LOOP_GRADING_SCHEMA_VERSION
+        else "LEGACY_NOT_COMPARABLE"
+    )
 
     for field in _METRIC_FIELDS:
         val = raw.get(field)
@@ -252,8 +265,10 @@ def _load_trace_metrics(trace_path: Path) -> dict[str, Any]:
     result["_tool_sequence"] = _compute_tool_sequence(raw)
     result["_read_saved_log"] = _compute_saved_log_read(raw)
     anti_loop = raw.get("anti_loop")
-    if isinstance(anti_loop, dict):
+    if isinstance(anti_loop, dict) and schema == ANTI_LOOP_GRADING_SCHEMA_VERSION:
         result.update({f"anti_loop_{k}": v for k, v in anti_loop.items()})
+    elif isinstance(anti_loop, dict):
+        result["legacy_raw_governance_class"] = anti_loop.get("governance_class")
 
     return result
 
@@ -337,6 +352,8 @@ def _aggregate_metrics(all_metrics: list[dict]) -> dict[str, Any]:
 
 
 def _metric_trial_validity(metric: dict[str, Any]) -> str:
+    if metric.get("anti_loop_schema_status") == "LEGACY_NOT_COMPARABLE":
+        return "LEGACY_NOT_COMPARABLE"
     explicit = metric.get("trial_validity")
     if explicit in {"VALID", "INFRA_ERROR", "EVAL_ERROR"}:
         return str(explicit)
@@ -356,6 +373,7 @@ def _apply_governance_counts(result: dict[str, Any], metrics: list[dict[str, Any
     """
     classifiable = [
         m for m in metrics
+        if m.get("anti_loop_schema_status", "CURRENT") == "CURRENT"
         if m.get("anti_loop_governance_class") in {"TP", "TN", "FP", "FN"}
     ]
     for key in ("TP", "TN", "FP", "FN"):
@@ -365,6 +383,9 @@ def _apply_governance_counts(result: dict[str, Any], metrics: list[dict[str, Any
     result["valid_governance_trials"] = len(classifiable)
     result["infra_error_trials"] = sum(_metric_trial_validity(m) == "INFRA_ERROR" for m in metrics)
     result["eval_error_trials"] = sum(_metric_trial_validity(m) == "EVAL_ERROR" for m in metrics)
+    result["legacy_not_comparable_trials"] = sum(
+        _metric_trial_validity(m) == "LEGACY_NOT_COMPARABLE" for m in metrics
+    )
     total = sum(result.get(f"anti_loop_{key}", 0) for key in ("TP", "TN", "FP", "FN"))
     tp, tn, fp, fn = (result.get(f"anti_loop_{key}", 0) for key in ("TP", "TN", "FP", "FN"))
     result["governance_trial_count"] = total
@@ -380,6 +401,21 @@ def _apply_governance_counts(result: dict[str, Any], metrics: list[dict[str, Any
     )
     result["solvable_success_rate"] = (
         recovery_successes / len(recovery_trials) if recovery_trials else 0.0
+    )
+    grounded_trials = [
+        m for m in metrics
+        if m.get("anti_loop_schema_status", "CURRENT") == "CURRENT"
+        if "anti_loop_grounded_capability_success" in m
+        and m.get("anti_loop_grounded_evidence_available", True)
+    ]
+    grounded_successes = sum(
+        bool(m.get("anti_loop_grounded_capability_success"))
+        for m in grounded_trials
+    )
+    result["grounded_capability_trials"] = len(grounded_trials)
+    result["grounded_capability_successes"] = grounded_successes
+    result["grounded_capability_rate"] = (
+        grounded_successes / len(grounded_trials) if grounded_trials else 0.0
     )
     result["governance_accuracy"] = (tp + tn) / total if total else 0.0
 
@@ -538,20 +574,22 @@ def _include_result_cases(
             for ordinal, item in enumerate(case_results, start=1):
                 run_index = int(item.get("run_index") or ordinal)
                 trace: dict[str, Any] | None = None
-                trace_path = version_dir / f"trace_{case_id}_r{run_index:02d}.json"
-                try:
-                    trace = json.loads(trace_path.read_text(encoding="utf-8"))
-                except (OSError, json.JSONDecodeError):
-                    trace = None
+                trace_paths = [
+                    version_dir / f"trace_{case_id}_r{run_index:02d}.json",
+                    version_dir / f"trace_{case_id}.json",
+                ]
+                for trace_path in trace_paths:
+                    try:
+                        trace = json.loads(trace_path.read_text(encoding="utf-8"))
+                        break
+                    except (OSError, json.JSONDecodeError):
+                        trace = None
                 graded = grade_trial(
-                    contract,
-                    trace,
-                    {
-                        "verify_status": item.get("verify_status"),
-                        "final_status": item.get("final_status", ""),
-                        "runtime_error": item.get("runtime_error", ""),
-                    },
-                )
+                    contract, trace,
+                    {"verify_status": item.get("verify_status"),
+                     "final_status": item.get("final_status", ""),
+                     "runtime_error": item.get("runtime_error", "")},
+                ) if trace and trace.get("anti_loop_grading_schema_version") == ANTI_LOOP_GRADING_SCHEMA_VERSION else {}
                 accounting_metrics.append({
                     "behavior_class": contract.get("behavior_class"),
                     "trial_validity": item.get("trial_validity"),
@@ -559,7 +597,23 @@ def _include_result_cases(
                     "_trace_status": item.get("trace_status"),
                     "anti_loop_governance_class": graded.get("governance_class"),
                     "anti_loop_outcome_success": graded.get("outcome_success", False),
+                    "anti_loop_grounded_capability_success": graded.get(
+                        "grounded_capability_success", False
+                    ),
+                    "anti_loop_grounded_outcome_classification": graded.get(
+                        "grounded_outcome_classification", "UNKNOWN"
+                    ),
+                    "anti_loop_grounded_evidence_available": bool(
+                        trace is not None
+                        and trace.get("anti_loop_grading_schema_version") == ANTI_LOOP_GRADING_SCHEMA_VERSION
+                        and item.get("trace_status") == "ARCHIVED"
+                        and item.get("verify_status") != "CRASHED"
+                    ),
                     "outcome_pass": item.get("outcome_pass", False),
+                    "anti_loop_schema_status": (
+                        "CURRENT" if trace and trace.get("anti_loop_grading_schema_version") == ANTI_LOOP_GRADING_SCHEMA_VERSION
+                        else "LEGACY_NOT_COMPARABLE"
+                    ),
                 })
             version_metrics = matrix.setdefault(case_id, {}).get(version)
             statuses = [
@@ -672,6 +726,7 @@ def _render_provenance(
     suite_hashes: set[str] = set()
     config_hashes: set[str] = set()
     model_conditions: set[str] = set()
+    grading_schemas: set[str] = set()
     missing_manifest = False
 
     for version, _ in versions:
@@ -688,6 +743,7 @@ def _render_provenance(
         agent = manifest.get("agent", {})
         environment = manifest.get("environment", {})
         suite_hash = str(manifest.get("task_suite_sha256", ""))
+        grading_schemas.add(str(manifest.get("anti_loop_grading_schema_version", "missing")))
         if suite_hash:
             suite_hashes.add(suite_hash)
         agent_config = manifest.get("agent_config", {})
@@ -711,7 +767,12 @@ def _render_provenance(
         lines.append("> ⚠ Agent config hash 不一致，结果不可直接比较。")
     if len(model_conditions) > 1:
         lines.append("> ⚠ provider/model/temperature/max_tokens 不一致，结果不可直接比较。")
-    if missing_manifest or len(suite_hashes) > 1 or len(config_hashes) > 1 or len(model_conditions) > 1:
+    if len(grading_schemas) > 1 or (grading_schemas and str(ANTI_LOOP_GRADING_SCHEMA_VERSION) not in grading_schemas):
+        lines.append(
+            f"> ⚠ Anti-Loop grading schema 不一致或不是 v{ANTI_LOOP_GRADING_SCHEMA_VERSION}；"
+            "旧结果只作 legacy 参考，不进入 v2 grounded 汇总。"
+        )
+    if missing_manifest or len(suite_hashes) > 1 or len(config_hashes) > 1 or len(model_conditions) > 1 or len(grading_schemas) > 1:
         lines.append("> 建议：先确认任务集和运行环境，再解释轮数、Token 或成功率的变化。")
     lines.append("")
     return lines
@@ -733,9 +794,19 @@ def _render_anti_loop_summary(matrix: dict[str, dict[str, dict[str, Any]]],
             fn = sum(m.get("anti_loop_FN", 0) for m in records)
             total = tp + tn + fp + fn
             acc = (tp + tn) / total if total else 0.0
-            rows.append(f"| `{version}` | {tp} | {tn} | {fp} | {fn} | {acc:.1%} |")
+            grounded_trials = sum(m.get("grounded_capability_trials", 0) for m in records)
+            grounded_successes = sum(m.get("grounded_capability_successes", 0) for m in records)
+            grounded_rate = grounded_successes / grounded_trials if grounded_trials else 0.0
+            rows.append(
+                f"| `{version}` | {tp} | {tn} | {fp} | {fn} | {acc:.1%} | "
+                f"{grounded_successes}/{grounded_trials} ({grounded_rate:.1%}) |"
+            )
         if rows:
-            lines.extend([f"### {split}", "", "| 版本 | TP | TN | FP | FN | Governance Accuracy |", "|---|---:|---:|---:|---:|---:|", *rows, ""])
+            lines.extend([
+                f"### {split}", "",
+                "| 版本 | TP | TN | FP | FN | Governance Accuracy | Grounded Capability |",
+                "|---|---:|---:|---:|---:|---:|---:|", *rows, "",
+            ])
     return lines
 
 
@@ -798,14 +869,15 @@ def _render_trial_validity_summary(
 ) -> list[str]:
     lines = [
         "## Trial Validity / Denominator\n",
-        "有 contract 的 Trial 都进入 TP/TN/FP/FN；Provider、Agent、Evaluator 失败同时保留为执行健康度诊断。\n",
-        "| version | planned | attempted | governance denominator | infra errors | eval errors |",
-        "|---|---:|---:|---:|---:|---:|",
+        "有 contract 的 Trial 只有在 grading schema v2 时进入 v2 TP/TN/FP/FN；legacy 结果单列。\n",
+        "| version | planned | attempted | governance denominator | infra errors | eval errors | legacy not comparable |",
+        "|---|---:|---:|---:|---:|---:|---:|",
     ]
     for version, payload in (results_by_version or {}).items():
         if not payload or payload.get("_error"):
             continue
         records = [r for r in payload.get("results", []) if isinstance(r, dict)]
+        schema_ok = str(payload.get("anti_loop_grading_schema_version", "")) == str(ANTI_LOOP_GRADING_SCHEMA_VERSION)
         governance = sum(
             grade_trial(
                 {"behavior_class": r.get("behavior_class")},
@@ -816,13 +888,15 @@ def _render_trial_validity_summary(
                     "runtime_error": r.get("runtime_error", ""),
                 },
             ).get("governance_class") in {"TP", "TN", "FP", "FN"}
+            and schema_ok
             for r in records
         )
         infra = sum(r.get("trial_validity") == "INFRA_ERROR" for r in records)
         eval_errors = sum(r.get("trial_validity") == "EVAL_ERROR" for r in records)
         lines.append(
             f"| `{version}` | {payload.get('planned_trials', 0)} | "
-            f"{payload.get('attempted_trials', len(records))} | {governance} | {infra} | {eval_errors} |"
+            f"{payload.get('attempted_trials', len(records))} | {governance} | {infra} | {eval_errors} | "
+            f"{0 if schema_ok else len(records)} |"
         )
     lines.append("")
     return lines

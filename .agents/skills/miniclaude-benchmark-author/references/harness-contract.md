@@ -42,7 +42,7 @@ Runner 只把 `EVAL_TRACE_PATH` 注入 verifier；它指向 Agent 可写 workspa
 
 这些字段提供 metadata，不会代替 semantic QA。`expected_final_status` 只适合 Claim 确实要求某一终态的 Case；不要为了让 verifier 通过而机械指定 `CIRCUIT_BROKEN`。`verify_script_file` 可以显式为 `null`，但新的可判定 Benchmark 通常应有隐藏 verifier。
 
-对于 `anti_loop` 的 `must_recover`，当前 Runner 的 reference self-check 要求 `reference_solution/` 和 `verify_script_file`，并可先执行 `reference_command`；然后以 `EVAL_REFERENCE_CHECK=1` 执行 verifier。Reference 分支应真的验证 reference outcome，不要无条件 `exit 0`。命令解析使用简单 token split，Windows/JVM/Node 命令要按当前代码和平台实际验证。
+对于 `anti_loop` 的 `must_recover`，当前 Runner 的 reference self-check 要求 `reference_solution/` 和 `verify_script_file`，并在复制 reference solution 后、reference workspace 内执行 `reference_command`；该命令不是 untouched baseline 的入口要求。Baseline failure gate 单独验证 baseline 不能满足目标 contract；reference-only command entrypoint 可以只存在于 `reference_solution/`，但 reference 分支必须真实执行并通过，不能无条件 `exit 0`。然后以 `EVAL_REFERENCE_CHECK=1` 执行 verifier。命令解析使用简单 token split，Windows/JVM/Node 命令要按当前代码和平台实际验证。
 
 ## Anti-Loop 的两层记账
 
