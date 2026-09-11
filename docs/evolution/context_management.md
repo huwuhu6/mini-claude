@@ -90,8 +90,10 @@ Audit 009 不再在 Agent 主循环中建设第二套 validator，而是由 pars
 本阶段保留 recent 15、0.7 micro-compaction 阈值和现有摘要策略。删除 Transcript 遇到文件系统拒绝时，索引保留该 durable record，因而 retention 只能保持可观察的一致性而不能绕过外部 I/O 故障。当前剩余 Context 问题主要进入 Architecture / Benchmark 阶段：Provider-aware Context Budget、Summary 12K tail-only limitation、Recent 15 retention strategy、Summary Trust Boundary / Prompt Injection、Value-aware Retention 和 Project Context Discovery。没有引入事务日志、Summary 新算法、长期 Memory、Anthropic compatibility、Multi-Agent、Team、Inbox/MessageBus 或 Background delivery 机制；Hot Context 的 CTX-006 继续作为 follow-up。
 ## 2026-09-11
 
-Commit: `PENDING`
-Commit Description: `refactor(context): 建立 Context Baseline Modernization`
+Commit: `1986265`
+Commit Description: `refactor(context): 建立完整请求预算与基线观测能力`
+
+本项目的 Context Foundation Baseline 0 为 `9a437c2`；本阶段实现与本次 Evolution 回填完成后的最终 HEAD 定义为 Context Benchmark Baseline 0。由于 Git Commit 不能在自身内容中可靠记录自身 Hash，最终 Benchmark Baseline revision 以本次文档提交后的真实 HEAD 为准，并在交付报告中记录。
 
 ### Description
 
@@ -103,7 +105,7 @@ Summary baseline 不再静默保留最后 12K chars，也不再对每条 message
 
 ### Result / Evidence
 
-新增 deterministic tests 覆盖显式阈值边界与非法配置、完整 request estimate、Provider usage/cache 字段缺失与存在、按 token 加权的任务级 cache hit rate、Summary 完整 middle 输入、Summary usage 统计，以及 tiktoken encoding 初始化失败时的安全 fallback。当前已运行新增和既有 Context Foundation/Reliability 测试，以及 Trace/Provider 和 Compression smoke 测试；未运行真实 Provider Benchmark 或 Evaluation。
+新增 deterministic tests 覆盖显式阈值边界与非法配置、完整 request estimate、Provider usage/cache 字段缺失与存在、cached 超界 clamp、按 token 加权的任务级 cache hit rate、Summary 完整 middle 输入、Summary output reserve、Summary usage 统计、旧配置迁移报错，以及 tiktoken encoding 初始化失败时的安全 fallback。完整 unit/integration deterministic suite 为 `277 passed, 2 deselected`；其中两个 deselected case 是已经在 clean `5ccecf8` baseline 独立确认的 pre-existing Evaluation oracle mutation tests。聚焦 Context/Trace/Provider 测试为 `65 passed`，直接受影响测试为 `57 passed`，`git diff --check` 为 PASS。未运行真实 Provider、Context Benchmark 或 Evaluation。
 
 ### Decision / Limitation
 
