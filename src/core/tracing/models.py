@@ -31,6 +31,12 @@ class ToolTrace:
     finished_at: float = 0.0
     latency_ms: float = 0.0
     success: bool = True
+    execution_success: bool = True
+    observed_failure: bool = False
+    semantic_status: str = ""
+    observation: str = ""
+    exit_code: Optional[int] = None
+    segment_exit_codes: List[int] = field(default_factory=list)
     loop_guard_blocked: bool = False
     guard_type: str = ""
     guard_reason: str = ""
@@ -72,6 +78,12 @@ class ToolTrace:
             'finished_at': round(self.finished_at, 3),
             'latency_ms': round(self.latency_ms, 1),
             'success': self.success,
+            'execution_success': self.execution_success,
+            'observed_failure': self.observed_failure,
+            'semantic_status': self.semantic_status,
+            'observation': self.observation,
+            'exit_code': self.exit_code,
+            'segment_exit_codes': list(self.segment_exit_codes),
             'loop_guard_blocked': self.loop_guard_blocked,
             'guard_type': self.guard_type or (
                 "HARD_CIRCUIT_BREAKER" if self.circuit_breaker_triggered
@@ -166,6 +178,7 @@ class TaskTrace:
     governance_decision: str = ""
     open_blocker_count: int = 0
     environment: Dict[str, Any] = field(default_factory=dict)
+    attempt_events: List[Dict[str, Any]] = field(default_factory=list)
     turns: List[TurnTrace] = field(default_factory=list)
 
     def to_dict(self) -> Dict[str, Any]:
@@ -195,5 +208,6 @@ class TaskTrace:
             'governance_decision': self.governance_decision,
             'open_blocker_count': self.open_blocker_count,
             'environment': dict(self.environment),
+            'attempt_events': [dict(event) for event in self.attempt_events],
             'turns': [t.to_dict() for t in self.turns],
         }

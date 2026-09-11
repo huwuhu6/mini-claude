@@ -1,5 +1,25 @@
 # Anti-Loop Benchmark Red-Team Audit
 
+## Tool Outcome Observation Loss 修复（2026-09-11）
+
+【观察到的问题】旧链路把 stdout/stderr 合并为展示文本，再只看最终 `[Exit Code: 0]`。`A & echo OK` 会让前一个失败被 echo 的 0 覆盖，所以 019 r03、020 r03、021 r01 的 Trace 写成 SUCCESS；问题发生在 Policy 之前，Policy 根本没有看到失败事实。
+
+【为什么原设计会这样】执行结果、目标观察结果和 LLM 展示文本共用一个 success boolean，无法同时表达“curl 进程成功但 HTTP=503”和“wrapper 进程成功但 segment exit=1”。在格式化文本上再 Regex 也会把 warning、README 和 grep 结果误判成资源失败。
+
+【考虑过哪些方案】继续扩大文本 Regex 会制造 False Positive；把 semantic failure 改写成 process failure 又会丢失事实边界。采用结构化 `ShellSession`/`ToolResult` 结果加轻量 `ObservationNormalizer`：LLM 仍看到文本，Runtime 读取结构化 process facts 和保守 semantic evidence。
+
+【最终怎么改】ShellSession/BaseTools 保留 `exit_code/stdout/stderr/timed_out/cancelled/segment_exit_codes`；AttemptEvent 增加 `execution_success`、`observed_failure`、`semantic_status`、`observation`、`exit_code` 和 segment codes，因此 `execution_success=true` 与 `observed_failure=true` 可以并存。Normalizer 只识别有工具上下文的 HTTP 4xx/5xx、后台失败、probe/resource/toolchain 权限错误和明确 traceback，不把任意 stderr 当失败。本轮没有修改 RuntimePolicy 阈值、lifetime strike 或 task-specific 规则。
+
+【评测怎么证明】`anti_loop_observation_targeted_v2` 的 018/019/020/021 Trace 都写入了真实 AttemptEvent evidence：HTTP_403、HTTP_503、包装 segment exit 和 HTTP_404 均可见；False Positive 回归覆盖普通 HTTP 503 文本、grep README 中的 Permission denied、warning stderr，相关测试全部通过。DEV×1 `anti_loop_observation_candidate_dev1` 保留 12/12 个 Trial，账本为 TP/TN/FP/FN=`1/6/0/5`，Governance Accuracy=`7/12`，Stop Precision=`1/1`，Stop Recall=`1/6`，False Stop Rate=`0/6`，Solvable Success=`5/6`，Verifier Pass=`6/12`，其中 3 个 Infra Error。DEV×3 `anti_loop_observation_candidate` 保留 36/36 个 Trial，账本为 TP/TN/FP/FN=`7/18/0/11`，Governance Accuracy=`25/36`，Stop Precision=`7/7`，Stop Recall=`7/18`，False Stop Rate=`0/18`，Solvable Success=`6/18`，Verifier Pass=`13/36`，其中 21 个 Infra Error。本轮没有运行 Holdout。
+
+【还剩什么风险】Candidate 的有效非 Infra 成本样本只有 15/36，不能把全量平均值解释成 Runtime 成本改善；有效样本均值为 9.53 turns、50,655.5 tokens、42.57s，Baseline 为 11.28 turns、69,475.9 tokens、54.85s，但样本集合不一致。Observation 已准确进入 Event Stream，是否需要用近期重复 semantic failure 形成更强 stagnation evidence 留到下一阶段。
+
+## Verifier 与旧 terminal reason 的耦合（2026-09-11）
+
+【观察到的问题】019 verifier 原来只接受 `ENVIRONMENT_BLOCK` 或 `HARD_CIRCUIT_BREAKER`，会把当前实现合法的 `UNRESOLVED_BLOCKER_COMPLETION` 判为失败。
+
+【最终怎么改】Verifier 改为检查真实服务不可用证据、没有伪造成功，以及最终状态和 terminal reason 是否体现阻断，不再绑定旧类名/旧 Guard reason；018/020/021 同样接受 observed failure evidence。这次 smoke 中 019 仍有 Agent 把服务当成 solved，属于 Outcome/治理未停止，不是旧 reason 耦合。
+
 本审计针对 task_018～task_029 的当前 fixture，结论优先于分数。`task_030_long_running_daemon_lifecycle_legacy`、task_015 和 task_016 不属于 Core Anti-Loop 统计。
 
 ## 总结结论
@@ -81,3 +101,43 @@ Reference self-check 已从“检查哨兵文件”改为执行 reference comman
 | 035 | Node | holdout | recover | `bin/config/tests` 与 DEV 不同拓扑；reference、空 Trace、删除测试均失败 |
 
 跨语言 Core 当前为 DEV 12、HOLDOUT 5；生态分布为 Python 10、JVM 2、Node 2、shell 3。静态审计通过后，仍需以冻结 commit 上的 DEV×1 Smoke 观察实际治理轨迹，不能把静态 HIGH 当成 Dynamic HIGH。
+
+## 统一 Attempt Event Stream 重构（2026-09-11）
+
+【观察到的问题】旧实现让短窗口 LoopGuard、任务生命周期 CircuitBreaker strike、FailureMemory 计数、Workspace stall counter 和 ProgressGovernance 各自记账。`edit → test → edit → test` 中间即使有真实修改，旧 test failure 仍可能累计到 5 次；启动时的 OFFLINE 快照也可能把后来已经恢复的网络永久挡住。
+
+【最终怎么改】所有 Tool Attempt 统一写入 `AttemptEvent`，由 `AttemptHistory` 保存最近 32 条；SUCCESS、FAILURE、BLOCKED 都进入同一顺序流。Loop、失败复发、状态振荡只从这条流产生 Evidence；`RuntimePolicy` 是唯一决策入口，`CircuitBreaker` 只执行已经批准的 HARD_STOP。删除旧 ProgressGovernance 双轨状态层和 FailureEscalationPolicy；FailureMemory 仅保留无独立计数的兼容查询视图，WorkspaceStateGuard 不再保存隐藏 stall history。环境探测只更新 evidence，动态 连接拒绝、权限和包错误不再直接拥有任务终止权。
+
+【评测怎么证明】Baseline commit `7d27d82d64a088812ad9f847d9dc3dfc2e186e13`，`anti_loop_unified_baseline`，DEV 12 cases × 3 runs；原始归档 `run_results_20260910T154937Z.json`。最终 Candidate 为 `anti_loop_unified_candidate`，DEV 12 cases × 3 runs；归档 `run_results_20260910T173833Z.json`。下面是对完整 Durable Trial Ledger 的修正复算，不再只统计 VALID trial：
+
+| 指标 | Baseline | Candidate |
+|---|---:|---:|
+| TP / FP / TN / FN | 11 / 0 / 18 / 7 | 13 / 0 / 18 / 5 |
+| Governance Accuracy | 80.56% (29/36) | 86.11% (31/36) |
+| Stop Precision | 100.00% (11/11) | 100.00% (13/13) |
+| Stop Recall | 61.11% (11/18) | 72.22% (13/18) |
+| False Stop Rate | 0.00% (0/18) | 0.00% (0/18) |
+| Solvable Success Rate | 77.78% (14/18) | 83.33% (15/18) |
+| Appropriate Stop Rate | 61.11% (11/18) | 72.22% (13/18) |
+| Verifier Pass Rate | 61.11% (22/36) | 66.67% (24/36) |
+| 平均 Turn | 10.72 | 8.58 |
+| 平均 Token | 64,876 | 46,607 |
+| 平均 Latency | 56.83s | 41.43s |
+
+Smoke 为 8/12，正式 Candidate 的 verifier 通过数为 24/36（`eval_result` 通过数为 15/36）；022 connection recovery、023 permission recovery、033 shell oscillation 和 034 signer blocker 的关键轨迹通过。修正后的 Candidate 没有出现 false stop，但仍有 5 个 must_stop FN，因此本轮没有运行 HOLDOUT，也不能声称跨数据泛化。完整 36×2 版本的逐 Trial 账本见 `sandbox/eval_results/anti_loop_accounting_audit.md`，由 `scripts/audit_anti_loop_accounting.py` 从 raw results 和 Trace 复算。
+
+## Evaluation Accounting Audit（2026-09-11）
+
+【观察到的问题】DEV 实际执行了 36 个 Trial，但旧报告把 Governance Accuracy 写成 Candidate `24/33`。缺少的 3 个不是没有执行，而是 `task_024_local_package_fallback` 的 3 次 provider timeout：它们都有 `ARCHIVED` Trace 和 Durable Ledger 行，只被 `trial_validity=INFRA_ERROR` 标记。旧的 `aggregate_governance` 和 `compare_reports.py` 又用 VALID-only 过滤，于是这 3 行从 confusion matrix 消失。
+
+【为什么原设计会这样】评测器把“执行健康度”（provider/evaluator 是否报错）和“治理行为”（是否错误停止）混成了同一个过滤条件。这样会美化治理准确率和召回率，也让 `Solvable Success Rate=15/15` 看起来像所有 recover trial 都成功；实际上 18 个 must_recover 中有 3 个 verifier 失败。另一个口径问题是 TN 只代表“没有误停”，不能代表业务任务已经成功。
+
+【考虑过哪些方案】方案 A：继续删除 Crash/Invalid，保留 VALID-only 统计，放弃，因为 benchmark contract 明确要求缺失 Trace、Case Crash 和 verifier failure 都留在 trial 分母。方案 B：所有有 contract 的 Trial 都进入 TP/FP/TN/FN，执行健康度单独计数；没有 stop 证据时保守记 must_stop=FN、must_recover=TN；Outcome 成功率独立按 must_recover 全量计算。采用方案 B，因为它既不让 Trial 消失，也不把 Outcome Failure 伪装成 Governance Failure。
+
+【最终怎么改】`eval_runner.py` 在每个落盘 Trial 中保留 accounting 字段并为缺失 Trace/runner crash 生成可解释的保守分类；`anti_loop.py` 和 `compare_reports.py` 不再用 VALID-only 条件裁掉 confusion matrix；`Solvable Success Rate` 改为 `must_recover outcome_success / 全部 must_recover`。新增 `scripts/audit_anti_loop_accounting.py` 输出 36-row 逐 Trial 对账表。
+
+【评测怎么证明】修正前的候选摘要是 Governance Accuracy `24/33`、Solvable Success `15/15`；修正后同一批 raw results 为 Candidate `TP=13, FP=0, TN=18, FN=5`，Governance Accuracy `31/36=86.11%`，Stop Recall `13/18=72.22%`，False Stop Rate `0/18=0%`，Solvable Success `15/18=83.33%`，Verifier Pass `24/36=66.67%`。Baseline 也按同一口径重算为 `TP=11, FP=0, TN=18, FN=7`、Governance Accuracy `29/36=80.56%`、Solvable Success `14/18=77.78%`。这说明修正改变了可见分母和指标解释，但没有重新运行 Agent，也没有修改 Runtime。
+
+【还剩什么风险】缺失 Trace/runner crash 的保守 FN/TN 是“没有观察到 stop”的审计归类，不等于证明了真实 Agent 决策；如果未来要求区分“未知”而不是保守归类，需要额外报告 Crash/Invalid 子类，但不能把它们从主分母删除。当前 Candidate 的 5 个 FN 仍需按真实 Trace 分析，尚未据此调整 Runtime，也未运行 Holdout。
+
+【还剩什么风险】AttemptEvent 目前只有 observation fingerprint 和少量显式状态 token，没有可靠的 test error delta；真实进展仍可能依赖模型主动采取 fallback。`EnvironmentBlocker.check_command` 兼容入口还可能被外部调用方误当成决定，后续应改成明确的 evidence API。未通过的 018/019/020/021/024 说明“治理架构正确”不能替代“Agent 完成了任务动作”。

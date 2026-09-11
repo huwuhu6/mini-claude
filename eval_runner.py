@@ -85,6 +85,26 @@ EFFECTIVE_MAX_ITERATIONS = 50
 _BASH_LIKE_TOOLS = frozenset({"bash", "execute_command", "run_command"})
 
 
+def _latest_governance_decision(trace: dict[str, Any]) -> str:
+    """Extract the last structured runtime decision for accounting output."""
+    decisions: list[str] = []
+
+    def visit(value: Any) -> None:
+        if isinstance(value, dict):
+            decision = value.get("governance_decision")
+            if isinstance(decision, str) and decision:
+                decisions.append(decision)
+            for child in value.values():
+                visit(child)
+        elif isinstance(value, list):
+            for child in value:
+                visit(child)
+
+    visit(trace)
+    non_allow = [decision for decision in decisions if decision != "ALLOW"]
+    return (non_allow or decisions or ["UNKNOWN"])[-1]
+
+
 def _positive_int(value: str) -> int:
     try:
         parsed = int(value)
@@ -615,6 +635,7 @@ def run_case(
     base_result = {
         "case_id": case_id,
         "trial_index": trial_index,
+        "run_index": run_idx,
         "suite": None,
         "split": None,
         "behavior_class": None,
@@ -738,6 +759,8 @@ def run_case(
     trace_status = "MISSING"
     trial_validity = "EVAL_ERROR"
 
+    anti_loop_data: dict[str, Any] | None = None
+    runtime_error = ""
     if trace_path and trace_path.exists():
         try:
             trace_data = json.loads(trace_path.read_text(encoding="utf-8"))
@@ -775,22 +798,22 @@ def run_case(
                     if not runtime_error:
                         failure_reason = f"agent_final_status: {final_status}"
             trace_data["eval_result"] = eval_result
+            trace_data["governance_decision"] = _latest_governance_decision(trace_data)
             trial_validity = classify_trial_validity(trace_data, {
                 "verify_status": verify_status,
                 "runtime_error": runtime_error,
             })
             trace_data["trial_validity"] = trial_validity
             if contract.get("suite") == "anti_loop":
-                if trial_validity == "VALID":
-                    trace_data["anti_loop"] = grade_trial(contract, trace_data, {
-                        "verify_status": verify_status,
-                        "final_status": trace_data.get("final_status", ""),
-                    })
-                else:
-                    trace_data["anti_loop"] = {
-                        "governance_class": "UNCLASSIFIED",
-                        "trial_validity": trial_validity,
-                    }
+                # Governance is classifiable from the observed terminal
+                # action even when the provider/evaluator had an execution
+                # error.  Keep trial_validity as a separate health field.
+                anti_loop_data = grade_trial(contract, trace_data, {
+                    "verify_status": verify_status,
+                    "final_status": trace_data.get("final_status", ""),
+                    "runtime_error": runtime_error,
+                })
+                trace_data["anti_loop"] = anti_loop_data
 
             print(f"  📊 指标对账完成 — "
                   f"precision={trace_data['tool_call_precision']}, "
@@ -821,6 +844,16 @@ def run_case(
         print("  ⚠ 未找到 Trace JSON，跳过指标对账与归档")
         terminal_reason = "AGENT_EXCEPTION" if agent_error else "TRACE_MISSING"
         trial_validity = "INFRA_ERROR" if agent_error else "EVAL_ERROR"
+        runtime_error = agent_error or ""
+        if contract.get("suite") == "anti_loop":
+            # No trace means no evidence of a governance stop.  This is
+            # conservatively FN for must_stop and TN for must_recover; the
+            # execution error remains visible in trial_validity.
+            anti_loop_data = grade_trial(contract, None, {
+                "verify_status": verify_status,
+                "final_status": "",
+                "runtime_error": runtime_error,
+            })
 
     # ── Step 5: 垃圾回收 + 句柄缓冲 + 暴力毁灭现场 ────────
     gc.collect()
@@ -851,7 +884,7 @@ def run_case(
         "eval_result": trace_data.get("eval_result", verify_status),
         "terminal_reason": terminal_reason,
         "trial_validity": trial_validity,
-        "runtime_error": trace_data.get("runtime_error", ""),
+        "runtime_error": runtime_error,
         "trace_status": trace_status,
         "failure_reason": failure_reason,
         "verify_exit_code": verify_exit_code,
@@ -859,7 +892,18 @@ def run_case(
         "verify_stderr": verify_stderr,
         "verify_duration_s": verify_duration_s,
         "evaluation": contract,
-        "anti_loop": trace_data.get("anti_loop"),
+        "anti_loop": anti_loop_data or trace_data.get("anti_loop"),
+        "trace_present": trace_status == "ARCHIVED",
+        "verifier_pass": verify_status == "SUCCESS",
+        "outcome_pass": bool(anti_loop_data and anti_loop_data.get("outcome_success")),
+        "governance_decision": trace_data.get("governance_decision", "UNKNOWN"),
+        "governance_class": (anti_loop_data or {}).get("governance_class"),
+        "included_in_governance_denominator": bool(
+            (anti_loop_data or {}).get("governance_class") in {"TP", "FP", "TN", "FN"}
+        ),
+        "exclusion_reason": "" if (anti_loop_data or {}).get("governance_class") in {
+            "TP", "FP", "TN", "FN"
+        } else "missing behavior contract or governance evidence",
     }
 
 
@@ -892,9 +936,14 @@ def _crashed_trial_result(
     """Create a denominator-preserving result when the runner itself crashes."""
     evaluation = (config or {}).get("evaluation") or {}
     now = datetime.now(timezone.utc).isoformat()
+    anti_loop_data = grade_trial(
+        evaluation, None,
+        {"verify_status": "CRASHED", "final_status": "", "runtime_error": reason},
+    ) if evaluation.get("suite") == "anti_loop" else None
     return {
         "case_id": case_dir.name,
         "trial_index": trial_index,
+        "run_index": trial_index,
         "suite": evaluation.get("suite"),
         "split": evaluation.get("split"),
         "behavior_class": evaluation.get("behavior_class"),
@@ -910,6 +959,16 @@ def _crashed_trial_result(
         "terminal_reason": "runner_exception",
         "trial_validity": "INFRA_ERROR",
         "failure_reason": reason,
+        "trace_present": False,
+        "verifier_pass": False,
+        "outcome_pass": False,
+        "governance_decision": "UNKNOWN",
+        "governance_class": (anti_loop_data or {}).get("governance_class"),
+        "included_in_governance_denominator": bool(
+            (anti_loop_data or {}).get("governance_class") in {"TP", "FP", "TN", "FN"}
+        ),
+        "exclusion_reason": "" if anti_loop_data else "missing behavior contract or governance evidence",
+        "anti_loop": anti_loop_data,
     }
 
 

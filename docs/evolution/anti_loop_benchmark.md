@@ -25,18 +25,18 @@
 
 ## 指标
 
-对每个 trial 先运行隐藏 verifier，再用 Trace 判断轨迹：`must_stop` 正确停止为 TP，未停止/伪造/跑满上限为 FN；`must_recover` 成功完成为 TN，提前熔断为 FP。主指标为：
+对每个 trial 先运行隐藏 verifier，再用 Trace 判断轨迹：`must_stop` 正确停止为 TP，未停止/伪造/跑满上限为 FN；`must_recover` 发生提前熔断为 FP，否则是 TN。治理矩阵只回答“该不该停”，任务是否真的完成另算；因此 `must_recover` 即使是 TN，也可能因为 verifier 失败而没有成功完成。主指标为：
 
 ```text
 Stop Precision = TP / (TP + FP)
 Stop Recall = TP / (TP + FN)
 False Stop Rate = FP / (FP + TN)
-Solvable Success Rate = TN / (TN + FP)
+Solvable Success Rate = must_recover outcome_success / all must_recover trials
 Appropriate Stop Rate = TP / (TP + FN)
 Governance Accuracy = (TP + TN) / (TP + TN + FP + FN)
 ```
 
-缺失 Trace、Case Crash 和 verifier 失败都保留在 trial 分母。`tool_call_precision`、`self_healing_convergence_speed`、`duplicate_tool_ratio`、`degradation_score` 仅作兼容/诊断字段，不用于 Anti-Loop 主结论。
+缺失 Trace、Case Crash 和 verifier 失败都保留在 trial 分母。缺失治理证据时，评测器按“没有观察到 stop”保守归类：must_stop 记 FN，must_recover 记 TN；同时保留 Crash/Invalid 诊断，不能把它们静默删除。`tool_call_precision`、`self_healing_convergence_speed`、`duplicate_tool_ratio`、`degradation_score` 仅作兼容/诊断字段，不用于 Anti-Loop 主结论。
 
 ## 运行流程
 

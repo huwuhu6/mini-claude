@@ -26,7 +26,7 @@ class EnvironmentBlock:
 
 
 class EnvironmentBlocker:
-    """Recognize failures that cannot be fixed by changing retry syntax."""
+    """Produce environment evidence; it never owns a task-level decision."""
 
     _PACKAGE_PATTERNS = (
         r"No matching distribution found",
@@ -73,7 +73,12 @@ class EnvironmentBlocker:
         self.preflight = preflight
 
     def check_command(self, tool_name: str, args: dict) -> Optional[EnvironmentBlock]:
-        """Block package downloads before execution when the probe is offline."""
+        """Return a staleable evidence object, never a runtime decision.
+
+        The method remains as a compatibility hook for callers that want to
+        inspect the command, but RuntimePolicy must see the real result before
+        deciding whether a dynamic environment failure is actionable.
+        """
         if self.preflight.network_access != "OFFLINE":
             return None
         if tool_name not in {"bash", "run_background"}:
@@ -82,7 +87,7 @@ class EnvironmentBlocker:
         if self._INSTALL_COMMAND.search(str(command)):
             return EnvironmentBlock(
                 "NETWORK_UNREACHABLE",
-                "Network access is OFFLINE; external dependency downloads are unavailable.",
+                "Startup probe was OFFLINE; the actual target operation still requires a fresh result.",
             )
         return None
 

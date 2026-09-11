@@ -4,9 +4,8 @@ test_failure_intelligence.py — Regression tests for the Failure Intelligence L
 Verifies:
   - Failure classification (pip install failures → NETWORK_UNREACHABLE / PACKAGE_NOT_FOUND)
   - Strategy fingerprint inference
-  - Escalation policy triggers after N same-category failures
   - ToolTrace extension carries failure fields
-  - End-to-end: agent with failure intelligence stops retrying after escalation
+  - RuntimePolicy owns recurrence decisions outside this stateless analyzer
 """
 from __future__ import annotations
 import sys
@@ -24,8 +23,8 @@ if _src not in sys.path:
 import pytest
 from core.failure_intelligence import (
     FailureCategory, Recoverability, FailureSignature,
-    FailureAnalyzer, FailureMemory, FailureEscalationPolicy,
-    infer_strategy_fingerprint, build_escalation_message,
+    FailureAnalyzer, FailureMemory,
+    infer_strategy_fingerprint,
 )
 from core.tracing import ToolTrace, TraceManager
 
@@ -156,62 +155,6 @@ class TestStrategyFingerprint:
             assert fp == "NETWORK_PACKAGE_INSTALL", \
                 f"'{cmd}' → {fp}, expected NETWORK_PACKAGE_INSTALL"
 
-
-# ═════════════════════════════════════════════════════════════════
-# 3. Escalation Policy Tests
-# ═════════════════════════════════════════════════════════════════
-
-class TestEscalationPolicy:
-    """Verify escalation triggers correctly."""
-
-    def setup_method(self):
-        self.policy = FailureEscalationPolicy()
-        self.memory = FailureMemory()
-        self.memory.set_task("test_esc")
-        self.analyzer = FailureAnalyzer()
-
-    def _make_net_sig(self):
-        return self.analyzer.analyze(
-            "bash", {"command": "pip install pygame"},
-            "[Exit Code: 1]\nFailed to establish a new connection",
-        )
-
-    def test_no_escalation_first_failure(self):
-        """Single failure → no escalation."""
-        sig = self._make_net_sig()
-        should, _ = self.policy.should_escalate(sig, 1, 1)
-        assert not should
-
-    def test_escalation_after_3_network_failures(self):
-        """3 same-category failures, 1 strategy → ESCALATE."""
-        sig = self._make_net_sig()
-        should, reason = self.policy.should_escalate(sig, 3, 1)
-        assert should
-        assert "用户干预" in reason or "持续" in reason
-
-    def test_no_escalation_diverse_strategies(self):
-        """3 same-category failures but 2 strategies → NO escalation."""
-        sig = self._make_net_sig()
-        should, _ = self.policy.should_escalate(sig, 3, 2)
-        assert not should
-
-    def test_high_water_escalates_regardless(self):
-        """5 same-category failures → escalate regardless of diversity."""
-        sig = self._make_net_sig()
-        should, _ = self.policy.should_escalate(sig, 5, 10)
-        assert should
-
-    def test_scalable_failure_no_escalation(self):
-        """SELF_HEALABLE failure, even with 3 counts → NO escalation."""
-        sig = self.analyzer.analyze(
-            "bash", {"command": "cat ghost.md"},
-            "cat: ghost.md: No such file or directory",
-        )
-        # FILE_NOT_FOUND is SELF_HEALABLE, not in USER_INTERVENTION_CATEGORIES
-        should, _ = self.policy.should_escalate(sig, 3, 1)
-        assert not should
-
-
 # ═════════════════════════════════════════════════════════════════
 # 4. FailureMemory Tests
 # ═════════════════════════════════════════════════════════════════
@@ -308,101 +251,26 @@ class TestToolTraceFailureFields:
         tm.end_task("SUCCESS")
 
 
-# ═════════════════════════════════════════════════════════════════
-# 6. Escalation Message Tests
-# ═════════════════════════════════════════════════════════════════
+def test_lexically_different_package_commands_share_strategy_evidence():
+    """Strategy inference is evidence; RuntimePolicy owns escalation."""
+    variants = [
+        "pip install pygame",
+        "pip install pygame --timeout 120",
+        "pip install pygame -i https://pypi.tuna.tsinghua.edu.cn/simple",
+        "pip install pygame --default-timeout=300",
+        "pip install pygame==2.6.0",
+        "pip install 'pygame>=2.0'",
+    ]
+    fps = [infer_strategy_fingerprint("bash", {"command": c}) for c in variants]
+    assert set(fps) == {"NETWORK_PACKAGE_INSTALL"}
 
-class TestEscalationMessage:
-    """Verify escalation message format and content."""
+def test_http_5xx_is_recoverable_service_evidence():
+    """A swallowed HTTP 5xx must enter history without becoming an invariant."""
+    from core.failure_intelligence import FailureAnalyzer
 
-    def test_message_contains_key_info(self):
-        sig = FailureSignature(
-            category=FailureCategory.NETWORK_UNREACHABLE,
-            recoverability=Recoverability.USER_INTERVENTION_REQUIRED,
-            root_cause_hint="网络不可达",
-            tool_name="bash",
-            strategy_fingerprint="NETWORK_PACKAGE_INSTALL",
-        )
-        msg = build_escalation_message(sig, "网络不可达，继续重试无效")
-        assert "NETWORK_UNREACHABLE" in msg
-        assert "USER_INTERVENTION_REQUIRED" in msg
-        assert "Escalation" in msg
-        assert "Failure Intelligence" in msg
-
-
-# ═════════════════════════════════════════════════════════════════
-# 7. Pygame Regression Scenario (E2E Simulation)
-# ═════════════════════════════════════════════════════════════════
-
-class TestPygameRegression:
-    """Simulate the 'pip install pygame' failure scenario.
-
-    Before failure intelligence: agent would retry ~34 turns with different
-    pip flags, all hitting the same network error.
-
-    After failure intelligence: escalation triggers after 3 same-category
-    failures with the same strategy, terminating the retry loop early.
-    """
-
-    def test_escalation_happens_within_3_failures(self):
-        """Core assertion: escalation fires by the 3rd same-category failure."""
-        memory = FailureMemory()
-        memory.set_task("pygame_test")
-        policy = FailureEscalationPolicy()
-
-        # Simulate 3 pip install attempts, all hitting network unreachable
-        sig = FailureSignature(
-            category=FailureCategory.NETWORK_UNREACHABLE,
-            recoverability=Recoverability.USER_INTERVENTION_REQUIRED,
-            root_cause_hint="网络不可达",
-            fingerprint="NETWORK_UNREACHABLE::NETWORK_PACKAGE_INSTALL",
-            strategy_fingerprint="NETWORK_PACKAGE_INSTALL",
-        )
-
-        # Attempt 1: no escalation
-        should, _ = policy.should_escalate(sig, 1, 1)
-        assert not should, "First failure should NOT escalate"
-
-        # Attempt 2: no escalation
-        should, _ = policy.should_escalate(sig, 2, 1)
-        assert not should, "Second failure should NOT escalate"
-
-        # Attempt 3: escalation!
-        should, reason = policy.should_escalate(sig, 3, 1)
-        assert should, f"Third failure SHOULD escalate, got: {reason}"
-
-    def test_escalation_message_stops_retry_loop(self):
-        """Verify escalation message is a termination signal, not a retry prompt."""
-        sig = FailureSignature(
-            category=FailureCategory.NETWORK_UNREACHABLE,
-            recoverability=Recoverability.USER_INTERVENTION_REQUIRED,
-            root_cause_hint="网络不可达",
-            strategy_fingerprint="NETWORK_PACKAGE_INSTALL",
-        )
-        msg = build_escalation_message(sig, "网络不可达，继续重试无效")
-
-        # The message should tell the agent to STOP, not to retry
-        assert "Escalation" in msg or "escalation" in msg
-        # It should reference the user, suggesting external intervention
-        assert "用户" in msg or "user" in msg or "User" in msg
-
-    def test_lexically_different_but_same_strategy(self):
-        """Verify that all pip install variants produce the SAME strategy fingerprint.
-
-        This is the key regression: without failure intelligence, LoopGuard
-        sees different args_hash and doesn't block. With FI, we detect the
-        same strategy and escalate.
-        """
-        variants = [
-            "pip install pygame",
-            "pip install pygame --timeout 120",
-            "pip install pygame -i https://pypi.tuna.tsinghua.edu.cn/simple",
-            "pip install pygame --default-timeout=300",
-            "pip install pygame==2.6.0",
-            "pip install 'pygame>=2.0'",
-        ]
-        fps = [infer_strategy_fingerprint("bash", {"command": c}) for c in variants]
-        unique = set(fps)
-        assert len(unique) == 1, \
-            f"All pip install variants should have same strategy, got: {unique}"
-        assert unique.pop() == "NETWORK_PACKAGE_INSTALL"
+    signature = FailureAnalyzer().analyze(
+        "bash", {"command": "python health_check.py"},
+        "[Exit Code: 0]\nHTTP/1.0 503 Service Unavailable",
+    )
+    assert signature.category is FailureCategory.NETWORK_UNREACHABLE
+    assert signature.recoverability is Recoverability.PARTIALLY_RECOVERABLE

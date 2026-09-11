@@ -167,6 +167,12 @@ class TraceManager:
         result_preview: str = "",
         started_at: Optional[float] = None,
         finished_at: Optional[float] = None,
+        execution_success: Optional[bool] = None,
+        observed_failure: bool = False,
+        semantic_status: str = "",
+        observation: str = "",
+        exit_code: Optional[int] = None,
+        segment_exit_codes: Optional[list[int]] = None,
         # Failure Intelligence fields
         failure_category: str = "",
         recoverability: str = "",
@@ -218,6 +224,12 @@ class TraceManager:
             finished_at=f,
             latency_ms=latency,
             success=success,
+            execution_success=success if execution_success is None else execution_success,
+            observed_failure=observed_failure,
+            semantic_status=semantic_status,
+            observation=observation,
+            exit_code=exit_code,
+            segment_exit_codes=list(segment_exit_codes or []),
             loop_guard_blocked=loop_guard_blocked,
             guard_type=guard_type,
             guard_reason=guard_reason,
@@ -252,6 +264,11 @@ class TraceManager:
 
         if loop_guard_blocked:
             task.loop_guard_trigger_count += 1
+
+    def record_attempt_event(self, event: Dict[str, Any]) -> None:
+        """Persist the unified runtime fact alongside the tool trace."""
+        if self.current_task is not None:
+            self.current_task.attempt_events.append(dict(event))
 
     def annotate_current_tool(self, **fields: Any) -> None:
         """Attach post-execution governance evidence to the latest tool trace."""
