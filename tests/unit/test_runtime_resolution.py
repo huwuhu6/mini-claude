@@ -1,6 +1,7 @@
 """Deterministic regressions for runtime policy ownership and resolution."""
 
 from core.loop_controller import (
+    AttemptEvent,
     AttemptHistory,
     AttemptStatus,
     CommandNormalizer,
@@ -162,6 +163,26 @@ def test_replan_and_completion_decisions_are_replayable_from_history():
     assert [event.governance_decision for event in recorded_before_finalize] == [
         event.governance_decision for event in replay_history
     ]
+
+
+def test_serialized_subject_and_resolution_facts_replay_identically():
+    policy = RuntimePolicy()
+    service = "service://localhost:8080"
+    _record(policy, "bash", {"command": "curl http://localhost:8080/health"},
+            "HTTP 503", category="NETWORK_UNREACHABLE", observed_failure=True,
+            semantic_status="UNHEALTHY", subject_key=service)
+    _record(policy, "health_check", {"port": 8080}, '{"healthy":true}',
+            semantic_status="HEALTHY", subject_key=service,
+            resolution_evidence="structured healthy probe")
+    expected = policy.finalize().action
+
+    replay_history = AttemptHistory()
+    for row in (event.to_dict() for event in policy.history.all()):
+        row["status"] = AttemptStatus(row["status"])
+        row["segment_exit_codes"] = tuple(row["segment_exit_codes"])
+        row["changed_paths"] = tuple(row["changed_paths"])
+        replay_history.append(AttemptEvent(**row))
+    assert RuntimePolicy(replay_history).finalize().action is expected
 
 
 def test_history_keeps_success_failure_and_blocked_order_without_duplicate_events():
