@@ -70,6 +70,7 @@ class Compressor:
         if transcript_dir:
             self._transcript_dir = Path(transcript_dir)
             self._transcript_dir.mkdir(parents=True, exist_ok=True)
+            self._load_persisted_transcripts()
 
     def set_provider(self, provider: Any) -> None:
         """Inject an LLM provider for AI-powered summarization.
@@ -292,6 +293,9 @@ class Compressor:
         # Summarize the middle
         middle = messages[2:tail_start]
         summary = self._generate_summary(middle)
+        if not isinstance(summary, str) or not summary.strip():
+            logger.warning("Full Compression 未生成可用摘要，保留原始消息")
+            return messages
 
         # Create a compressed transcript record
         transcript = CompressedTranscript(
@@ -300,8 +304,6 @@ class Compressor:
             message_count=message_count,
             original_token_estimate=token_estimate,
         )
-
-        self._save_transcript(transcript)
 
         # Build compressed message list
         compressed = list(head)
@@ -315,6 +317,11 @@ class Compressor:
         cleaned = self._clean_tool_chains(compressed)
         # Final sanitize pass: guarantee tool_calls↔tool absolute closure
         cleaned = self.sanitize_openai_messages(cleaned)
+
+        # Commit only after the candidate has been built and sanitized.  A
+        # failed summary must not destroy source history or create a false
+        # successful transcript.
+        self._save_transcript(transcript)
 
         logger.info(
             f"已压缩 {message_count} 条消息（{token_estimate} tokens）-> "
@@ -424,17 +431,20 @@ class Compressor:
 
     # ── Summarization ──────────────────────────────────────────
 
-    def _generate_summary(self, messages: List[Message]) -> str:
+    def _generate_summary(self, messages: List[Message]) -> Optional[str]:
         """Generate a high-level summary preserving only what's needed for continuity.
 
-        Delegates to an LLM when available; falls back to statistical summary.
+        Delegates to an LLM when available.  Statistical summarization is an
+        intentional fallback only when no provider is configured; provider
+        failures return ``None`` so Full Compression can fail closed.
         """
         # ── Primary: LLM-powered summary ──────────────────────
         if self._provider:
             try:
                 return self._llm_summarize(messages)
             except Exception as e:
-                logger.warning(f"LLM 总结失败，回退到统计摘要: {e}")
+                logger.warning(f"LLM 总结失败，Full Compression fail-closed: {e}")
+                return None
 
         # ── Fallback: statistical summary ─────────────────────
         return self._statistical_summary(messages)
@@ -478,7 +488,9 @@ class Compressor:
             temperature=0.3,
         )
         parsed = self._provider.parse_response(response)
-        summary = parsed.get("content", "") or "(summary unavailable)"
+        summary = parsed.get("content", "") if isinstance(parsed, dict) else ""
+        if not isinstance(summary, str) or not summary.strip():
+            raise ValueError("LLM summary response has no usable content")
 
         logger.debug(
             f"LLM 总结完成: {len(conv_text)} chars input → "
@@ -513,6 +525,50 @@ class Compressor:
 
     # ── Transcript Management ─────────────────────────────────
 
+    def _load_persisted_transcripts(self) -> None:
+        """Load valid transcript files so retention survives process restarts."""
+        if not self._transcript_dir or not self._transcript_dir.exists():
+            return
+
+        for path in self._transcript_dir.glob("transcript_*.json"):
+            try:
+                with path.open('r', encoding='utf-8') as f:
+                    data = json.load(f)
+                if not isinstance(data, dict):
+                    raise ValueError("transcript JSON must be an object")
+
+                transcript_id = str(data.get('id') or "").strip()
+                summary = data.get('summary')
+                if not transcript_id or not isinstance(summary, str):
+                    raise ValueError("transcript metadata is incomplete")
+
+                transcript = CompressedTranscript(
+                    id=transcript_id,
+                    summary=summary,
+                    message_count=int(data.get('message_count', 0)),
+                    original_token_estimate=int(data.get('original_token_estimate', 0)),
+                    created_at=float(data.get('created_at', path.stat().st_mtime)),
+                    store_path=str(path),
+                )
+                self._transcripts[transcript.id] = transcript
+            except (OSError, TypeError, ValueError, json.JSONDecodeError) as exc:
+                logger.warning("跳过无效 Transcript %s: %s", path, exc)
+
+    def _prune_old_transcripts(self) -> None:
+        """Apply retention to both in-memory and persisted transcripts."""
+        transcripts = sorted(
+            self._transcripts.values(),
+            key=lambda transcript: transcript.created_at,
+        )
+        while len(transcripts) > self.max_transcripts:
+            old = transcripts.pop(0)
+            self._transcripts.pop(old.id, None)
+            if old.store_path:
+                try:
+                    Path(old.store_path).unlink()
+                except OSError:
+                    pass
+
     def _save_transcript(self, transcript: CompressedTranscript) -> None:
         self._transcripts[transcript.id] = transcript
         if self._transcript_dir:
@@ -525,17 +581,7 @@ class Compressor:
             except Exception as e:
                 logger.error(f"保存对话记录失败: {e}")
 
-        # Prune old transcripts
-        ids = sorted(self._transcripts.keys(),
-                     key=lambda i: self._transcripts[i].created_at)
-        while len(ids) > self.max_transcripts:
-            old_id = ids.pop(0)
-            old = self._transcripts.pop(old_id, None)
-            if old and old.store_path:
-                try:
-                    Path(old.store_path).unlink()
-                except OSError:
-                    pass
+        self._prune_old_transcripts()
 
     def get_transcripts(self) -> List[CompressedTranscript]:
         return sorted(self._transcripts.values(),
