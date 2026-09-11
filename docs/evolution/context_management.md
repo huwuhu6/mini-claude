@@ -88,3 +88,23 @@ Audit 009 不再在 Agent 主循环中建设第二套 validator，而是由 pars
 ### Decision / Limitation
 
 本阶段保留 recent 15、0.7 micro-compaction 阈值和现有摘要策略。删除 Transcript 遇到文件系统拒绝时，索引保留该 durable record，因而 retention 只能保持可观察的一致性而不能绕过外部 I/O 故障。当前剩余 Context 问题主要进入 Architecture / Benchmark 阶段：Provider-aware Context Budget、Summary 12K tail-only limitation、Recent 15 retention strategy、Summary Trust Boundary / Prompt Injection、Value-aware Retention 和 Project Context Discovery。没有引入事务日志、Summary 新算法、长期 Memory、Anthropic compatibility、Multi-Agent、Team、Inbox/MessageBus 或 Background delivery 机制；Hot Context 的 CTX-006 继续作为 follow-up。
+## 2026-09-11
+
+Commit: `PENDING`
+Commit Description: `refactor(context): 建立 Context Baseline Modernization`
+
+### Description
+
+Foundation correctness 修复后，基线仍有四个会直接影响后续 Context Benchmark 的缺口。默认模型的 Context Window 为 1M tokens，但原来的 70K/100K 隐式压缩关系只使用了很小的输入比例；请求前估算也只覆盖 durable messages，不能反映 system prompt、tool definitions 和临时 hot context 的真实请求组成。Provider 已返回实际 usage，但 Runtime 只保留笼统的 token 总数，Context Cache 的命中量因此不可观察。与此同时，Summary Provider 在看到 middle history 之前还会先执行每条 2000 字符和整体 12K tail-only 截断。
+
+本阶段将 Compression 配置改为显式的 `context_window_tokens=1000000`、`microcompact_token_threshold=250000` 和 `full_compression_token_threshold=500000`，并校验三者关系。请求前使用 `estimated_prompt_tokens` 统计实际待发送 messages（包括临时 hot context）、system prompt 与稳定序列化的 tool definitions；请求后保留 Provider-reported `actual_prompt_tokens` / usage。OpenAI-compatible usage parsing 增加 `cached_tokens`，Runtime/Trace 增加 uncached tokens、cache hit rate 以及 Main/Summary Provider usage 的区分，任务级命中率按累计 token 加权计算。
+
+Summary baseline 不再静默保留最后 12K chars，也不再对每条 message 做默认 2000 字符截断；完整 middle 会进入 Summary Provider。若完整 Summary 输入超过配置的 Context Window，则 fail-closed 并保留原始历史，而不是猜测性地删除一段输入后继续报告成功。
+
+### Result / Evidence
+
+新增 deterministic tests 覆盖显式阈值边界与非法配置、完整 request estimate、Provider usage/cache 字段缺失与存在、按 token 加权的任务级 cache hit rate、Summary 完整 middle 输入、Summary usage 统计，以及 tiktoken encoding 初始化失败时的安全 fallback。当前已运行新增和既有 Context Foundation/Reliability 测试，以及 Trace/Provider 和 Compression smoke 测试；未运行真实 Provider Benchmark 或 Evaluation。
+
+### Decision / Limitation
+
+250K/500K 是基于当前 1M Context Window 的最低合理 baseline，不是 Benchmark 得出的最优阈值；整体 Summary 也是可解释的单次 baseline，不代表最终 Summary 策略。Provider-aware Context Budget、Summary 分块或多级算法、Recent 15 retention、Summary Trust Boundary / Prompt Injection、Value-aware Retention、Project Context Discovery、Long-term Memory 和其他 Context Strategy 留待后续 Architecture / Benchmark 阶段。本阶段不引入 Explicit Cache，也不修改 Multi-Agent、Team、Inbox/MessageBus 或 Background delivery 语义。

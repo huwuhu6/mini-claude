@@ -84,8 +84,10 @@ def test_full_compression_without_provider_keeps_statistical_fallback():
 
 
 def test_auto_compression_does_not_report_failed_full_compression_as_success():
-    compressor = Compressor()
-    compressor.token_threshold = 1
+    compressor = Compressor({
+        "microcompact_token_threshold": 1,
+        "full_compression_token_threshold": 2,
+    })
     compressor.set_provider(_SummaryProvider(error=TimeoutError("temporary outage")))
 
     agent = object.__new__(MiniClaudeAgent)

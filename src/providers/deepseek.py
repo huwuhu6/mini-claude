@@ -282,12 +282,22 @@ class DeepseekProvider(LLMProvider):
             value = field(usage, name, 0) if usage is not None else 0
             return value if isinstance(value, int) and value >= 0 else 0
 
+        prompt_details = field(usage, 'prompt_tokens_details', None)
+
+        def cached_usage_value() -> int:
+            value = field(prompt_details, 'cached_tokens', 0)
+            return value if isinstance(value, int) and value >= 0 else 0
+
+        prompt_tokens = usage_value('prompt_tokens')
+        cached_tokens = min(cached_usage_value(), prompt_tokens)
+
         return {
             'content': content,
             'tool_calls': tool_calls,
             'usage': {
-                'prompt_tokens': usage_value('prompt_tokens'),
+                'prompt_tokens': prompt_tokens,
                 'completion_tokens': usage_value('completion_tokens'),
                 'total_tokens': usage_value('total_tokens'),
+                'cached_tokens': cached_tokens,
             },
         }

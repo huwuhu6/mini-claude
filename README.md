@@ -176,7 +176,7 @@ python compare_reports.py --tasks task_001_db_port,task_004_large_file_edit
 
 报告会展示运行条件、任务集一致性、用例覆盖、成功率、轮数、Token、工具调用和失败原因。不同任务集、历史结果缺少 manifest、无 Trace 或 Trace 无效时，报告会明确告警。
 
-评测依赖真实 provider 时需要 API key。项目声明 `tiktoken` 为精确估算依赖；若包或编码资源初始化失败，压缩模块会自动回退到粗略估算。
+评测依赖真实 provider 时需要 API key。项目声明 `tiktoken` 用于 estimated token 估算；它不是当前 DeepSeek 模型的精确 tokenizer。若包或编码资源初始化失败，压缩模块会自动回退到粗略估算。
 
 ### 用评测结果优化 harness
 
@@ -258,7 +258,7 @@ CLI
 - 项目仍是单机、单进程为主的 runtime，不承诺生产级并发、分布式队列或多租户隔离。
 - 当前对话状态主要保存在进程内；进程异常退出后，完整 LLM 对话上下文不会自动恢复。
 - `s_full.py`、`minimal_agent.py`、模块化 Agent 和评测脚本并存，历史兼容代码仍增加了一定维护成本。
-- `src/core/compression.py` 使用 `tiktoken` 做精确估算；包未安装或编码资源初始化失败时会安全回退到粗略估算，不提供 provider-specific tokenizer。
+- `src/core/compression.py` 使用 `tiktoken` 做 estimated token 估算；包未安装或编码资源初始化失败时会安全回退到粗略估算，不提供 provider-specific tokenizer。Provider 返回的 `usage.prompt_tokens` 才是实际请求用量。
 - 评测结果中的过程指标用于工程分析，不等同于通用 Agent 能力排名。
 
 ## 工程讨论主题

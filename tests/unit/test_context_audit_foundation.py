@@ -66,7 +66,10 @@ def test_full_compression_is_noop_when_middle_is_empty(message_count):
     )
     messages[2].tool_calls = [_large_tool_call()]
 
-    compressor = Compressor({"token_threshold": 1})
+    compressor = Compressor({
+        "microcompact_token_threshold": 1,
+        "full_compression_token_threshold": 2,
+    })
     provider = _CountingSummaryProvider()
     compressor.set_provider(provider)
 
@@ -82,7 +85,10 @@ def test_full_compression_is_noop_when_middle_is_empty(message_count):
 
 def test_empty_middle_does_not_report_auto_compression():
     agent = object.__new__(MiniClaudeAgent)
-    agent.compressor = Compressor({"token_threshold": 1})
+    agent.compressor = Compressor({
+        "microcompact_token_threshold": 1,
+        "full_compression_token_threshold": 2,
+    })
     agent.messages = [Message(role="user", content=f"message-{i}") for i in range(17)]
     agent.feature_manager = types.SimpleNamespace(is_enabled=lambda name: True)
 
@@ -134,6 +140,7 @@ def test_openai_compatible_valid_content_and_missing_usage_are_accepted():
         "prompt_tokens": 0,
         "completion_tokens": 0,
         "total_tokens": 0,
+        "cached_tokens": 0,
     }
 
 

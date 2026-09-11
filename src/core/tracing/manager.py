@@ -336,6 +336,99 @@ class TraceManager:
         if self.current_turn:
             self.current_turn.token_usage += tokens
 
+    def record_provider_usage(
+        self,
+        usage: Dict[str, Any],
+        *,
+        estimated_prompt_tokens: int = 0,
+        source: str = "main",
+    ) -> None:
+        """Record provider-reported usage and its request estimate.
+
+        ``source`` distinguishes the main request from the separate Summary
+        Provider request.  Both contribute to total token usage, while their
+        detailed counters remain separate.
+        """
+        turn = self.current_turn
+        task = self.current_task
+        if turn is None or task is None:
+            return
+
+        def value(name: str) -> int:
+            raw = usage.get(name, 0) if isinstance(usage, dict) else 0
+            return raw if isinstance(raw, int) and raw >= 0 else 0
+
+        prompt = value("prompt_tokens")
+        completion = value("completion_tokens")
+        total = value("total_tokens")
+        cached = min(value("cached_tokens"), prompt)
+        turn.token_usage += total
+        turn.actual_prompt_tokens += prompt
+        turn.completion_tokens += completion
+        turn.prompt_tokens += prompt
+        turn.cached_tokens += cached
+        turn.uncached_prompt_tokens = max(turn.prompt_tokens - turn.cached_tokens, 0)
+        turn.cache_hit_rate = (
+            turn.cached_tokens / turn.prompt_tokens
+            if turn.prompt_tokens else 0.0
+        )
+        task.prompt_tokens += prompt
+        task.cached_tokens += cached
+        task.actual_prompt_tokens += prompt
+        task.completion_tokens += completion
+        task.uncached_prompt_tokens = max(task.prompt_tokens - task.cached_tokens, 0)
+        task.cache_hit_rate = (
+            task.cached_tokens / task.prompt_tokens
+            if task.prompt_tokens else 0.0
+        )
+
+        if source == "summary":
+            turn.summary_prompt_tokens += prompt
+            turn.summary_completion_tokens += completion
+            turn.summary_total_tokens += total
+            turn.summary_cached_tokens += cached
+            task.summary_prompt_tokens += prompt
+            task.summary_completion_tokens += completion
+            task.summary_total_tokens += total
+            task.summary_cached_tokens += cached
+            task.summary_uncached_prompt_tokens = max(
+                task.summary_prompt_tokens - task.summary_cached_tokens, 0,
+            )
+            task.summary_cache_hit_rate = (
+                task.summary_cached_tokens / task.summary_prompt_tokens
+                if task.summary_prompt_tokens else 0.0
+            )
+            turn.summary_uncached_prompt_tokens = max(
+                turn.summary_prompt_tokens - turn.summary_cached_tokens, 0,
+            )
+            turn.summary_cache_hit_rate = (
+                turn.summary_cached_tokens / turn.summary_prompt_tokens
+                if turn.summary_prompt_tokens else 0.0
+            )
+            return
+
+        estimate = max(int(estimated_prompt_tokens), 0)
+        turn.estimated_prompt_tokens += estimate
+        turn.main_prompt_tokens += prompt
+        turn.main_cached_tokens += cached
+        turn.main_uncached_prompt_tokens = max(
+            turn.main_prompt_tokens - turn.main_cached_tokens, 0,
+        )
+        turn.main_cache_hit_rate = (
+            turn.main_cached_tokens / turn.main_prompt_tokens
+            if turn.main_prompt_tokens else 0.0
+        )
+        task.estimated_prompt_tokens += estimate
+        task.main_prompt_tokens += prompt
+        task.main_cached_tokens += cached
+        task.main_uncached_prompt_tokens = max(
+            task.main_prompt_tokens - task.main_cached_tokens, 0,
+        )
+        task.main_cache_hit_rate = (
+            task.main_cached_tokens / task.main_prompt_tokens
+            if task.main_prompt_tokens else 0.0
+        )
+
     def set_message_count(self, count: int) -> None:
         """Set the current turn's message count (snapshot before LLM call)."""
         if self.current_turn:

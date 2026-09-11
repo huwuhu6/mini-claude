@@ -120,7 +120,7 @@ def test_auto_microcompact_reports_changed_once_then_noop():
 
     compressor = Compressor()
     messages = _microcompact_messages()
-    compressor.token_threshold = compressor.estimate_tokens(messages)
+    compressor.microcompact_token_threshold = compressor.estimate_tokens(messages)
 
     agent = object.__new__(MiniClaudeAgent)
     agent.compressor = compressor

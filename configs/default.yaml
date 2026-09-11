@@ -49,7 +49,9 @@ team:
 
 # Compression Settings
 compression:
-  token_threshold: 100000
+  context_window_tokens: 1000000
+  microcompact_token_threshold: 250000
+  full_compression_token_threshold: 500000
   max_transcripts: 100
 
 # Background Processing

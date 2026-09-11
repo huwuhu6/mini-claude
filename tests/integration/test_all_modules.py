@@ -470,7 +470,12 @@ def test_compression():
     from core.compression import Compressor, CompressedTranscript
     from providers.base import Message
 
-    comp = Compressor({'token_threshold': 1000, 'max_transcripts': 5})
+    comp = Compressor({
+        'context_window_tokens': 10000,
+        'microcompact_token_threshold': 500,
+        'full_compression_token_threshold': 1000,
+        'max_transcripts': 5,
+    })
 
     # Token estimation
     msgs = [Message(role='user', content='hello world')]
@@ -501,7 +506,7 @@ def test_compression():
 
     # Stats
     stats = comp.get_compression_stats()
-    _test_result("compression stats", stats['token_threshold'] == 1000)
+    _test_result("compression stats", stats['full_compression_token_threshold'] == 1000)
 
 
 # ═══════════════════════════════════════════════════════════════

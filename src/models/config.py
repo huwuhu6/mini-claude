@@ -52,8 +52,34 @@ class TeamConfig:
 
 @dataclass
 class CompressionConfig:
-    token_threshold: int = 100000
+    context_window_tokens: int = 1_000_000
+    microcompact_token_threshold: int = 250_000
+    full_compression_token_threshold: int = 500_000
     max_transcripts: int = 100
+
+    def __post_init__(self):
+        self.context_window_tokens = int(self.context_window_tokens)
+        self.microcompact_token_threshold = int(self.microcompact_token_threshold)
+        self.full_compression_token_threshold = int(self.full_compression_token_threshold)
+        self.max_transcripts = int(self.max_transcripts)
+        if self.context_window_tokens <= 0:
+            raise ValueError("compression.context_window_tokens must be positive")
+        if self.microcompact_token_threshold <= 0:
+            raise ValueError("compression.microcompact_token_threshold must be positive")
+        if self.full_compression_token_threshold <= 0:
+            raise ValueError("compression.full_compression_token_threshold must be positive")
+        if self.microcompact_token_threshold >= self.full_compression_token_threshold:
+            raise ValueError(
+                "compression.microcompact_token_threshold must be less than "
+                "full_compression_token_threshold"
+            )
+        if self.full_compression_token_threshold > self.context_window_tokens:
+            raise ValueError(
+                "compression.full_compression_token_threshold must not exceed "
+                "context_window_tokens"
+            )
+        if self.max_transcripts < 0:
+            raise ValueError("compression.max_transcripts must not be negative")
 
 
 @dataclass
@@ -151,6 +177,12 @@ class ConfigManager:
             config.team = TeamConfig(**data['team'])
 
         if 'compression' in data:
+            if 'token_threshold' in data['compression']:
+                raise ValueError(
+                    "compression.token_threshold has been removed; use "
+                    "microcompact_token_threshold and "
+                    "full_compression_token_threshold"
+                )
             config.compression = CompressionConfig(**data['compression'])
 
         if 'background' in data:

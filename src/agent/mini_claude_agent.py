@@ -231,7 +231,9 @@ class MiniClaudeAgent:
 
         # Compression
         compression_config = {
-            'token_threshold': self.config.compression.token_threshold,
+            'context_window_tokens': self.config.compression.context_window_tokens,
+            'microcompact_token_threshold': self.config.compression.microcompact_token_threshold,
+            'full_compression_token_threshold': self.config.compression.full_compression_token_threshold,
             'max_transcripts': self.config.compression.max_transcripts,
             'transcript_dir': str(self.data_paths.root / 'transcripts'),
         }
@@ -260,7 +262,7 @@ class MiniClaudeAgent:
         # Runtime trace system — append-only, hook-based observability
         self.trace = TraceManager(trace_dir=self.data_paths.traces)
         # Benchmark metrics — reset each _llm_tool_cycle call
-        self.last_metrics: Dict[str, int] = {"turns": 0, "total_tokens": 0, "api_errors": 0}
+        self.last_metrics: Dict[str, Any] = self._empty_usage_metrics()
         self._cmd_history: List[tuple] = []
 
 
@@ -622,14 +624,6 @@ class MiniClaudeAgent:
     def _run_with_tasks(self, user_input: str, require_tool_call: bool = False) -> str:
         """Execution with task management."""
         self.messages.append(Message(role='user', content=user_input))
-
-        # Check for compression
-        if self.feature_manager.is_enabled('compression'):
-            if self.compressor.should_compress(self.messages):
-                self.messages = self.compressor.compress(self.messages)
-            elif self.compressor.should_microcompact(self.messages):
-                self.messages = self.compressor.microcompact(self.messages)
-
         return self._llm_tool_cycle(require_tool_call=require_tool_call)
 
     def _get_llm_tools(self) -> List[Dict[str, Any]]:
@@ -1381,7 +1375,118 @@ class MiniClaudeAgent:
             return True
         return False
 
-    def _check_auto_compress(self) -> bool:
+    @staticmethod
+    def _empty_usage_metrics() -> Dict[str, Any]:
+        return {
+            "turns": 0,
+            "estimated_prompt_tokens": 0,
+            "actual_prompt_tokens": 0,
+            "main_prompt_tokens": 0,
+            "main_cached_tokens": 0,
+            "main_uncached_prompt_tokens": 0,
+            "main_cache_hit_rate": 0.0,
+            "prompt_tokens": 0,
+            "completion_tokens": 0,
+            "total_tokens": 0,
+            "cached_tokens": 0,
+            "uncached_prompt_tokens": 0,
+            "cache_hit_rate": 0.0,
+            "summary_prompt_tokens": 0,
+            "summary_completion_tokens": 0,
+            "summary_total_tokens": 0,
+            "summary_cached_tokens": 0,
+            "summary_uncached_prompt_tokens": 0,
+            "summary_cache_hit_rate": 0.0,
+            "api_errors": 0,
+        }
+
+    def _record_provider_usage(
+        self,
+        usage: Dict[str, Any],
+        *,
+        estimated_prompt_tokens: int = 0,
+        source: str = "main",
+    ) -> None:
+        """Record estimated and provider-reported usage without conflating them."""
+        usage = usage if isinstance(usage, dict) else {}
+
+        def value(name: str) -> int:
+            raw = usage.get(name, 0)
+            return raw if isinstance(raw, int) and raw >= 0 else 0
+
+        prompt = value("prompt_tokens")
+        completion = value("completion_tokens")
+        total = value("total_tokens")
+        cached = min(value("cached_tokens"), prompt)
+        self.last_metrics["total_tokens"] += total
+        self.last_metrics["actual_prompt_tokens"] += prompt
+        self.last_metrics["completion_tokens"] += completion
+        self.last_metrics["prompt_tokens"] += prompt
+        self.last_metrics["cached_tokens"] += cached
+        self.last_metrics["uncached_prompt_tokens"] = max(
+            self.last_metrics["prompt_tokens"] - self.last_metrics["cached_tokens"],
+            0,
+        )
+        prompt_total = self.last_metrics["prompt_tokens"]
+        self.last_metrics["cache_hit_rate"] = (
+            self.last_metrics["cached_tokens"] / prompt_total
+            if prompt_total else 0.0
+        )
+        if source == "summary":
+            self.last_metrics["summary_prompt_tokens"] += prompt
+            self.last_metrics["summary_completion_tokens"] += completion
+            self.last_metrics["summary_total_tokens"] += total
+            self.last_metrics["summary_cached_tokens"] += cached
+            summary_prompt_total = self.last_metrics["summary_prompt_tokens"]
+            self.last_metrics["summary_uncached_prompt_tokens"] = max(
+                summary_prompt_total - self.last_metrics["summary_cached_tokens"],
+                0,
+            )
+            self.last_metrics["summary_cache_hit_rate"] = (
+                self.last_metrics["summary_cached_tokens"] / summary_prompt_total
+                if summary_prompt_total else 0.0
+            )
+        else:
+            self.last_metrics["estimated_prompt_tokens"] += max(
+                int(estimated_prompt_tokens), 0
+            )
+            self.last_metrics["main_prompt_tokens"] += prompt
+            self.last_metrics["main_cached_tokens"] += cached
+            self.last_metrics["main_uncached_prompt_tokens"] = max(
+                self.last_metrics["main_prompt_tokens"] - self.last_metrics["main_cached_tokens"],
+                0,
+            )
+            main_prompt_total = self.last_metrics["main_prompt_tokens"]
+            self.last_metrics["main_cache_hit_rate"] = (
+                self.last_metrics["main_cached_tokens"] / main_prompt_total
+                if main_prompt_total else 0.0
+            )
+
+        self.trace.record_provider_usage(
+            usage,
+            estimated_prompt_tokens=estimated_prompt_tokens,
+            source=source,
+        )
+
+    def _build_request_messages(self, hot_text: str) -> List[Message]:
+        """Build the exact transient message list sent to the provider."""
+        if not hot_text:
+            return self.messages
+        msgs_for_llm = list(self.messages)
+        if msgs_for_llm and msgs_for_llm[-1].role == 'user':
+            last = msgs_for_llm[-1]
+            msgs_for_llm[-1] = Message(
+                role='user',
+                content=last.content + "\n\n" + hot_text,
+            )
+        else:
+            msgs_for_llm.append(Message(role='user', content=hot_text))
+        return msgs_for_llm
+
+    def _check_auto_compress(
+        self,
+        estimated_prompt_tokens: Optional[int] = None,
+    ) -> bool:
         """Auto-compress if token threshold exceeded.
 
         Returns:
@@ -1389,13 +1494,21 @@ class MiniClaudeAgent:
         """
         if self.feature_manager.is_enabled('compression'):
             before = copy.deepcopy(self.messages)
-            if self.compressor.should_compress(self.messages):
+            if self.compressor.should_compress(
+                self.messages, estimated_prompt_tokens=estimated_prompt_tokens,
+            ):
                 logger.info("触发自动压缩")
                 self.messages = self.compressor.compress(self.messages)
-            elif self.compressor.should_microcompact(self.messages):
+            elif self.compressor.should_microcompact(
+                self.messages, estimated_prompt_tokens=estimated_prompt_tokens,
+            ):
                 logger.info("触发微压缩")
                 self.messages = self.compressor.microcompact(self.messages)
-            return self.messages != before
+            changed = self.messages != before
+            summary_usage = self.compressor.consume_last_summary_usage()
+            if summary_usage is not None:
+                self._record_provider_usage(summary_usage, source="summary")
+            return changed
         return False
 
     def _drain_background_notifications(self) -> Optional[str]:
@@ -1492,7 +1605,7 @@ class MiniClaudeAgent:
         tool_defs = [ProviderToolDef(**t) for t in tools]
 
         # ── Reset benchmark metrics ──
-        self.last_metrics = {"turns": 0, "total_tokens": 0, "api_errors": 0}
+        self.last_metrics = self._empty_usage_metrics()
 
         # ── Nag tracking (s_full.py s03) ──
         rounds_without_todo = 0
@@ -1523,12 +1636,31 @@ class MiniClaudeAgent:
                 self.trace.start_turn(iteration)
                 # ── Pre-LLM: compression pipeline (s_full.py s06) ──
                 # (safe inside the loop — only modifies existing messages)
-                if self._check_auto_compress():
+                self.messages = Compressor._clean_tool_chains(self.messages)
+                hot_text = self._get_dynamic_hot_context(
+                    rounds_without_todo=rounds_without_todo,
+                )
+                msgs_for_llm = self._build_request_messages(hot_text)
+                estimated_prompt_tokens = self.compressor.estimate_prompt_tokens(
+                    msgs_for_llm,
+                    system_prompt=self.system_prompt,
+                    tools=tools,
+                )
+                if self._check_auto_compress(estimated_prompt_tokens):
                     self.trace.record_compression()
 
                 # ── Safety net: normalize tool chains before API call ──
                 # Ensures no orphaned tool messages or broken tool_calls
                 self.messages = Compressor._clean_tool_chains(self.messages)
+
+                # Rebuild after compression.  Hot context remains transient
+                # and is counted exactly once as part of the request list.
+                msgs_for_llm = self._build_request_messages(hot_text)
+                estimated_prompt_tokens = self.compressor.estimate_prompt_tokens(
+                    msgs_for_llm,
+                    system_prompt=self.system_prompt,
+                    tools=tools,
+                )
 
                 # ── Log message structure for debugging ──
                 role_counts = Counter(m.role for m in self.messages)
@@ -1536,28 +1668,6 @@ class MiniClaudeAgent:
 
                 # ── Update trace with current message count ──
                 self.trace.set_message_count(len(self.messages))
-
-                # ── Build message list with hot context injected ──
-                # Hot context (todos, notifications, inbox) is assembled as a
-                # temporary injection — NEVER appended to self.messages — so
-                # the persisted history stays clean and prefix-cache-friendly.
-                hot_text = self._get_dynamic_hot_context(
-                    rounds_without_todo=rounds_without_todo,
-                )
-                if hot_text:
-                    msgs_for_llm = list(self.messages)  # shallow copy
-                    if msgs_for_llm and msgs_for_llm[-1].role == 'user':
-                        last = msgs_for_llm[-1]
-                        msgs_for_llm[-1] = Message(
-                            role='user',
-                            content=last.content + "\n\n" + hot_text,
-                        )
-                    else:
-                        msgs_for_llm.append(
-                            Message(role='user', content=hot_text)
-                        )
-                else:
-                    msgs_for_llm = self.messages
 
                 # ── LLM call with system prompt ──
                 response = provider.create_message(
@@ -1587,11 +1697,12 @@ class MiniClaudeAgent:
 
                 # ── Accumulate benchmark metrics ──
                 usage = parsed.get('usage', {})
-                self.last_metrics["total_tokens"] += usage.get('total_tokens', 0)
+                self._record_provider_usage(
+                    usage,
+                    estimated_prompt_tokens=estimated_prompt_tokens,
+                    source="main",
+                )
                 self.last_metrics["turns"] = iteration + 1
-
-                # ── Trace: token usage ──
-                self.trace.record_tokens(usage.get('total_tokens', 0))
 
                 if not tool_calls:
                     self.messages.append(Message(role='assistant', content=content))

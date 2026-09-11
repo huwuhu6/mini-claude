@@ -15,8 +15,10 @@ from typing import List, Optional, Dict, Any
 from providers.base import Message
 
 logger = logging.getLogger(__name__)
+SUMMARY_MAX_OUTPUT_TOKENS = 600
 
-# Try to use tiktoken for accurate token counting; fallback to rough estimate
+# cl100k_base is only an estimate for the active DeepSeek model.  Provider
+# reported usage remains the source of truth after a request completes.
 _TIKTOKEN_AVAILABLE = False
 _ENCODING = None
 try:
@@ -25,7 +27,7 @@ try:
     _TIKTOKEN_AVAILABLE = True
 except Exception as exc:
     logger.info(
-        "tiktoken 不可用，将使用粗略估算（1 token ≈ 4 字符）: %s",
+        "tiktoken 不可用，将使用粗略 estimated token 估算（1 token ≈ 4 字符）: %s",
         exc,
     )
 
@@ -60,11 +62,19 @@ class Compressor:
 
     def __init__(self, config: Optional[Dict[str, Any]] = None):
         cfg = config or {}
-        self.token_threshold = cfg.get('token_threshold', 100000)
+        self.context_window_tokens = int(cfg.get('context_window_tokens', 1_000_000))
+        self.microcompact_token_threshold = int(
+            cfg.get('microcompact_token_threshold', 250_000)
+        )
+        self.full_compression_token_threshold = int(
+            cfg.get('full_compression_token_threshold', 500_000)
+        )
+        self._validate_thresholds()
         self.max_transcripts = max(0, int(cfg.get('max_transcripts', 100)))
         self._transcripts: Dict[str, CompressedTranscript] = {}
         self._transcript_dir: Optional[Path] = None
         self._provider: Any = None  # LLMProvider for real summarization
+        self._last_summary_usage: Optional[Dict[str, int]] = None
 
         transcript_dir = cfg.get('transcript_dir', '')
         if transcript_dir:
@@ -85,7 +95,11 @@ class Compressor:
     # ── Token Estimation ──────────────────────────────────────
 
     def estimate_tokens(self, messages: List[Message]) -> int:
-        """Accurate token count using tiktoken (cl100k_base). Falls back to 1 token ≈ 4 characters."""
+        """Return an estimated token count for persisted messages.
+
+        ``cl100k_base`` is not the DeepSeek tokenizer, so this value must not
+        be presented as an exact/provider-reported count.
+        """
         if _TIKTOKEN_AVAILABLE and _ENCODING is not None:
             total = 0
             for msg in messages:
@@ -100,6 +114,40 @@ class Compressor:
             for m in messages
         )
         return total_chars // 4
+
+    def estimate_prompt_tokens(
+        self,
+        messages: List[Message],
+        system_prompt: str = "",
+        tools: Optional[List[Any]] = None,
+    ) -> int:
+        """Estimate the complete OpenAI-compatible prompt sent to a provider.
+
+        ``messages`` must be the exact request message list, including any
+        temporary hot-context injection.  It is therefore counted once here,
+        while system and tool definitions are added as their separate request
+        components.
+        """
+        total = self.estimate_tokens(messages)
+        if system_prompt:
+            total += self.estimate_tokens_for_text(system_prompt)
+        if tools:
+            total += self.estimate_tokens_for_text(self._stable_json(tools))
+        return total
+
+    @staticmethod
+    def _stable_json(value: Any) -> str:
+        """Serialize tool definitions deterministically for estimation."""
+        try:
+            return json.dumps(
+                value,
+                ensure_ascii=False,
+                sort_keys=True,
+                separators=(',', ':'),
+                default=lambda obj: vars(obj),
+            )
+        except (TypeError, ValueError):
+            return str(value)
 
     @staticmethod
     def _message_metadata_text(message: Message) -> str:
@@ -119,21 +167,55 @@ class Compressor:
             return str(metadata)
 
     def estimate_tokens_for_text(self, text: str) -> int:
-        """Accurate token count for a single text string."""
+        """Return an estimated token count for a text string."""
         if _TIKTOKEN_AVAILABLE and _ENCODING is not None:
             return len(_ENCODING.encode(text or ""))
         return len(text or "") // 4
 
     # ── Compression Decision ──────────────────────────────────
 
-    def should_compress(self, messages: List[Message]) -> bool:
-        """Check if messages exceed the token threshold."""
-        return self.estimate_tokens(messages) > self.token_threshold
+    def _validate_thresholds(self) -> None:
+        if self.context_window_tokens <= 0:
+            raise ValueError("compression.context_window_tokens must be positive")
+        if self.microcompact_token_threshold <= 0:
+            raise ValueError("compression.microcompact_token_threshold must be positive")
+        if self.full_compression_token_threshold <= 0:
+            raise ValueError("compression.full_compression_token_threshold must be positive")
+        if self.microcompact_token_threshold >= self.full_compression_token_threshold:
+            raise ValueError(
+                "compression.microcompact_token_threshold must be less than "
+                "full_compression_token_threshold"
+            )
+        if self.full_compression_token_threshold > self.context_window_tokens:
+            raise ValueError(
+                "compression.full_compression_token_threshold must not exceed "
+                "context_window_tokens"
+            )
 
-    def should_microcompact(self, messages: List[Message]) -> bool:
-        """Check if rapid growth suggests micro-compaction."""
+    def should_compress(
+        self,
+        messages: List[Message],
+        estimated_prompt_tokens: Optional[int] = None,
+    ) -> bool:
+        """Check whether estimated prompt usage reaches the Full threshold."""
+        estimate = (
+            self.estimate_tokens(messages)
+            if estimated_prompt_tokens is None else estimated_prompt_tokens
+        )
+        return estimate >= self.full_compression_token_threshold
+
+    def should_microcompact(
+        self,
+        messages: List[Message],
+        estimated_prompt_tokens: Optional[int] = None,
+    ) -> bool:
+        """Check whether estimated prompt usage reaches the Micro threshold."""
+        estimate = (
+            self.estimate_tokens(messages)
+            if estimated_prompt_tokens is None else estimated_prompt_tokens
+        )
         return (
-            self.estimate_tokens(messages) > self.token_threshold * 0.7
+            estimate >= self.microcompact_token_threshold
             and self._has_microcompact_candidates(messages)
         )
 
@@ -449,6 +531,7 @@ class Compressor:
         """
         # ── Primary: LLM-powered summary ──────────────────────
         if self._provider:
+            self._last_summary_usage = None
             try:
                 return self._llm_summarize(messages)
             except Exception as e:
@@ -461,43 +544,52 @@ class Compressor:
     def _llm_summarize(self, messages: List[Message]) -> str:
         """Call the LLM to produce a high-level intent summary.
 
-        The summarization request is intentionally small (max 600 output
-        tokens, no tools) so it cannot trigger recursive compression or
-        runaway token usage.
+        The summarization request has no tools and a bounded output.  The
+        complete middle is passed to the provider; if it cannot fit the
+        configured context window, the request fails closed instead of
+        silently dropping an arbitrary prefix or suffix.
         """
-        # Build a compact text representation of the messages to compress
+        # Preserve the complete middle, including tool-call metadata.  This is
+        # deliberately not a lossy per-message or tail-only representation.
         lines: List[str] = []
         for m in messages:
             role = m.role
-            content = (m.content or "")[:2000]  # per-message cap
-            lines.append(f"[{role}]: {content}")
+            metadata = self._message_metadata_text(m)
+            suffix = f"\n[metadata]: {metadata}" if metadata else ""
+            lines.append(f"[{role}]: {m.content or ''}{suffix}")
         conv_text = "\n".join(lines)
 
-        # Keep the prompt under ~12K chars to stay within safe bounds
-        if len(conv_text) > 12000:
-            conv_text = conv_text[-12000:]
+        prompt = (
+            "Summarize the high-level intent and current progress of "
+            "this conversation. Do not attempt to summarize code blocks, "
+            "file contents, or exact IDs. Focus entirely on what has been "
+            "accomplished so far and what the immediate next blocked step "
+            "is. Keep it concise.\n\n"
+        )
 
         summary_msgs = [
             Message(
                 role="user",
-                content=(
-                    "Summarize the high-level intent and current progress of "
-                    "this conversation. Do not attempt to summarize code blocks, "
-                    "file contents, or exact IDs. Focus entirely on what has been "
-                    "accomplished so far and what the immediate next blocked step "
-                    "is. Keep it concise.\n\n"
-                    f"{conv_text}"
-                ),
+                content=prompt + conv_text,
             )
         ]
 
+        summary_estimate = self.estimate_tokens(summary_msgs)
+        if summary_estimate + SUMMARY_MAX_OUTPUT_TOKENS > self.context_window_tokens:
+            raise ValueError(
+                "summary input plus output reserve exceeds configured context window; "
+                "Full Compression preserved the original history"
+            )
+
         response = self._provider.create_message(
             summary_msgs,
-            max_tokens=600,
+            max_tokens=SUMMARY_MAX_OUTPUT_TOKENS,
             temperature=0.3,
         )
         parsed = self._provider.parse_response(response)
         summary = parsed.get("content", "") if isinstance(parsed, dict) else ""
+        raw_usage = parsed.get("usage", {}) if isinstance(parsed, dict) else {}
+        self._last_summary_usage = self._normalize_usage(raw_usage)
         if not isinstance(summary, str) or not summary.strip():
             raise ValueError("LLM summary response has no usable content")
 
@@ -506,6 +598,29 @@ class Compressor:
             f"{len(summary)} chars summary"
         )
         return summary.strip()
+
+    @staticmethod
+    def _normalize_usage(usage: Any) -> Dict[str, int]:
+        """Normalize optional provider usage without making it look exact."""
+        if not isinstance(usage, dict):
+            usage = {}
+
+        def non_negative_int(name: str) -> int:
+            value = usage.get(name, 0)
+            return value if isinstance(value, int) and value >= 0 else 0
+
+        return {
+            'prompt_tokens': non_negative_int('prompt_tokens'),
+            'completion_tokens': non_negative_int('completion_tokens'),
+            'total_tokens': non_negative_int('total_tokens'),
+            'cached_tokens': non_negative_int('cached_tokens'),
+        }
+
+    def consume_last_summary_usage(self) -> Optional[Dict[str, int]]:
+        """Return and clear usage from the most recent LLM summary request."""
+        usage = self._last_summary_usage
+        self._last_summary_usage = None
+        return dict(usage) if usage is not None else None
 
     def _statistical_summary(self, messages: List[Message]) -> str:
         """Lightweight summary from message counts and keywords."""
@@ -636,6 +751,8 @@ class Compressor:
     def get_compression_stats(self) -> Dict[str, Any]:
         return {
             'total_transcripts': len(self._transcripts),
-            'token_threshold': self.token_threshold,
+            'context_window_tokens': self.context_window_tokens,
+            'microcompact_token_threshold': self.microcompact_token_threshold,
+            'full_compression_token_threshold': self.full_compression_token_threshold,
             'max_transcripts': self.max_transcripts,
         }
