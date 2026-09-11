@@ -265,6 +265,10 @@ chore:
 
 Commit Description 使用中文，保证仅查看 Git History 就能理解该 Commit 的主要工程目的。
 
+### 8.1 Worktree
+
+Worktree 优先创建于主仓库目录之外，保持主工作区的 Git 状态干净；如使用仓库内的 `.worktrees/`，该目录必须被 Git 忽略。创建、移动或移除 Worktree 时，不得影响其他 Worktree 中的评测脚本、verifier、trace、report 或实验产物。
+
 ## 9. 语言与代码规范
 
 与用户沟通以及项目内部面向用户的说明默认使用中文。

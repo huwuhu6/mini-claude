@@ -32,7 +32,7 @@
 
 ## 2026-09-11
 
-Commit: `PENDING`
+Commit: `402f474`
 Commit Description: `fix(context): 修复上下文压缩与工具输出基础缺陷`
 
 ### Description
