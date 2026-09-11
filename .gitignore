@@ -28,7 +28,6 @@ task_list.md
 !/sandbox/eval_runtime/verification_support.py
 
 # Personal / legacy docs
-docs/evolution/*
 !docs/evolution/anti_loop_benchmark_validity_hardening_v2_report.md
 docs/legacy/
 docs/chat-logs/
