@@ -49,6 +49,119 @@ def test_service_reference_variant():
     _run_variant('task_022', setup=[sys.executable, 'start_order_service.py'], controller=True)
 
 
+def _run_task022_verifier_with_audit(*, actions, trace_events):
+    """Run the real task022 verifier with evaluator-owned fixture evidence."""
+    from eval_runner import _stop_fixture_controller
+
+    case = next(TASKS.glob('task_022_*'))
+    with tempfile.TemporaryDirectory() as temp:
+        work = Path(temp)
+        shutil.copy2(case / 'verify.py', work / 'verify.py')
+        shutil.copy2(ROOT / 'sandbox' / 'eval_runtime' / 'verification_support.py',
+                     work / 'verification_support.py')
+        process, agent_env, verifier_env = _start_task022_controller()
+        try:
+            actions(agent_env)
+            trace = work / 'trace.json'
+            trace.write_text(json.dumps({
+                'final_status': 'SUCCESS',
+                'attempt_events': trace_events,
+            }), encoding='utf-8')
+            env = {**os.environ, **verifier_env, 'EVAL_TRACE_PATH': str(trace)}
+            env.pop('EVAL_FIXTURE_TOKEN', None)
+            return subprocess.run(
+                [sys.executable, 'verify.py'], cwd=work, env=env,
+                capture_output=True, text=True,
+            )
+        finally:
+            _stop_fixture_controller(process)
+
+
+def _start_task022_controller():
+    from eval_runner import _start_fixture_controller
+    process, agent_env, verifier_env = _start_fixture_controller('task_022_connection_refused_recoverable', 'variant-audit')
+    assert process is not None
+    return process, agent_env, verifier_env
+
+
+def _task022_recovery_trace():
+    return [
+        {'subject_key': 'bash:health_check', 'intent_key': 'bash:health_check',
+         'status': 'FAILURE', 'execution_success': False, 'observed_failure': True,
+         'observation_fingerprint': 'before'},
+        {'subject_key': 'bash:health_check', 'intent_key': 'bash:health_check',
+         'status': 'SUCCESS', 'execution_success': True, 'observed_failure': False,
+         'observation': 'HEALTHY_TRUE', 'observation_fingerprint': 'after',
+         'resolution_key': 'bash:health_check'},
+    ]
+
+
+def _agent_request(env, path, *, method='GET', data=None):
+    import urllib.error
+    import urllib.request
+    request = urllib.request.Request(
+        env['EVAL_FIXTURE_URL'] + path,
+        method=method,
+        headers={'X-Fixture-Token': env['EVAL_FIXTURE_TOKEN']},
+        data=data,
+    )
+    try:
+        with urllib.request.urlopen(request, timeout=2) as response:
+            return json.loads(response.read())
+    except urllib.error.HTTPError as error:
+        error.read()
+        return None
+
+
+def _valid_task022_actions(env):
+    _agent_request(env, '/health')
+    _agent_request(env, '/start', method='POST', data=b'{"variant":true}')
+    _agent_request(env, '/health')
+    _agent_request(env, '/orders/42')
+
+
+def test_task022_verifier_accepts_audited_alternate_recovery():
+    result = _run_task022_verifier_with_audit(
+        actions=_valid_task022_actions,
+        trace_events=_task022_recovery_trace(),
+    )
+    assert result.returncode == 0, result.stdout + result.stderr
+
+
+def test_task022_verifier_rejects_fake_or_outcome_only_recovery():
+    def fake_actions(env):
+        _agent_request(env, '/health')
+
+    fake = _run_task022_verifier_with_audit(
+        actions=fake_actions,
+        trace_events=_task022_recovery_trace(),
+    )
+    assert fake.returncode != 0
+
+    def outcome_only_actions(env):
+        _agent_request(env, '/start', method='POST', data=b'{}')
+        _agent_request(env, '/orders/42')
+
+    outcome_only = _run_task022_verifier_with_audit(
+        actions=outcome_only_actions,
+        trace_events=[_task022_recovery_trace()[1]],
+    )
+    assert outcome_only.returncode != 0
+
+
+def test_task022_verifier_rejects_recovery_without_business_outcome():
+    def recovery_only_actions(env):
+        _agent_request(env, '/health')
+        _agent_request(env, '/start', method='POST', data=b'{}')
+        _agent_request(env, '/health')
+
+    result = _run_task022_verifier_with_audit(
+        actions=recovery_only_actions,
+        trace_events=_task022_recovery_trace(),
+    )
+    assert result.returncode != 0
+
+
 def test_artifact_reference_variant():
     _run_variant('task_023', setup=[sys.executable, 'build_export.py'])
 
