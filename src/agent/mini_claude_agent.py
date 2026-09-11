@@ -39,23 +39,51 @@ from core.background import BackgroundProcessor, BackgroundTaskStatus
 from core.subagent import SubAgentManager, SubAgentType, SubAgentResult
 from core.console import ConsoleCommandSystem, Command
 from core.compression import Compressor
-from core.loop_guard import LoopGuard, canonicalize_args
-from core.loop_controller import LoopController, RuntimeEscalationException, CommandNormalizer
+from core.loop_guard import canonicalize_args
+from core.loop_controller import (
+    AttemptHistory, AttemptStatus, CommandNormalizer, RuntimeDecision,
+    LoopController, RuntimeEscalationException, RuntimePolicy, RuntimePolicyAdapter,
+)
 from core.tracing import TraceManager
 from core.runtime_data import RuntimeDataPaths
 from core.session_recorder import SessionLogHandler, SessionRecorder
-from core.failure_intelligence import FailureAnalyzer, FailureMemory, FailureEscalationPolicy, build_escalation_message
+from core.failure_intelligence import FailureAnalyzer
 from core.runtime_context import (
     RuntimeContext,
     run_preflight,
     EnvironmentBlocker,
     WorkspaceStateGuard,
 )
+from core.runtime_context.observation import ObservationNormalizer
 from core.runtime_context.command_policy import CommandPolicy
 from cli.authority import WorkspaceAuthority
 from skills import SkillLoader
 
 logger = logging.getLogger(__name__)
+
+
+class _RuntimeCompletionGate:
+    """Completion compatibility gate; terminal runtime decisions stay in RuntimePolicy."""
+
+    def __init__(self, policy: RuntimePolicy):
+        self.policy = policy
+
+    def reset(self) -> None:
+        return None
+
+    def check(self, _tracker):
+        decision = self.policy.finalize()
+        return type("CompletionDecision", (), {
+            "should_terminate": decision.action is RuntimeDecision.HARD_STOP,
+            "should_replan": decision.action is RuntimeDecision.REPLAN,
+            "action": decision.action,
+            "reason": decision.reason,
+            "open_blocker_count": 1 if decision.action is not RuntimeDecision.ALLOW else 0,
+        })()
+
+    @staticmethod
+    def message(_decision) -> str:
+        return ""
 
 
 class MiniClaudeAgent:
@@ -98,6 +126,8 @@ class MiniClaudeAgent:
         # Probe before session subsystems start so the system prompt and audit
         # record share the same bounded environment facts.
         self.preflight = run_preflight(self.workdir)
+        # Preflight is a startup capability snapshot only. Runtime decisions
+        # use fresh tool results and the unified attempt stream below.
         self.environment_blocker = EnvironmentBlocker(self.preflight)
         self.data_paths = RuntimeDataPaths.for_workspace(
             self.workdir, data_root=runtime_data_root
@@ -216,24 +246,21 @@ class MiniClaudeAgent:
         self.messages: List[Message] = []
         self._running = False
 
-        # Failure Intelligence Layer (must init before V3 Loop Controller)
+        # Stateless semantic observer + the single runtime fact stream.
         self.failure_analyzer = FailureAnalyzer()
-        self.failure_memory = FailureMemory()
-        self.failure_policy = FailureEscalationPolicy()
-
-        # V3 Loop Controller — combined intent normalization + guard + circuit breaker
-        self.loop_controller = LoopController(
-            failure_memory=self.failure_memory,
-            strike_limit=5,
-        )
-        # Legacy loop guard kept for backward compatibility (trace schema)
-        self.loop_guard = LoopGuard()
+        self.observation_normalizer = ObservationNormalizer()
+        self.attempt_history = AttemptHistory(maxlen=32)
+        self.runtime_policy = RuntimePolicy(self.attempt_history)
+        # LoopController is only a facade over this exact policy instance.
+        self.loop_controller = LoopController(policy=self.runtime_policy)
+        # The adapter exists only for trace compatibility; it has no state or
+        # second event store.
+        self.runtime_observer = RuntimePolicyAdapter(self.runtime_policy)
+        self.completion_guard = _RuntimeCompletionGate(self.runtime_policy)
         # Runtime trace system — append-only, hook-based observability
         self.trace = TraceManager(trace_dir=self.data_paths.traces)
         # Benchmark metrics — reset each _llm_tool_cycle call
         self.last_metrics: Dict[str, int] = {"turns": 0, "total_tokens": 0, "api_errors": 0}
-        # Tracks consecutive identical command executions for soft prompting
-        # (Replaced by V3 intent-based LoopGuard in loop_controller.py)
         self._cmd_history: List[tuple] = []
 
 
@@ -325,6 +352,15 @@ class MiniClaudeAgent:
             api_key = os.getenv('DEEPSEEK_API_KEY', llm.api_key or '')
             base_url = os.getenv('DEEPSEEK_BASE_URL',
                                  llm.base_url or 'https://api.deepseek.com')
+        elif llm.provider == 'dashscope':
+            api_key = os.getenv('DASHSCOPE_API_KEY', llm.api_key or '')
+            base_url = os.getenv(
+                'DASHSCOPE_COMPATIBLE_BASE_URL',
+                os.getenv(
+                    'AI_BASE_URL',
+                    llm.base_url or 'https://dashscope.aliyuncs.com/compatible-mode/v1',
+                ),
+            )
         elif llm.provider == 'anthropic':
             api_key = os.getenv('ANTHROPIC_API_KEY', llm.api_key or '')
             base_url = os.getenv('ANTHROPIC_BASE_URL',
@@ -339,6 +375,7 @@ class MiniClaudeAgent:
             'temperature': llm.temperature,
             'api_key': api_key,
             'base_url': base_url,
+            'timeout': llm.timeout_ms / 1000.0,
         }
 
         if api_key:
@@ -918,7 +955,7 @@ class MiniClaudeAgent:
 
     # ── Tool Handler Methods (bound once in __init__.tool_dispatcher) ──
 
-    def _handle_bash(self, command: str) -> str:
+    def _handle_bash(self, command: str) -> ToolResult:
         # Windows `start` launches another process/window but can still keep
         # the parent shell waiting when called through subprocess.run. Route
         # this narrow, explicit server-launch form through the background
@@ -929,7 +966,7 @@ class MiniClaudeAgent:
                 description=f"Windows start: {command[:80]}",
             )
         result = self.tools.run_bash(command)
-        return result.content
+        return result
 
     def _handle_run_background(self, command: str, description: str = "",
                                timeout: int = 3600) -> str:
@@ -1246,7 +1283,7 @@ class MiniClaudeAgent:
         header += ">"
         return ToolResult(content=f"{header}\n{skill.content}\n</skill>")
 
-    def _execute_tool(self, name: str, args: Dict[str, Any]) -> str:
+    def _execute_tool(self, name: str, args: Dict[str, Any]) -> Any:
         """Execute tool via pre-bound dispatch dict (s_full.py TOOL_HANDLERS pattern)."""
         handler = self.tool_dispatcher.get(name)
         if not handler:
@@ -1270,9 +1307,14 @@ class MiniClaudeAgent:
         started_at: float,
         call_id: str,
     ) -> str:
-        """Persist and surface a terminal environment blocker in one place."""
+        """Persist blocker evidence and surface it as recoverable tool feedback.
+
+        EnvironmentBlocker remains the authority for classifying a command or
+        result.  Whether that evidence terminates the task belongs to the
+        progress/completion governance layer, so this helper never ends the
+        task by itself.
+        """
         result_text = block.message
-        self.trace.record_circuit_breaker()
         self.trace.record_tool_call(
             tool_name=tool_name,
             args_hash=args_hash,
@@ -1285,10 +1327,10 @@ class MiniClaudeAgent:
             failure_category=block.category,
             guard_type="ENVIRONMENT_BLOCK",
             guard_reason=block.category,
-            recoverability="NON_RECOVERABLE",
+            recoverability="UNKNOWN",
             strategy_fingerprint="ENVIRONMENT_BLOCKER",
-            escalated=True,
-            circuit_breaker_triggered=True,
+            escalated=False,
+            circuit_breaker_triggered=False,
             cwd=str(self.runtime_context.cwd),
             workspace_root=str(self.runtime_context.workspace_root),
             session_id=self.runtime_context.shell_session.session_id,
@@ -1304,13 +1346,20 @@ class MiniClaudeAgent:
         self._emit_ui_event("tool_result", name=tool_name, success=False, blocked=True)
         return result_text
 
-    def _is_tool_error(self, result_text: str) -> bool:
+    def _is_tool_error(self, result: ToolResult | str, tool_name: str = "") -> bool:
         """Detect whether a tool result indicates failure.
 
         Checks two patterns:
           - "错误:" prefix (from _execute_tool exception handling)
           - "[Exit Code: N]" with N != 0 (from bash tool return)
         """
+        if isinstance(result, ToolResult):
+            return not bool(
+                result.execution_success
+                if result.execution_success is not None
+                else result.success
+            )
+        result_text = result
         if not result_text:
             return False
         if result_text.startswith("错误:"):
@@ -1457,9 +1506,10 @@ class MiniClaudeAgent:
             environment=self.preflight.to_dict(),
         )
         self.runtime_context.current_task_id = tid
-        self.failure_memory.set_task(tid)
-        self.loop_controller.clear()
+        self.runtime_policy.reset()
         self.workspace_state_guard.reset()
+        self.runtime_observer.reset()
+        self.completion_guard.reset()
 
         no_tool_retry_count = 0
         tool_call_seen = False
@@ -1560,6 +1610,32 @@ class MiniClaudeAgent:
                             continue
                         self.trace.end_task("FAILED")
                         return content
+                    completion_decision = self.completion_guard.check(self.runtime_observer)
+                    latest_event = self.runtime_policy.history.all()[-1:]
+                    if latest_event:
+                        # finalize() annotates the existing attempt; refresh
+                        # the trace entry in place so this is not a duplicate.
+                        self.trace.update_last_attempt_event(latest_event[0].to_dict())
+                    if completion_decision.should_terminate:
+                        self.trace.record_completion_guard(
+                            completion_decision.reason,
+                            completion_decision.open_blocker_count,
+                        )
+                        self.trace.end_task(
+                            "BLOCKED_ENVIRONMENT",
+                            "UNRESOLVED_BLOCKER_COMPLETION",
+                        )
+                        return self.completion_guard.message(completion_decision)
+                    if completion_decision.action.value == "REPLAN":
+                        self.trace.record_completion_guard(
+                            completion_decision.reason,
+                            completion_decision.open_blocker_count,
+                        )
+                        self.messages.append(Message(
+                            role='user',
+                            content=self.completion_guard.message(completion_decision),
+                        ))
+                        continue
                     self.trace.end_task("SUCCESS")
                     return content
 
@@ -1589,6 +1665,17 @@ class MiniClaudeAgent:
                     sig = (tname, args_raw)
                     if sig in seen_tool_sigs:
                         logger.warning(f"检测到重复工具调用【{tname}】，已自动跳过")
+                        duplicate_intent = CommandNormalizer.normalize(
+                            tname, {"raw_arguments": str(args_raw)}
+                        )
+                        event, _ = self.runtime_policy.record_attempt(
+                            turn=iteration + 1, tool_name=tname,
+                            intent_key=duplicate_intent.to_key(),
+                            args_fingerprint=canonicalize_args({"raw_arguments": str(args_raw)}),
+                            success=False, result_text="duplicate tool call in same response",
+                            failure_category="", block_reason="SAME_RESPONSE_DUPLICATE",
+                        )
+                        self.trace.record_attempt_event(event.to_dict())
                         continue
                     seen_tool_sigs.add(sig)
                     logger.info("TOOL_REQUEST: name=%s raw_args=%s", tname, args_raw)
@@ -1600,6 +1687,16 @@ class MiniClaudeAgent:
                         # not terminate the entire agent task.
                         result_text = f"工具参数 JSON 无效，请重新生成合法 JSON: {exc}"
                         args_hash = canonicalize_args({"raw_arguments": str(args_raw)})
+                        intent = CommandNormalizer.normalize(
+                            tname, {"raw_arguments": str(args_raw)}
+                        )
+                        event, _ = self.runtime_policy.record_attempt(
+                            turn=iteration + 1, tool_name=tname,
+                            intent_key=intent.to_key(), args_fingerprint=args_hash,
+                            success=False, result_text=result_text,
+                            failure_category="INVALID_ARGUMENTS",
+                        )
+                        self.trace.record_attempt_event(event.to_dict())
                         self.trace.record_tool_call(
                             tool_name=tname,
                             args_hash=args_hash,
@@ -1654,22 +1751,69 @@ class MiniClaudeAgent:
                     # ── Trace + V3 Defense + Execute + Failure Intelligence ──
                     t_start = time.time()
                     args_hash = canonicalize_args(args)
-                    state_before = None
+                    # Capture the before snapshot for the stateless workspace
+                    # observer; lifecycle and recurrence live in AttemptHistory.
+                    tracker_state_before = self.workspace_state_guard.snapshot()
+                    state_before = tracker_state_before if self.workspace_state_guard.is_write_operation(tname, args) else None
                     state_guard_blocked = False
-                    if self.workspace_state_guard.is_write_operation(tname, args):
-                        state_before = self.workspace_state_guard.snapshot()
                     v3_block_msg = None
                     failure_sig = None
+                    observation_text = ""
 
                     try:
                         # ── V3 Layer 2+3: intent-based dedup → circuit breaker ──
-                        preflight_block = self.environment_blocker.check_command(tname, args)
+                        # Startup OFFLINE is retained as evidence in the trace,
+                        # never as an execution blocker. Real result below is
+                        # the fresher capability observation.
+                        preflight_evidence = self.environment_blocker.check_command(tname, args)
+                        preflight_block = None
                         if preflight_block:
                             result_text = self._record_environment_block(
                                 tname, args_hash, preflight_block, t_start, tc.get("id", "")
                             )
-                            self.trace.end_task("BLOCKED_ENVIRONMENT", "ENVIRONMENT_BLOCK")
-                            return result_text
+                            observation_text = result_text
+                            intent = CommandNormalizer.normalize(tname, args)
+                            decision = self.runtime_observer.observe(
+                                turn=iteration + 1, tool_name=tname,
+                                intent_key=intent.to_key(), success=False,
+                                result_text=observation_text,
+                                failure_category=preflight_block.category,
+                                blocker_category=preflight_block.category,
+                                workspace_before=tracker_state_before,
+                                workspace_after=tracker_state_before,
+                                workspace_root=str(self.runtime_context.workspace_root),
+                                command_blocked=True,
+                            )
+                            self.trace.annotate_current_tool(
+                                intent_key=intent.to_key(),
+                                observation_fingerprint=decision.event.observation_fingerprint,
+                                semantic_state=decision.event.semantic_state,
+                                progress_detected=decision.progress_detected,
+                                progress_reason=list(decision.progress_reason),
+                                stagnation_reason=list(decision.stagnation_reason),
+                                recovery_stage=decision.recovery_stage.value,
+                                open_blocker_count=decision.open_blocker_count,
+                                oscillation_detected=decision.oscillation_detected,
+                                verification_improved=decision.event.verification_improved,
+                                governance_decision=decision.action.value,
+                                workspace_before_digest=decision.event.workspace_before_digest,
+                                workspace_after_digest=decision.event.workspace_after_digest,
+                                changed_paths=list(decision.event.changed_paths),
+                            )
+                            self.messages.append(Message(
+                                role='tool', content=result_text,
+                                tool_call_id=tc.get('id', ''),
+                            ))
+                            if decision.should_terminate:
+                                self.trace.end_task("CIRCUIT_BROKEN", decision.reason)
+                                return result_text
+                            if decision.should_replan:
+                                self.messages.append(Message(
+                                    role='user',
+                                    content=("请重新规划：当前阻断仍只是证据，先寻找合法替代或验证其是否可恢复，"
+                                             "不要重复同一失败策略。"),
+                                ))
+                            continue
 
                         state_stall_preblock = None
                         if state_before is not None:
@@ -1682,35 +1826,45 @@ class MiniClaudeAgent:
 
                         if v3_block_msg:
                             result_text = v3_block_msg
+                            observation_text = result_text
+                            tool_result = ToolResult(
+                                content=result_text, success=False,
+                                execution_success=False,
+                            )
+                            observation_evidence = ObservationNormalizer.normalize(
+                                tname, args, tool_result
+                            )
                             logger.warning("TOOL_BLOCKED: name=%s reason=%s", tname, result_text)
-                            # Compatibility: record in legacy guard as well
-                            self.loop_guard.record(tname, args)
                         else:
                             result = self._execute_tool(tname, args)
-                            result_text = str(result)
-
-                            environment_block = self.environment_blocker.classify_result(
-                                result_text,
-                                failed=self._is_tool_error(result_text),
+                            tool_result = result if isinstance(result, ToolResult) else ToolResult(
+                                content=str(result), success=not self._is_tool_error(str(result), tname)
                             )
-                            if environment_block:
-                                result_text = self._record_environment_block(
-                                    tname, args_hash, environment_block, t_start, tc.get("id", "")
-                                )
-                                self.trace.end_task("BLOCKED_ENVIRONMENT", "ENVIRONMENT_BLOCK")
-                                return result_text
+                            result_text = tool_result.content
+                            observation_evidence = ObservationNormalizer.normalize(
+                                tname, args, tool_result
+                            )
+                            observation_text = (
+                                observation_evidence.evidence_text or result_text
+                            )
+
+                            # Environment classification is evidence only.  A
+                            # dynamic refusal/package/permission error remains
+                            # visible to the analyzer and can recover later.
+                            environment_block = self.environment_blocker.classify_result(
+                                observation_text,
+                                failed=(
+                                    not bool(tool_result.execution_success)
+                                    or observation_evidence.observed_failure
+                                ),
+                            )
 
                             state_guard_message = None
+                            after_snapshot = self.workspace_state_guard.snapshot()
                             if state_before is not None:
-                                mutation = self.workspace_state_guard.mutation(
-                                    state_before, self.workspace_state_guard.snapshot()
-                                )
-                                state_guard_message = self.workspace_state_guard.observe_write(mutation)
-                            elif self.workspace_state_guard.is_read_operation(tname):
-                                state_guard_message = self.workspace_state_guard.observe_read(tname, args)
-                            if state_guard_message:
-                                result_text = state_guard_message
-                                state_guard_blocked = True
+                                mutation = self.workspace_state_guard.mutation(state_before, after_snapshot)
+                            # WorkspaceStateGuard is an observer; stall policy is
+                            # derived from the shared AttemptHistory below.
 
                             if result_text.startswith("[用户中断]"):
                                 t_end = time.time()
@@ -1753,37 +1907,19 @@ class MiniClaudeAgent:
                                 return "已取消当前任务。"
 
                             # ── Failure Intelligence Analysis ──
-                            if self._is_tool_error(result_text):
+                            if (
+                                not bool(tool_result.execution_success)
+                                or observation_evidence.observed_failure
+                            ):
                                 failure_sig = self.failure_analyzer.analyze(
                                     tool_name=tname,
                                     tool_args=args,
-                                    result_text=result_text,
+                                    result_text=(
+                                        observation_evidence.evidence_text or result_text
+                                    ),
                                 )
-                                self.failure_memory.record(
-                                    category=failure_sig.category.value,
-                                    strategy_fp=failure_sig.strategy_fingerprint,
-                                )
-
-                                # ── V3 Layer 3: circuit breaker registration ──
-                                self.loop_controller.register_failure(
-                                    tname, args, failure_sig.category.value,
-                                )
-
-                                cat = failure_sig.category.value
-                                cat_count = self.failure_memory.get_category_count(cat)
-                                stg_div = self.failure_memory.get_strategy_diversity(cat)
-                                should_esc, esc_reason = self.failure_policy.should_escalate(
-                                    failure_sig, cat_count, stg_div,
-                                )
-                                if should_esc:
-                                    logger.warning(
-                                        f"FailureEscalation: {cat} x{cat_count}, "
-                                        f"strategies={stg_div}, reason={esc_reason}"
-                                    )
-                                    result_text = build_escalation_message(failure_sig, esc_reason)
-                                    failure_sig.escalated = True
-
-                            self.loop_guard.record(tname, args)
+                            # FailureAnalyzer is stateless. The event stream is
+                            # the sole place where this failure is counted.
 
                     except RuntimeEscalationException as e:
                         # ── V3 hard circuit breaker triggered ──
@@ -1815,7 +1951,7 @@ class MiniClaudeAgent:
                     t_success = (
                         not v3_block_msg
                         and not state_guard_blocked
-                        and not self._is_tool_error(result_text)
+                        and bool(tool_result.execution_success)
                     )
                     self.trace.record_tool_call(
                         tool_name=tname, args_hash=args_hash,
@@ -1824,6 +1960,12 @@ class MiniClaudeAgent:
                         error_message="" if t_success else result_text[:200],
                         result_preview=result_text,
                         started_at=t_start, finished_at=t_end,
+                        execution_success=bool(tool_result.execution_success),
+                        observed_failure=observation_evidence.observed_failure,
+                        semantic_status=observation_evidence.semantic_status,
+                        observation=observation_evidence.observation,
+                        exit_code=tool_result.exit_code,
+                        segment_exit_codes=tool_result.segment_exit_codes,
                         failure_category=(
                             "STATE_STALLED" if state_guard_blocked
                             else failure_sig.category.value if failure_sig else ""
@@ -1838,6 +1980,56 @@ class MiniClaudeAgent:
                         cwd=str(self.runtime_context.cwd),
                         workspace_root=str(self.runtime_context.workspace_root),
                         session_id=self.runtime_context.shell_session.session_id,
+                    )
+
+                    # Progress-aware evidence is computed after the existing
+                    # guards and Failure Intelligence have classified the call.
+                    intent = CommandNormalizer.normalize(tname, args)
+                    progress_failure_category = (
+                        "STATE_STALLED" if state_guard_blocked
+                        else failure_sig.category.value if failure_sig else ""
+                    )
+                    progress_decision = self.runtime_observer.observe(
+                        turn=iteration + 1,
+                        tool_name=tname,
+                        intent_key=intent.to_key(),
+                        strategy_fingerprint=(
+                            failure_sig.strategy_fingerprint if failure_sig else ""
+                        ),
+                        success=t_success,
+                        result_text=observation_text or result_text,
+                        failure_category=progress_failure_category,
+                        workspace_before=tracker_state_before,
+                        workspace_after=self.workspace_state_guard.snapshot(),
+                        workspace_root=str(self.runtime_context.workspace_root),
+                        command_blocked=bool(v3_block_msg) or state_guard_blocked,
+                        block_reason=(v3_block_msg or "STATE_STALLED"),
+                        args_fingerprint=args_hash,
+                        execution_success=bool(tool_result.execution_success),
+                        observed_failure=observation_evidence.observed_failure,
+                        semantic_status=observation_evidence.semantic_status,
+                        observation=observation_evidence.observation,
+                        exit_code=tool_result.exit_code,
+                        segment_exit_codes=tool_result.segment_exit_codes,
+                        resolution_evidence=observation_evidence.resolution_evidence,
+                        subject_key=CommandNormalizer.subject_key(tname, args),
+                    )
+                    self.trace.record_attempt_event(progress_decision.event.to_dict())
+                    self.trace.annotate_current_tool(
+                        intent_key=intent.to_key(),
+                        observation_fingerprint=progress_decision.event.observation_fingerprint,
+                        semantic_state=progress_decision.event.semantic_state,
+                        progress_detected=progress_decision.progress_detected,
+                        progress_reason=list(progress_decision.progress_reason),
+                        stagnation_reason=list(progress_decision.stagnation_reason),
+                        recovery_stage=progress_decision.recovery_stage.value,
+                        open_blocker_count=progress_decision.open_blocker_count,
+                        oscillation_detected=progress_decision.oscillation_detected,
+                        verification_improved=progress_decision.event.verification_improved,
+                        governance_decision=progress_decision.action.value,
+                        workspace_before_digest=progress_decision.event.workspace_before_digest,
+                        workspace_after_digest=progress_decision.event.workspace_after_digest,
+                        changed_paths=list(progress_decision.event.changed_paths),
                     )
 
                     logger.info(
@@ -1876,10 +2068,15 @@ class MiniClaudeAgent:
                         tool_call_id=tc.get('id', ''),
                     ))
 
-                    if state_guard_blocked:
-                        self.trace.record_circuit_breaker()
-                        self.trace.end_task("CIRCUIT_BROKEN")
+                    if progress_decision.should_terminate:
+                        self.trace.end_task("CIRCUIT_BROKEN", progress_decision.reason)
                         return result_text
+                    if progress_decision.should_replan:
+                        self.messages.append(Message(
+                            role='user',
+                            content=("[Progress Governance] 最近的策略没有产生新的有效 Observation 或 State Progress。"
+                                     "请重新规划，改变解决路径；不要继续重复同一失败或振荡操作。"),
+                        ))
 
                 # ── Nag tracking (s_full.py s03 — hot-injected via _get_dynamic_hot_context) ──
                 rounds_without_todo = 0 if used_todo else rounds_without_todo + 1

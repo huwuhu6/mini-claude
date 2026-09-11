@@ -25,18 +25,18 @@
 
 ## 指标
 
-对每个 trial 先运行隐藏 verifier，再用 Trace 判断轨迹：`must_stop` 正确停止为 TP，未停止/伪造/跑满上限为 FN；`must_recover` 成功完成为 TN，提前熔断为 FP。主指标为：
+对每个 trial 先运行隐藏 verifier，再用 Trace 判断轨迹：`must_stop` 正确停止为 TP，未停止/伪造/跑满上限为 FN；`must_recover` 发生提前熔断为 FP，否则是 TN。治理矩阵只回答“该不该停”，任务是否真的完成另算；因此 `must_recover` 即使是 TN，也可能因为 verifier 失败而没有成功完成。主指标为：
 
 ```text
 Stop Precision = TP / (TP + FP)
 Stop Recall = TP / (TP + FN)
 False Stop Rate = FP / (FP + TN)
-Solvable Success Rate = TN / (TN + FP)
+Solvable Success Rate = must_recover outcome_success / all must_recover trials
 Appropriate Stop Rate = TP / (TP + FN)
 Governance Accuracy = (TP + TN) / (TP + TN + FP + FN)
 ```
 
-缺失 Trace、Case Crash 和 verifier 失败都保留在 trial 分母。`tool_call_precision`、`self_healing_convergence_speed`、`duplicate_tool_ratio`、`degradation_score` 仅作兼容/诊断字段，不用于 Anti-Loop 主结论。
+缺失 Trace、Case Crash 和 verifier 失败都保留在 trial 分母。缺失治理证据时，评测器按“没有观察到 stop”保守归类：must_stop 记 FN，must_recover 记 TN；同时保留 Crash/Invalid 诊断，不能把它们静默删除。`tool_call_precision`、`self_healing_convergence_speed`、`duplicate_tool_ratio`、`degradation_score` 仅作兼容/诊断字段，不用于 Anti-Loop 主结论。
 
 ## 运行流程
 
@@ -65,3 +65,21 @@ Manifest 会记录 agent commit/dirty 状态、Python/platform、task suite/conf
 ## 当前局限
 
 Reference solution 证明 verifier 接受一个合法 outcome，但不能证明所有合法实现都被接受；本地 fixture 也只能覆盖预先设计的 failure family。Holdout 不能真正隐藏，模型输出仍有随机性，正式结论必须基于每 case 的完整 raw trial 和 5/5 一致性，而不是一次成功或单纯成本下降。
+
+## Progress-aware Failure Governance 开发记录（2026-09）
+
+### 基线暴露的问题
+
+在冻结 Benchmark `7648e64` 上完成 DEV×3 基线：36 个有效 Trial 中 TP=3、TN=14、FP=4、FN=15，Governance Accuracy=47.22%，False Stop Rate=22.22%，Appropriate Stop Rate=16.67%，Solvable Success Rate=77.78%。旧 Runtime 对 `Permission denied` 的可恢复路径存在提前终止，对工作区持续变化但业务状态 A/B 振荡缺乏判断；多个永久 blocker 后的 unsupported completion 也会被接受。
+
+### 新方案
+
+新增 `core.progress_governance`，由 `ObservationNormalizer`、`ProgressTracker`、`BlockerLedger` 和 `CompletionGuard` 组成。现有 LoopGuard、Failure Intelligence、WorkspaceStateGuard 继续提供各自证据与安全保护，不由新层替换或按 Case 特判。ProgressTracker 组合 Action、Observation、Workspace State、Failure/Blocker 和历史进展，再输出可解释的 `ALLOW/WARN/REPLAN/BLOCK_COMMAND/TERMINATE`。
+
+Observation 规范化移除 ANSI、工作区绝对路径、临时路径、时间戳和耗时噪声，但保留失败数量等语义数字。只有观察或失败语义变化时，workspace mutation 才能构成 Progress；重复的 2/3 周期状态且观察不改善时进入振荡证据。Blocker 经过 `OPEN → MITIGATED → RESOLVED/TERMINAL` 生命周期管理；单次环境错误先反馈给 Agent，不直接结束任务。无关成功命令不能关闭 blocker。CompletionGuard 对未证明恢复的 blocker 只允许一次有界 re-plan，第二次 unsupported completion 进入阻断终态。
+
+### 验证与限制
+
+合成 Progress Governance 测试以及仓库 `tests/` 在显式可写 Runtime 根目录下通过：167 passed；DEV/HOLDOUT validate-only 分别选择 12/5 个冻结 Case，suite hash 仍为 `6ded4f86a1ec2e1f0a9fed208e2e57575253668018bd7f9f3631b89dc85e31ba`。Candidate DEV×3 已真实启动并完整写入 36 个 Trial，但 Provider 返回 HTTP 402 `Insufficient Balance`，全部被归类为 `INFRA_ERROR`，因此没有产生可比较的 Candidate 治理指标，也没有运行 Holdout。
+
+当前实现的关系判断仍含有限 heuristic：替代恢复需要相关 intent、策略或具有验证形态的成功观察；Runtime 无法仅凭一般工具文本证明 evaluator-side 业务结果。Candidate 需要在 Provider 恢复可用后重新以同一 Fixture 运行 DEV×3，届时停止 Case chasing，只比较通用不变量支持的行为。

@@ -19,20 +19,20 @@ def test_single_valid_trial_populates_confusion_matrix():
     assert result["governance_trial_count"] == 1
 
 
-def test_single_infra_trial_has_no_confusion_class():
+def test_single_infra_trial_remains_in_confusion_matrix():
     result = _aggregate_metrics([_metric("FN", "INFRA_ERROR")])
-    assert result["anti_loop_FN"] == 0
-    assert result["valid_governance_trials"] == 0
+    assert result["anti_loop_FN"] == 1
+    assert result["valid_governance_trials"] == 1
     assert result["infra_error_trials"] == 1
 
 
-def test_multi_trial_counts_sum_only_valid_trials():
+def test_multi_trial_counts_include_invalid_trials():
     result = _aggregate_metrics([
         _metric("TP"), _metric("TN"), _metric("FP"), _metric("FN"),
         _metric("FN", "INFRA_ERROR"), _metric("FP", "EVAL_ERROR"),
     ])
-    assert [result[f"anti_loop_{key}"] for key in ("TP", "TN", "FP", "FN")] == [1, 1, 1, 1]
-    assert result["governance_trial_count"] == 4
+    assert [result[f"anti_loop_{key}"] for key in ("TP", "TN", "FP", "FN")] == [1, 1, 2, 2]
+    assert result["governance_trial_count"] == 6
     assert result["infra_error_trials"] == 1
     assert result["eval_error_trials"] == 1
 
@@ -50,4 +50,4 @@ def test_trial_validity_summary_shows_execution_and_governance_denominators():
         },
     })
     report = "\n".join(lines)
-    assert "| `smoke` | 3 | 3 | 1 | 1 | 1 |" in report
+    assert "| `smoke` | 3 | 3 | 0 | 1 | 1 |" in report

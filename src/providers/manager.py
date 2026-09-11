@@ -63,7 +63,7 @@ class ProviderManager:
         Create and register a new provider.
 
         Args:
-            provider_type: Type of provider ('deepseek' or 'anthropic')
+            provider_type: Type of provider ('deepseek', 'dashscope' or 'anthropic')
             config: Provider configuration
             is_primary: Whether to set as primary
             fallback_priority: Priority for fallback
@@ -72,8 +72,10 @@ class ProviderManager:
             The name of the registered provider
         """
         name = f"{provider_type}_provider"
+        config = dict(config)
+        config.setdefault("provider_name", provider_type)
 
-        if provider_type == "deepseek":
+        if provider_type in {"deepseek", "dashscope"}:
             provider = DeepseekProvider(config)
         elif provider_type == "anthropic":
             try:

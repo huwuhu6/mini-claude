@@ -1,33 +1,21 @@
-"""
-Loop Controller V3 — Combined Circuit Breaker Defense with Intent Normalization.
+"""Unified runtime liveness policy and the canonical tool-attempt event stream.
 
-Three-layer defense pipeline:
-  1. CommandNormalizer — token-based CLI normalizer (shlex.split) that strips
-     shell noise and extracts canonical {action, target} intent fingerprints.
-  2. Intent-Aware LoopGuard — compares normalized intents instead of raw command
-     strings, injects LOOP_GUARD_PREVENTED virtual failures into FailureMemory.
-  3. Hard Circuit Breaker — when the same intent accumulates 5 failures
-     (TOOL_CRASH + LOOP_GUARD_PREVENTED combined), raises RuntimeEscalationException
-     to physically terminate the agent loop.
-
-Usage:
-    controller = LoopController(failure_memory=memory)
-
-    block_msg = controller.check("bash", {"command": "python run_test.py"})
-    if block_msg:
-        # Tool was intercepted — return block_msg as result
-        ...
-
-    # After real tool failure, register the strike
-    controller.register_failure("bash", {"command": "..."}, "TOOL_CRASH")
+CommandNormalizer creates deterministic intent keys.  RuntimePolicy consumes
+AttemptHistory-derived evidence and is the only component that chooses a
+runtime action.  CircuitBreaker remains only as the actuator for HARD_STOP.
 """
 from __future__ import annotations
 import shlex
 import json
 import hashlib
 import logging
-from dataclasses import dataclass
-from typing import Dict, List, Optional, Any
+import re
+import time
+from collections import deque
+from dataclasses import dataclass, replace
+from enum import Enum
+from typing import Deque, Dict, List, Optional, Any, Iterable
+from urllib.parse import urlsplit
 
 logger = logging.getLogger(__name__)
 
@@ -224,6 +212,39 @@ class CommandNormalizer:
 
         return NormalizedIntent(action=action, target=target, tool=tool_name)
 
+    @classmethod
+    def subject_key(cls, tool_name: str, args: Dict[str, Any]) -> str:
+        """Return a small, deterministic identity for cross-tool resolution."""
+        args = args if isinstance(args, dict) else {}
+        if tool_name == "health_check":
+            port = args.get("port")
+            if port is not None:
+                return f"service://localhost:{int(port)}"
+            url = str(args.get("url", ""))
+            if url:
+                return cls._service_subject(url)
+            return ""
+
+        command = str(args.get("command", "")) if tool_name == "bash" else ""
+        urls = re.findall(r"https?://[^\s'\"]+", command, re.IGNORECASE)
+        if urls:
+            return cls._service_subject(urls[0])
+
+        intent = cls.normalize(tool_name, args)
+        if re.search(r"\bpytest\b", command, re.IGNORECASE):
+            return f"test://pytest/{intent.target or 'full'}"
+        if intent.action == "INSTALL_PACKAGE" and intent.target:
+            return f"dependency://{intent.target.lower()}"
+        return ""
+
+    @staticmethod
+    def _service_subject(url: str) -> str:
+        parsed = urlsplit(url if "://" in url else f"http://{url}")
+        if not parsed.hostname:
+            return ""
+        port = parsed.port or (443 if parsed.scheme.lower() == "https" else 80)
+        return f"service://{parsed.hostname.lower()}:{port}"
+
     # ── Pipeline helpers ───────────────────────────────────────────────
 
     @classmethod
@@ -378,234 +399,683 @@ class CommandNormalizer:
 
 
 # ──────────────────────────────────────────────────────────────────────
-#  Layer 2: Intent-Aware LoopGuard
+#  Unified attempt facts and policy
 # ──────────────────────────────────────────────────────────────────────
 
-class V3LoopGuard:
-    """Intent-based loop guard that normalizes commands before comparison.
+class AttemptStatus(str, Enum):
+    SUCCESS = "SUCCESS"
+    FAILURE = "FAILURE"
+    BLOCKED = "BLOCKED"
 
-    When a duplicate intent is detected:
-      1. Physically blocks the tool from executing.
-      2. Injects a LOOP_GUARD_PREVENTED virtual failure into FailureMemory,
-         so the Failure Intelligence layer sees the guard's activity.
-      3. Registers a strike on the CircuitBreaker.
-    """
 
-    def __init__(
-        self,
-        max_recent: int = 6,
-        min_occurrences: int = 4,
-        circuit_breaker: Optional[CircuitBreaker] = None,
-    ):
-        self.max_recent = max_recent
-        self.min_occurrences = min_occurrences
-        self.circuit_breaker = circuit_breaker
-        self.recent_intents: List[NormalizedIntent] = []
-        self.trigger_count: int = 0
+class RuntimeDecision(str, Enum):
+    ALLOW = "ALLOW"
+    SOFT_BLOCK = "SOFT_BLOCK"
+    REPLAN = "REPLAN"
+    HARD_STOP = "HARD_STOP"
 
-    def set_circuit_breaker(self, cb: CircuitBreaker) -> None:
-        self.circuit_breaker = cb
 
-    def check_and_record(self, tool_name: str, args: Dict[str, Any]) -> Optional[str]:
-        """Check the proposed call and record the intent.
+@dataclass(frozen=True)
+class AttemptEvent:
+    """One immutable fact about one proposed Tool Attempt."""
+    sequence: int
+    turn: int
+    tool_name: str
+    intent_key: str
+    args_fingerprint: str
+    status: AttemptStatus
+    execution_success: bool = True
+    observed_failure: bool = False
+    semantic_status: str = ""
+    observation: str = ""
+    exit_code: Optional[int] = None
+    segment_exit_codes: tuple[int, ...] = ()
+    failure_category: str = ""
+    recoverability: str = ""
+    strategy_fingerprint: str = ""
+    workspace_changed: bool = False
+    observation_fingerprint: str = ""
+    block_reason: str = ""
+    duration_ms: float = 0.0
+    timestamp: float = 0.0
+    changed_paths: tuple[str, ...] = ()
+    semantic_state: str = ""
+    verification_improved: bool = False
+    subject_key: str = ""
+    resolution_key: str = ""
+    resolution_reason: str = ""
+    governance_decision: str = ""
+    governance_reason: str = ""
+    completion_decision: str = ""
+    completion_reason: str = ""
+    workspace_before_digest: str = ""
+    workspace_after_digest: str = ""
 
-        Returns:
-            None if the call is safe to execute.
-            A block-message string if the call should be intercepted.
-        """
-        intent = CommandNormalizer.normalize(tool_name, args)
-        intent_key = intent.to_key()
+    def to_dict(self) -> Dict[str, Any]:
+        return {
+            "sequence": self.sequence, "turn": self.turn,
+            "tool_name": self.tool_name, "intent_key": self.intent_key,
+            "args_fingerprint": self.args_fingerprint,
+            "status": self.status.value,
+            "execution_success": self.execution_success,
+            "observed_failure": self.observed_failure,
+            "semantic_status": self.semantic_status,
+            "observation": self.observation,
+            "exit_code": self.exit_code,
+            "segment_exit_codes": list(self.segment_exit_codes),
+            "failure_category": self.failure_category,
+            "recoverability": self.recoverability,
+            "strategy_fingerprint": self.strategy_fingerprint,
+            "workspace_changed": self.workspace_changed,
+            "observation_fingerprint": self.observation_fingerprint,
+            "block_reason": self.block_reason, "duration_ms": round(self.duration_ms, 1),
+            "timestamp": round(self.timestamp, 3), "changed_paths": list(self.changed_paths),
+            "semantic_state": self.semantic_state,
+            "verification_improved": self.verification_improved,
+            "subject_key": self.subject_key,
+            "resolution_key": self.resolution_key,
+            "resolution_reason": self.resolution_reason,
+            "governance_decision": self.governance_decision,
+            "governance_reason": self.governance_reason,
+            "completion_decision": self.completion_decision,
+            "completion_reason": self.completion_reason,
+            "workspace_before_digest": self.workspace_before_digest,
+            "workspace_after_digest": self.workspace_after_digest,
+        }
 
-        # ── Record intent unconditionally ──
-        self.recent_intents.append(intent)
-        if len(self.recent_intents) > self.max_recent * 5:
-            self.recent_intents = self.recent_intents[-self.max_recent:]
 
-        if len(self.recent_intents) < self.min_occurrences:
+class AttemptHistory:
+    """The only runtime fact store. Detectors read it; they never own history."""
+
+    def __init__(self, maxlen: int = 32):
+        self.maxlen = maxlen
+        self._events: Deque[AttemptEvent] = deque(maxlen=maxlen)
+        self._next_sequence = 1
+
+    def append(self, event: AttemptEvent) -> AttemptEvent:
+        if event.sequence != self._next_sequence:
+            event = AttemptEvent(**{**event.__dict__, "sequence": self._next_sequence})
+        self._events.append(event)
+        self._next_sequence += 1
+        return event
+
+    def add(self, *, turn: int, tool_name: str, args_fingerprint: str,
+            intent_key: str = "",
+            status: AttemptStatus, failure_category: str = "",
+            recoverability: str = "", strategy_fingerprint: str = "",
+            workspace_changed: bool = False, observation_fingerprint: str = "",
+            block_reason: str = "", duration_ms: float = 0.0,
+            execution_success: Optional[bool] = None, observed_failure: bool = False,
+            semantic_status: str = "", observation: str = "",
+            changed_paths: Iterable[str] = (), exit_code: Optional[int] = None,
+            segment_exit_codes: Iterable[int] = ()) -> AttemptEvent:
+        event = AttemptEvent(
+            sequence=self._next_sequence, turn=turn, tool_name=tool_name,
+            intent_key=intent_key or f"{tool_name}:UNKNOWN:", args_fingerprint=args_fingerprint,
+            status=status,
+            execution_success=(status is AttemptStatus.SUCCESS
+                               if execution_success is None else execution_success),
+            observed_failure=observed_failure, semantic_status=semantic_status,
+            observation=observation, exit_code=exit_code,
+            segment_exit_codes=tuple(segment_exit_codes),
+            failure_category=failure_category,
+            recoverability=recoverability, strategy_fingerprint=strategy_fingerprint,
+            workspace_changed=workspace_changed,
+            observation_fingerprint=observation_fingerprint,
+            block_reason=block_reason, duration_ms=duration_ms,
+            timestamp=time.time(), changed_paths=tuple(changed_paths),
+        )
+        return self.append(event)
+
+    def record(self, *, turn: int, tool_name: str, intent_key: str,
+               args_fingerprint: str, status: AttemptStatus,
+               failure_category: str = "", recoverability: str = "",
+               strategy_fingerprint: str = "", workspace_changed: bool = False,
+               observation_fingerprint: str = "", block_reason: str = "",
+               duration_ms: float = 0.0, changed_paths: Iterable[str] = (),
+               timestamp: Optional[float] = None, semantic_state: str = "",
+               verification_improved: bool = False, execution_success: Optional[bool] = None,
+               observed_failure: bool = False, semantic_status: str = "",
+               observation: str = "", exit_code: Optional[int] = None,
+               segment_exit_codes: Iterable[int] = ()) -> AttemptEvent:
+        return self.append(AttemptEvent(
+            sequence=self._next_sequence, turn=turn, tool_name=tool_name,
+            intent_key=intent_key, args_fingerprint=args_fingerprint,
+            status=status,
+            execution_success=(status is AttemptStatus.SUCCESS
+                               if execution_success is None else execution_success),
+            observed_failure=observed_failure, semantic_status=semantic_status,
+            observation=observation, exit_code=exit_code,
+            segment_exit_codes=tuple(segment_exit_codes),
+            failure_category=failure_category,
+            recoverability=recoverability, strategy_fingerprint=strategy_fingerprint,
+            workspace_changed=workspace_changed,
+            observation_fingerprint=observation_fingerprint,
+            block_reason=block_reason, duration_ms=duration_ms,
+            timestamp=timestamp or time.time(), changed_paths=tuple(changed_paths),
+            semantic_state=semantic_state, verification_improved=verification_improved,
+        ))
+
+    def __len__(self) -> int:
+        return len(self._events)
+
+    def __iter__(self):
+        return iter(self._events)
+
+    def all(self) -> tuple[AttemptEvent, ...]:
+        return tuple(self._events)
+
+    def recent(self, horizon: int) -> tuple[AttemptEvent, ...]:
+        return tuple(list(self._events)[-horizon:])
+
+    def update_last(self, **changes: Any) -> AttemptEvent | None:
+        """Attach derived policy facts to the last stream entry."""
+        if not self._events:
             return None
-
-        # ── Check: frequency in sliding window ──
-        # (exclude current call from window)
-        window = self.recent_intents[-self.max_recent - 1:-1]
-        match_count = sum(1 for i in window if i.to_key() == intent_key)
-
-        if match_count >= self.min_occurrences:
-            self.trigger_count += 1
-            logger.warning(
-                f"[V3] 意图重复拦截 (频率 {match_count}/{self.max_recent}): "
-                f"{intent_key}"
-            )
-            if self.circuit_breaker:
-                self.circuit_breaker.register_failure(
-                    tool_name, args, "LOOP_GUARD_PREVENTED"
-                )
-            return self._build_block_message(intent)
-
-        return None
-
-    def _build_block_message(self, intent: NormalizedIntent) -> str:
-        recent_keys = [i.to_key() for i in self.recent_intents[-self.max_recent:]]
-        return (
-            f"[重复操作提醒 — 本次调用未执行]\n"
-            f"━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━\n"
-            f"意图键: {intent.to_key()}\n"
-            f"最近窗口 ({len(recent_keys)}): {', '.join(recent_keys)}\n"
-            f"\n"
-            f"检测到你正在重复相同的操作：\n"
-            f"  操作: {intent.action}\n"
-            f"  目标: {intent.target}\n"
-            f"\n"
-            f"系统判断该操作在最近窗口中重复出现，因此本次调用未执行。\n"
-            f"请结合前面的工具结果自行判断：是更换策略、调整参数，还是确实需要重试。\n"
-            f"━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━"
-        )
-
-    def clear(self) -> None:
-        self.recent_intents.clear()
-        self.trigger_count = 0
-
-
-# ──────────────────────────────────────────────────────────────────────
-#  Layer 3: Hard Circuit Breaker
-# ──────────────────────────────────────────────────────────────────────
-
-class CircuitBreaker:
-    """Hard-stop circuit breaker with per-intent strike counting.
-
-    When an intent accumulates STRIKE_LIMIT failures (combining real tool
-    errors and LOOP_GUARD_PREVENTED virtual records), raises
-    RuntimeEscalationException to physically terminate the agent loop.
-
-    Design principle: this is a HARD stop, not a soft suggestion.
-    The LLM never sees a tool_result — the loop catches the exception
-    and returns the escalation message directly to the user.
-    """
-
-    STRIKE_LIMIT: int = 5
-
-    def __init__(self, strike_limit: int = 5):
-        self.STRIKE_LIMIT = strike_limit
-        # per-intent-key → cumulative strike count
-        self._strikes: Dict[str, int] = {}
-        # intents that already triggered escalation (prevent re-fire)
-        self._escalated: set = set()
-
-    def register_failure(
-        self,
-        tool_name: str,
-        args: Dict[str, Any],
-        failure_category: str,
-    ) -> None:
-        """Register a failure for circuit breaker evaluation.
-
-        Call this BOTH when:
-          - A real tool error is detected (TOOL_CRASH, TIMEOUT, etc.)
-          - The LoopGuard intercepts a call (LOOP_GUARD_PREVENTED)
-
-        Raises RuntimeEscalationException when the strike limit is reached.
-        """
-        intent = CommandNormalizer.normalize(tool_name, args)
-        key = self._failure_key(tool_name, args, intent)
-
-        # Accumulate strike
-        self._strikes[key] = self._strikes.get(key, 0) + 1
-        total = self._strikes[key]
-
-        logger.warning(
-            f"[V3] 断路器登记失败: intent={key}, category={failure_category}, "
-            f"strikes={total}/{self.STRIKE_LIMIT}"
-        )
-
-        # Check threshold
-        if total >= self.STRIKE_LIMIT and key not in self._escalated:
-            self._escalated.add(key)
-            logger.critical(
-                f"[V3] 断路器触发！intent={key}, strikes={total}/{self.STRIKE_LIMIT}"
-            )
-            raise RuntimeEscalationException(
-                f"⛔ [V3 硬断路器] 累计失败 {total} 次（阈值: {self.STRIKE_LIMIT}），"
-                f"操作: {intent.action}，目标: {intent.target}\n"
-                f"Runtime 已物理掐断 Agent 循环。"
-            )
-
-    @staticmethod
-    def _failure_key(
-        tool_name: str,
-        args: Dict[str, Any],
-        intent: NormalizedIntent,
-    ) -> str:
-        """Group failed local edits by file while preserving intent dedup keys."""
-        if tool_name == "edit_file":
-            target = CommandNormalizer._extract_base_path(args) or "edit_file"
-            return f"edit_file:EDIT:{target}"
-        return intent.to_key()
-
-    def get_strike_count(self, intent_key: str) -> int:
-        return self._strikes.get(intent_key, 0)
+        updated = replace(self._events[-1], **changes)
+        self._events[-1] = updated
+        return updated
 
     def reset(self) -> None:
-        self._strikes.clear()
-        self._escalated.clear()
+        self._events.clear()
+        self._next_sequence = 1
 
 
-# ──────────────────────────────────────────────────────────────────────
-#  Facade: LoopController (convenience wrapper)
-# ──────────────────────────────────────────────────────────────────────
+@dataclass(frozen=True)
+class LoopEvidence:
+    suspected: bool = False
+    kind: str = ""
+    occurrences: int = 0
+    horizon: int = 0
+    reason: str = ""
 
-class LoopController:
-    """Unified V3 defense controller combining all three layers.
 
-    This is the single entry point that MiniClaudeAgent uses:
-      controller = LoopController()
-      controller.set_failure_memory(fi_memory)
+class LoopDetector:
+    """Stateless loop/observation detector over AttemptHistory."""
 
-      # Before tool execution:
-      block_msg = controller.check("bash", {"command": "..."})
-      if block_msg:
-          # tool was intercepted, use block_msg as result
-          ...
+    def __init__(self, intent_horizon: int = 8):
+        self.intent_horizon = intent_horizon
 
-      # After real tool failure:
-      controller.register_failure("bash", {"command": "..."}, "TOOL_CRASH")
-    """
+    def inspect(self, history: AttemptHistory, candidate: AttemptEvent | None = None) -> LoopEvidence:
+        raw_events = list(history.recent(self.intent_horizon))
+        events = list(raw_events)
+        if candidate is not None:
+            events.append(candidate)
+        if not events:
+            return LoopEvidence()
+        current = events[-1]
+        same = [event for event in events if event.intent_key == current.intent_key]
+        if len(same) >= 4 and not self._has_intervening_change(events, same[-4:]):
+            if len({event.observation_fingerprint for event in same[-4:]}) == 1:
+                return LoopEvidence(True, "OBSERVATION_STAGNATION", len(same), len(events),
+                                    "same intent returned equivalent observation")
+            return LoopEvidence(True, "INTENT_REPETITION", len(same), len(events),
+                                "same intent repeated in a short window")
+        if current.tool_name in {"edit_file", "write_file"}:
+            writes = events[-3:]
+            if len(writes) >= 2 and all(
+                event.tool_name in {"edit_file", "write_file"}
+                and event.status is AttemptStatus.SUCCESS
+                and not event.workspace_changed for event in writes
+            ):
+                return LoopEvidence(True, "NOOP_MUTATION", len(writes), len(events),
+                                    "consecutive write attempts produced no diff")
+        # Explicit state markers (for example ``OBSERVED:A``) are stronger
+        # evidence than a changing file digest.  A probe can mutate a file on
+        # every run while still oscillating between the same business states.
+        state_values = []
+        for event in raw_events[-8:]:
+            if event.semantic_state:
+                state_values.extend(part for part in event.semantic_state.split("|") if part)
+        observations = state_values or [event.observation_fingerprint for event in events[-6:]
+                                        if event.observation_fingerprint]
+        for period in (2, 3):
+            if len(observations) >= period * 2:
+                left = observations[-period * 2:-period]
+                right = observations[-period:]
+                if left == right and len(set(right)) > 1:
+                    return LoopEvidence(True, "STATE_OSCILLATION", len(observations), len(events),
+                                        f"observation cycle of period {period} repeated")
+        return LoopEvidence()
 
-    def __init__(self, failure_memory=None, strike_limit: int = 5):
-        self.circuit_breaker = CircuitBreaker(strike_limit=strike_limit)
-        self.guard = V3LoopGuard(circuit_breaker=self.circuit_breaker)
-        self.failure_memory = failure_memory
+    @staticmethod
+    def _has_intervening_change(events: list[AttemptEvent], matching: list[AttemptEvent]) -> bool:
+        """Use mutation as weak counter-evidence, never as history erasure."""
+        if len(matching) < 2:
+            return False
+        positions = [events.index(event) for event in matching]
+        return any(events[i].workspace_changed for i in range(positions[0] + 1, len(events)))
 
-    def set_failure_memory(self, memory) -> None:
-        self.failure_memory = memory
 
-    def check(self, tool_name: str, args: Dict[str, Any]) -> Optional[str]:
-        """Layer 2 + 3: intent-aware dedup → circuit breaker escalation.
+@dataclass(frozen=True)
+class FailureEvidence:
+    category: str = ""
+    occurrences: int = 0
+    strategy_diversity: int = 0
+    horizon: int = 0
+    reason: str = ""
 
-        Returns block message or None. May raise RuntimeEscalationException.
+
+class FailureRecurrenceDetector:
+    """Compute recent failure recurrence from the shared stream."""
+
+    def __init__(self, horizon: int = 16):
+        self.horizon = horizon
+
+    def inspect(self, history: AttemptHistory, category: str) -> FailureEvidence:
+        if not category:
+            return FailureEvidence(horizon=self.horizon)
+        events = list(history.recent(self.horizon))
+        events = [event for event in events
+                  if event.failure_category == category
+                  and (event.status is not AttemptStatus.SUCCESS or event.observed_failure)]
+        strategies = {event.strategy_fingerprint for event in events if event.strategy_fingerprint}
+        return FailureEvidence(category, len(events), len(strategies), self.horizon,
+                                f"recent {category} failures={len(events)}, strategies={len(strategies)}")
+
+
+@dataclass(frozen=True)
+class RuntimePolicyDecision:
+    action: RuntimeDecision = RuntimeDecision.ALLOW
+    reason: str = ""
+    loop: LoopEvidence = LoopEvidence()
+    failure: FailureEvidence = FailureEvidence()
+
+    @property
+    def should_block(self) -> bool:
+        return self.action in {RuntimeDecision.SOFT_BLOCK, RuntimeDecision.HARD_STOP}
+
+
+class RuntimePolicy:
+    """Single decision point for ALLOW/SOFT_BLOCK/REPLAN/HARD_STOP."""
+
+    def __init__(self, history: Optional[AttemptHistory] = None):
+        self.history = history if history is not None else AttemptHistory()
+        self.loop_detector = LoopDetector()
+        self.failure_detector = FailureRecurrenceDetector()
+
+    def reset(self) -> None:
+        self.history.reset()
+
+    @staticmethod
+    def _replans(events: Iterable[AttemptEvent]) -> int:
+        """Read prior replans from the event stream, not object-local state."""
+        return sum(event.governance_decision == RuntimeDecision.REPLAN.value for event in events)
+
+    def _remember_attempt_decision(self, decision: RuntimePolicyDecision) -> AttemptEvent | None:
+        return self.history.update_last(
+            governance_decision=decision.action.value,
+            governance_reason=decision.reason,
+        )
+
+    def _remember_completion_decision(self, decision: RuntimePolicyDecision) -> AttemptEvent | None:
+        return self.history.update_last(
+            completion_decision=decision.action.value,
+            completion_reason=decision.reason,
+        )
+
+    def before_execution(self, *, tool_name: str, args: Dict[str, Any],
+                         args_fingerprint: str, turn: int) -> RuntimePolicyDecision:
+        intent = CommandNormalizer.normalize(tool_name, args)
+        prior = list(self.history.recent(self.loop_detector.intent_horizon))
+        same = [event for event in prior if event.intent_key == intent.to_key()]
+        noop_writes = [event for event in prior[-3:]
+                       if event.tool_name in {"edit_file", "write_file"}
+                       and event.status is AttemptStatus.SUCCESS
+                       and not event.workspace_changed]
+        if len(noop_writes) >= 2 and tool_name in {"edit_file", "write_file"}:
+            return RuntimePolicyDecision(RuntimeDecision.REPLAN,
+                "consecutive no-op writes", LoopEvidence(True, "NOOP_MUTATION", len(noop_writes), 3,
+                                                          "consecutive write attempts produced no diff"))
+        if len(same) >= 4 and not self.loop_detector._has_intervening_change(prior, same[-4:]):
+            kind = "OBSERVATION_STAGNATION" if len({e.observation_fingerprint for e in same[-4:]}) == 1 else "INTENT_REPETITION"
+            evidence = LoopEvidence(True, kind, len(same), self.loop_detector.intent_horizon,
+                                    "same intent repeated without relevant state change")
+            if self._replans(prior) >= 1:
+                return RuntimePolicyDecision(RuntimeDecision.HARD_STOP,
+                    "repeated intent after replan opportunity", evidence)
+            return RuntimePolicyDecision(RuntimeDecision.REPLAN, evidence.reason, evidence)
+        return RuntimePolicyDecision()
+
+    def observe(self, event: AttemptEvent) -> RuntimePolicyDecision:
+        loop = self.loop_detector.inspect(self.history)
+        failure = self.failure_detector.inspect(self.history, event.failure_category)
+        if (event.status is AttemptStatus.FAILURE
+                and event.failure_category == "CAPABILITY_UNAVAILABLE"):
+            decision = RuntimePolicyDecision(
+                RuntimeDecision.HARD_STOP,
+                "high-confidence capability invariant reported by the tool",
+                loop, failure,
+            )
+            self._remember_attempt_decision(decision)
+            return decision
+        if loop.suspected:
+            if self._replans(self.history) >= 1 and loop.occurrences >= 5:
+                decision = RuntimePolicyDecision(RuntimeDecision.HARD_STOP,
+                    f"{loop.kind}: {loop.reason}; replan already attempted", loop, failure)
+                self._remember_attempt_decision(decision)
+                return decision
+            decision = RuntimePolicyDecision(RuntimeDecision.REPLAN,
+                f"{loop.kind}: {loop.reason}", loop, failure)
+            self._remember_attempt_decision(decision)
+            return decision
+        if failure.occurrences >= 3 and failure.strategy_diversity <= 1:
+            # This is only a recent stagnation signal. A single failure or an
+            # old task-lifetime count never has authority to terminate.
+            if failure.occurrences >= 5 and self._replans(self.history) >= 1:
+                decision = RuntimePolicyDecision(RuntimeDecision.HARD_STOP,
+                    f"recent unrecovered failure recurrence after replan: {failure.reason}", loop, failure)
+                self._remember_attempt_decision(decision)
+                return decision
+            decision = RuntimePolicyDecision(RuntimeDecision.REPLAN,
+                f"recent failure recurrence: {failure.reason}", loop, failure)
+            self._remember_attempt_decision(decision)
+            return decision
+        decision = RuntimePolicyDecision(RuntimeDecision.ALLOW, "recent evidence is not stagnant", loop, failure)
+        self._remember_attempt_decision(decision)
+        return decision
+
+    def finalize(self) -> RuntimePolicyDecision:
+        """Gate an unsupported final answer without killing a live recovery."""
+        events = list(self.history)
+        recent_loop = self.loop_detector.inspect(self.history)
+        if recent_loop.suspected and self._replans(events) >= 1:
+            decision = RuntimePolicyDecision(
+                RuntimeDecision.HARD_STOP,
+                f"{recent_loop.kind}: {recent_loop.reason}; replan opportunity was already given",
+                recent_loop,
+            )
+            self._remember_completion_decision(decision)
+            return decision
+        unresolved_indexes = [i for i, event in enumerate(events)
+                             if event.status is AttemptStatus.FAILURE or event.observed_failure]
+        if not unresolved_indexes:
+            decision = RuntimePolicyDecision()
+            self._remember_completion_decision(decision)
+            return decision
+
+        unresolved = [
+            event for index, event in enumerate(events)
+            if index in unresolved_indexes
+            and not any(
+                later.resolution_key
+                and later.resolution_key in {
+                    event.intent_key,
+                    event.subject_key,
+                }
+                for later in events[index + 1:]
+            )
+        ]
+        if not unresolved:
+            decision = RuntimePolicyDecision()
+            self._remember_completion_decision(decision)
+            return decision
+
+        completion_replans = sum(
+            event.completion_decision == RuntimeDecision.REPLAN.value
+            for event in events
+        )
+        if completion_replans == 0:
+            decision = RuntimePolicyDecision(
+                RuntimeDecision.REPLAN,
+                "final answer follows an unresolved failure; verify or recover first",
+            )
+        else:
+            decision = RuntimePolicyDecision(
+                RuntimeDecision.HARD_STOP,
+                "final answer still follows an unresolved failure after replan",
+            )
+        self._remember_completion_decision(decision)
+        return decision
+
+    def record_attempt(self, *, turn: int, tool_name: str, intent_key: str,
+                       args_fingerprint: str, success: bool,
+                       result_text: str = "", failure_category: str = "",
+                       recoverability: str = "", strategy_fingerprint: str = "",
+                       workspace_before: Optional[Dict[str, str]] = None,
+                       workspace_after: Optional[Dict[str, str]] = None,
+                       block_reason: str = "", duration_ms: float = 0.0,
+                       execution_success: Optional[bool] = None,
+                       observed_failure: bool = False, semantic_status: str = "",
+                       observation: str = "", exit_code: Optional[int] = None,
+                       segment_exit_codes: Iterable[int] = (),
+                       resolution_evidence: str = "", subject_key: str = "") -> tuple[AttemptEvent, RuntimePolicyDecision]:
+        """Append exactly one outcome event, then derive a decision from it."""
+        before = workspace_before or {}
+        after = workspace_after or {}
+        changed_paths = tuple(sorted(path for path in set(before) | set(after)
+                                     if before.get(path) != after.get(path)))
+        before_digest = hashlib.sha256(json.dumps(dict(sorted(before.items())), sort_keys=True).encode()).hexdigest()[:16]
+        after_digest = hashlib.sha256(json.dumps(dict(sorted(after.items())), sort_keys=True).encode()).hexdigest()[:16]
+        normalized = " ".join(str(result_text or "").split()).lower()
+        observation_fingerprint = hashlib.sha256(normalized.encode("utf-8")).hexdigest()[:16]
+        semantic_state = self._semantic_state(result_text)
+        resolution_key, resolution_reason = self._resolution_for(
+            intent_key=intent_key,
+            subject_key=subject_key,
+            status=AttemptStatus.SUCCESS if success else AttemptStatus.BLOCKED if block_reason else AttemptStatus.FAILURE,
+            execution_success=(success if execution_success is None else execution_success),
+            observed_failure=observed_failure,
+            resolution_evidence=resolution_evidence,
+        )
+        event = self.history.append(AttemptEvent(
+            sequence=self.history._next_sequence, turn=turn, tool_name=tool_name,
+            intent_key=intent_key, args_fingerprint=args_fingerprint,
+            status=AttemptStatus.SUCCESS if success else AttemptStatus.BLOCKED if block_reason else AttemptStatus.FAILURE,
+            execution_success=(success if execution_success is None else execution_success),
+            observed_failure=observed_failure, semantic_status=semantic_status,
+            observation=observation, exit_code=exit_code,
+            segment_exit_codes=tuple(segment_exit_codes),
+            failure_category=failure_category, recoverability=recoverability,
+            strategy_fingerprint=strategy_fingerprint,
+            workspace_changed=bool(changed_paths),
+            observation_fingerprint=observation_fingerprint, block_reason=block_reason,
+            duration_ms=duration_ms, timestamp=time.time(), changed_paths=changed_paths,
+            semantic_state=semantic_state,
+            verification_improved=bool(resolution_key),
+            subject_key=subject_key,
+            resolution_key=resolution_key,
+            resolution_reason=resolution_reason,
+            workspace_before_digest=before_digest,
+            workspace_after_digest=after_digest,
+        ))
+        decision = self.observe(event)
+        event = self.history.update_last(
+            governance_decision=decision.action.value,
+            governance_reason=decision.reason,
+        ) or event
+        return event, decision
+
+    def _resolution_for(
+        self, *, intent_key: str, subject_key: str, status: AttemptStatus,
+        execution_success: bool, observed_failure: bool,
+        resolution_evidence: str,
+    ) -> tuple[str, str]:
+        """Find a relevant prior failure resolved by this concrete outcome.
+
+        A success is relevant only for the same normalized intent.  Health
+        evidence is supplied by a tool-aware normalizer, so prose such as
+        ``echo READY`` never reaches this path as proof of recovery.
         """
-        block_msg = self.guard.check_and_record(tool_name, args)
+        if status is not AttemptStatus.SUCCESS or not execution_success or observed_failure:
+            return "", ""
+        prior = list(self.history)
+        matching = [
+            event for event in prior
+            if (
+                event.intent_key == intent_key
+                or (subject_key and event.subject_key == subject_key)
+            )
+            and (event.status is AttemptStatus.FAILURE or event.observed_failure)
+        ]
+        if not matching:
+            return "", ""
+        latest = matching[-1]
+        # An unhealthy resource needs a positive observation from the same
+        # probe family.  A later process exit of zero is not enough to prove
+        # that HTTP 503/404 (or another target failure) disappeared.
+        if latest.semantic_status == "UNHEALTHY" and not resolution_evidence:
+            return "", ""
+        reason = resolution_evidence or "same normalized intent completed successfully"
+        return intent_key if latest.intent_key == intent_key else subject_key, reason
 
-        if block_msg and self.failure_memory:
-            # Inject LOOP_GUARD_PREVENTED virtual failure into FI
-            intent = CommandNormalizer.normalize(tool_name, args)
-            self.failure_memory.record(
-                category="LOOP_GUARD_PREVENTED",
-                strategy_fp=intent.action,
+    @staticmethod
+    def _semantic_state(result_text: str) -> str:
+        """Extract explicit, tool-produced state tokens without an LLM.
+
+        This deliberately recognises only labelled state output.  Arbitrary
+        prose is left as a fingerprint so normal explanations do not become
+        accidental state machines.
+        """
+        normalized = " ".join(str(result_text or "").split()).lower()
+        matches = re.findall(
+            r"\b(?:observed|state|status|phase)\s*[:=]\s*([a-z0-9_.-]+)",
+            normalized,
+        )
+        return "|".join(matches)
+
+    @staticmethod
+    def message(decision: RuntimePolicyDecision) -> str:
+        prefix = "[Runtime Policy]"
+        if decision.action is RuntimeDecision.HARD_STOP:
+            return f"{prefix} HARD_STOP: {decision.reason}"
+        if decision.action is RuntimeDecision.REPLAN:
+            return f"{prefix} 当前操作未执行，需要重新规划：{decision.reason}"
+        return f"{prefix} {decision.action.value}: {decision.reason}"
+
+
+class CircuitBreaker:
+    """Actuator only: execute a policy-approved hard stop."""
+
+    def stop(self, decision: RuntimePolicyDecision) -> None:
+        if decision.action is RuntimeDecision.HARD_STOP:
+            raise RuntimeEscalationException(
+                f"⛔ [Runtime Policy HARD_STOP] {decision.reason}"
             )
 
-        return block_msg
 
-    def register_failure(self, tool_name: str, args: Dict[str, Any],
-                          failure_category: str) -> None:
-        """Register a real tool failure with the circuit breaker.
+class LoopController:
+    """Compatibility facade exposing the unified RuntimePolicy."""
 
-        May raise RuntimeEscalationException.
-        """
-        self.circuit_breaker.register_failure(tool_name, args, failure_category)
+    def __init__(self, history: Optional[AttemptHistory] = None,
+                 policy: Optional[RuntimePolicy] = None, **_legacy: Any):
+        self.policy = policy or RuntimePolicy(history=history)
+        self.circuit_breaker = CircuitBreaker()
+
+    @property
+    def history(self) -> AttemptHistory:
+        return self.policy.history
+
+    def clear(self) -> None:
+        self.policy.reset()
+
+    def check(self, tool_name: str, args: Dict[str, Any]) -> Optional[str]:
+        decision = self.policy.before_execution(
+            tool_name=tool_name, args=args,
+            args_fingerprint=json.dumps(args, sort_keys=True, ensure_ascii=False),
+            turn=0,
+        )
+        return self.policy.message(decision) if decision.action is not RuntimeDecision.ALLOW else None
+
+    def register_failure(self, *_args: Any, **_kwargs: Any) -> None:
+        """Deprecated compatibility hook; outcomes are recorded once after execution."""
+        return None
 
     @property
     def trigger_count(self) -> int:
-        return self.guard.trigger_count
+        return sum(event.status is AttemptStatus.BLOCKED for event in self.history)
 
-    def clear(self) -> None:
-        self.guard.clear()
-        self.circuit_breaker.reset()
+
+class RuntimePolicyAdapter:
+    """Small compatibility surface for old trace plumbing, backed by one policy."""
+
+    def __init__(self, policy: RuntimePolicy):
+        self.policy = policy
+
+    def reset(self) -> None:
+        self.policy.reset()
+
+    def finalize(self):
+        decision = self.policy.finalize()
+        return _AdapterDecision(
+            event=self.policy.history.all()[-1] if self.policy.history.all() else AttemptEvent(
+                0, 0, "", "", "", AttemptStatus.SUCCESS
+            ),
+            decision=decision,
+            progress_detected=False,
+        )
+
+    def observe(self, *, turn: int, tool_name: str, intent_key: str = "",
+                strategy_fingerprint: str = "", success: bool = True,
+                result_text: str = "", failure_category: str = "",
+                blocker_category: str = "", workspace_before=None,
+                workspace_after=None, workspace_root: str = "",
+                command_blocked: bool = False, block_reason: str = "",
+                args_fingerprint: str = "", execution_success: Optional[bool] = None,
+                observed_failure: bool = False, semantic_status: str = "",
+                observation: str = "", exit_code: Optional[int] = None,
+                segment_exit_codes: Iterable[int] = (), resolution_evidence: str = "",
+                subject_key: str = ""):
+        event, decision = self.policy.record_attempt(
+            turn=turn, tool_name=tool_name, intent_key=intent_key,
+            args_fingerprint=args_fingerprint, success=success, result_text=result_text,
+            failure_category=blocker_category or failure_category,
+            strategy_fingerprint=strategy_fingerprint,
+            workspace_before=workspace_before if isinstance(workspace_before, dict) else None,
+            workspace_after=workspace_after if isinstance(workspace_after, dict) else None,
+            block_reason=block_reason if command_blocked else "",
+            execution_success=execution_success,
+            observed_failure=observed_failure,
+            semantic_status=semantic_status,
+            observation=observation,
+            exit_code=exit_code,
+            segment_exit_codes=segment_exit_codes,
+            resolution_evidence=resolution_evidence,
+            subject_key=subject_key,
+        )
+        previous = self.policy.history.recent(2)
+        progress = len(previous) < 2 or event.observation_fingerprint != previous[-2].observation_fingerprint
+        return _AdapterDecision(event=event, decision=decision, progress_detected=progress)
+
+
+@dataclass(frozen=True)
+class _AdapterDecision:
+    event: AttemptEvent
+    decision: RuntimePolicyDecision
+    progress_detected: bool = False
+
+    @property
+    def action(self):
+        return self.decision.action
+
+    @property
+    def should_replan(self) -> bool:
+        return self.action is RuntimeDecision.REPLAN
+
+    @property
+    def should_terminate(self) -> bool:
+        return self.action is RuntimeDecision.HARD_STOP
+
+    @property
+    def reason(self) -> str:
+        return self.decision.reason
+
+    @property
+    def progress_reason(self) -> tuple[str, ...]:
+        return ("OBSERVATION_CHANGED",) if self.progress_detected else ()
+
+    @property
+    def stagnation_reason(self) -> tuple[str, ...]:
+        return () if self.progress_detected else ("SAME_OBSERVATION",)
+
+    @property
+    def recovery_stage(self):
+        return type("Stage", (), {"value": "HEALTHY" if self.progress_detected else "SUSPECTED_STALL"})()
+
+    @property
+    def open_blocker_count(self) -> int:
+        return 0
+
+    @property
+    def oscillation_detected(self) -> bool:
+        return False

@@ -89,17 +89,25 @@ def test_edit_file_different_edits():
     assert ":E:" in intent_b.target
 
 
-def test_edit_file_failures_share_file_scoped_breaker_budget():
-    """Different failed replacements on one file are one stalled operation."""
-    from core.loop_controller import CircuitBreaker, RuntimeEscalationException
+def test_edit_file_failures_use_recent_shared_history_not_breaker_strikes():
+    """Different edit payloads remain distinct and only recent evidence can stop."""
+    from core.loop_controller import AttemptHistory, RuntimeDecision, RuntimePolicy
 
-    breaker = CircuitBreaker(strike_limit=2)
+    history = AttemptHistory()
+    policy = RuntimePolicy(history)
     args_a = {"path": "service.py", "edits": [{"search": "def foo", "replace": "def bar"}]}
     args_b = {"path": "service.py", "edits": [{"search": "def baz", "replace": "def qux"}]}
-
-    breaker.register_failure("edit_file", args_a, "LOCAL_FILE_IO")
-    with pytest.raises(RuntimeEscalationException):
-        breaker.register_failure("edit_file", args_b, "LOCAL_FILE_IO")
+    for args in (args_a, args_b):
+        intent = CommandNormalizer.normalize("edit_file", args)
+        policy.record_attempt(
+            turn=len(history) + 1, tool_name="edit_file", intent_key=intent.to_key(),
+            args_fingerprint=intent.to_key(), success=False,
+            result_text="edit failed", failure_category="LOCAL_FILE_IO",
+        )
+    assert len(history) == 2
+    assert policy.before_execution(
+        tool_name="edit_file", args=args_a, args_fingerprint="a", turn=3
+    ).action is RuntimeDecision.ALLOW
 
 
 def test_edit_file_same_edits():
@@ -321,3 +329,133 @@ def test_to_key_format():
     """to_key() follows tool:action:target format."""
     intent = NormalizedIntent(action="READ", target="main.py", tool="read_file")
     assert intent.to_key() == "read_file:READ:main.py"
+
+
+def _record(policy, history, tool, args, *, success, result, category="", changed=False):
+    intent = CommandNormalizer.normalize(tool, args)
+    return policy.record_attempt(
+        turn=len(history) + 1, tool_name=tool, intent_key=intent.to_key(),
+        args_fingerprint=intent.to_key(), success=success, result_text=result,
+        failure_category=category, workspace_before={"a": "1"},
+        workspace_after={"a": "2"} if changed else {"a": "1"},
+    )
+
+
+def test_attempt_history_is_single_ordered_source_for_success_failure_blocked():
+    from core.loop_controller import AttemptHistory, AttemptStatus, RuntimePolicy
+
+    history = AttemptHistory()
+    policy = RuntimePolicy(history)
+    _record(policy, history, "bash", {"command": "echo ok"}, success=True, result="ok")
+    _record(policy, history, "bash", {"command": "pytest"}, success=False,
+            result="failed", category="TOOL_CRASH")
+    intent = CommandNormalizer.normalize("bash", {"command": "pytest"})
+    event, _ = policy.record_attempt(
+        turn=3, tool_name="bash", intent_key=intent.to_key(), args_fingerprint="x",
+        success=False, result_text="blocked", block_reason="repeat",
+    )
+    assert [event.sequence for event in history] == [1, 2, 3]
+    assert [event.status for event in history] == [
+        AttemptStatus.SUCCESS, AttemptStatus.FAILURE, AttemptStatus.BLOCKED,
+    ]
+
+
+def test_normal_edit_test_debug_cycle_does_not_accumulate_old_test_failures():
+    from core.loop_controller import RuntimeDecision, AttemptHistory, RuntimePolicy
+
+    history = AttemptHistory()
+    policy = RuntimePolicy(history)
+    for i in range(7):
+        _record(policy, history, "bash", {"command": "pytest"}, success=False,
+                result="1 failed", category="TOOL_CRASH")
+        _record(policy, history, "edit_file", {"path": "app.py", "edits": [{"search": str(i), "replace": str(i + 1)}]},
+                success=True, result="changed app.py", changed=True)
+    assert all(policy.before_execution(
+        tool_name="bash", args={"command": "pytest"}, args_fingerprint="x", turn=20
+    ).action is RuntimeDecision.ALLOW for _ in range(1))
+
+
+def test_repeated_read_same_observation_replans_but_paged_reads_are_allowed():
+    from core.loop_controller import AttemptHistory, RuntimeDecision, RuntimePolicy
+
+    history = AttemptHistory()
+    policy = RuntimePolicy(history)
+    args = {"path": "a.py", "start_line": 1, "end_line": 100}
+    decisions = [_record(policy, history, "read_file", args, success=True, result="same") [1]
+                 for _ in range(4)]
+    assert decisions[-1].action is RuntimeDecision.REPLAN
+
+    paged = AttemptHistory()
+    paged_policy = RuntimePolicy(paged)
+    for start in (1, 101, 201):
+        _record(paged_policy, paged, "read_file",
+                {"path": "a.py", "start_line": start, "end_line": start + 99},
+                success=True, result="different page")
+    assert len(paged) == 3
+    assert paged_policy.before_execution(
+        tool_name="read_file", args={"path": "a.py", "start_line": 301, "end_line": 400},
+        args_fingerprint="x", turn=4
+    ).action is RuntimeDecision.ALLOW
+
+
+def test_noop_writes_replan_quickly_and_hard_stop_requires_repeated_replan():
+    from core.loop_controller import AttemptHistory, RuntimeDecision, RuntimePolicy
+
+    history = AttemptHistory()
+    policy = RuntimePolicy(history)
+    args = {"path": "a.py", "edits": [{"search": "x", "replace": "x"}]}
+    _record(policy, history, "edit_file", args, success=True, result="unchanged")
+    _record(policy, history, "edit_file", args, success=True, result="unchanged")
+    assert policy.before_execution(
+        tool_name="edit_file", args=args, args_fingerprint="x", turn=3
+    ).action is RuntimeDecision.REPLAN
+
+
+def test_state_oscillation_is_detected_even_when_probe_changes_a_file():
+    from core.loop_controller import AttemptHistory, RuntimeDecision, RuntimePolicy
+
+    history = AttemptHistory()
+    policy = RuntimePolicy(history)
+    args = {"command": "probe.cmd"}
+    for state in ("OBSERVED:A", "OBSERVED:B"):
+        _record(policy, history, "bash", args, success=True, result=state, changed=True)
+    _, decision = _record(
+        policy, history, "bash", args, success=True,
+        result="OBSERVED:A\nOBSERVED:B\nOBSERVED:A\nOBSERVED:B", changed=False,
+    )
+    assert history.all()[-1].semantic_state == "a|b|a|b"
+    assert decision.action is RuntimeDecision.REPLAN
+    assert policy.finalize().action is RuntimeDecision.HARD_STOP
+
+
+def test_capability_invariant_stops_immediately_but_dynamic_failure_does_not():
+    from core.loop_controller import AttemptHistory, RuntimeDecision, RuntimePolicy
+
+    invariant_history = AttemptHistory()
+    invariant_policy = RuntimePolicy(invariant_history)
+    _, decision = _record(
+        invariant_policy, invariant_history, "bash", {"command": "probe"},
+        success=False, result="VERDICT=FAIL controlled signer unavailable",
+        category="CAPABILITY_UNAVAILABLE",
+    )
+    assert decision.action is RuntimeDecision.HARD_STOP
+
+    dynamic_history = AttemptHistory()
+    dynamic_policy = RuntimePolicy(dynamic_history)
+    _, decision = _record(
+        dynamic_policy, dynamic_history, "bash", {"command": "curl localhost:8080"},
+        success=False, result="Connection refused", category="NETWORK_UNREACHABLE",
+    )
+    assert decision.action is not RuntimeDecision.HARD_STOP
+
+
+def test_structural_single_source_has_no_legacy_counter_fields():
+    from core.loop_controller import CircuitBreaker
+    from core.failure_intelligence.memory import FailureMemory
+    from core.runtime_context.workspace_state import WorkspaceStateGuard
+
+    assert not hasattr(CircuitBreaker(), "_strikes")
+    assert not hasattr(FailureMemory(), "_categories")
+    assert not hasattr(WorkspaceStateGuard, "_write_stalls")
+    assert not hasattr(WorkspaceStateGuard, "_read_stalls")
+    assert not hasattr(WorkspaceStateGuard, "_last_read_key")

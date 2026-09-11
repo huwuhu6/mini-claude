@@ -92,10 +92,9 @@ def test_workspace_state_guard_stops_two_noop_writes(tmp_path):
 
     assert guard.observe_write(guard.mutation(before, guard.snapshot())) is None
     assert guard.observe_write(guard.mutation(before, guard.snapshot())) is None
-    message = guard.pending_write_message()
-
-    assert message is not None
-    assert "State Stalled Detected" in message
+    # WorkspaceStateGuard only observes. RuntimePolicy derives the stall from
+    # the shared event stream, so the observer has no hidden counter/message.
+    assert guard.pending_write_message() is None
 
 
 # ═════════════════════════════════════════════════════════════════
@@ -231,6 +230,19 @@ def test_long_bash_output_is_saved_and_can_be_read_in_windows():
         assert window.success
         assert "log line 31" in window.content
         assert "log line 35" in window.content
+
+
+def test_bash_result_keeps_process_facts_when_wrapper_masks_failure(tmp_path):
+    tools = BaseTools(tmp_path, shell_session=ShellSession(tmp_path))
+
+    result = tools.run_bash("cmd /c exit 7 & echo WRAPPER_OK")
+
+    assert result.success
+    assert result.execution_success is True
+    assert result.exit_code == 0
+    assert result.segment_exit_codes == [7]
+    assert result.stdout == "WRAPPER_OK"
+    assert result.stderr == ""
 
 
 def test_short_tool_output_is_returned_unchanged():

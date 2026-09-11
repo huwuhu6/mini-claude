@@ -17,6 +17,7 @@ class LLMConfig:
     temperature: float = 0.0
     api_key: str = ""
     base_url: str = ""
+    timeout_ms: int = 20000
 
 
 @dataclass
@@ -129,7 +130,7 @@ class ConfigManager:
             active_provider = llm_data.get('provider', 'deepseek')
 
             # Apply provider-specific overrides only for the active provider
-            for pname in ('deepseek', 'anthropic'):
+            for pname in ('deepseek', 'anthropic', 'dashscope'):
                 if pname in llm_data:
                     if active_provider == pname:
                         pconfig = llm_data[pname]

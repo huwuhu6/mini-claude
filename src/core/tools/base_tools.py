@@ -20,8 +20,22 @@ logger = logging.getLogger(__name__)
 
 @dataclass
 class ToolResult:
+    """Tool output with execution facts kept separate from display text."""
     content: str
     success: bool = True
+    execution_success: Optional[bool] = None
+    exit_code: Optional[int] = None
+    stdout: str = ""
+    stderr: str = ""
+    timed_out: bool = False
+    cancelled: bool = False
+    segment_exit_codes: Optional[List[int]] = None
+
+    def __post_init__(self) -> None:
+        if self.execution_success is None:
+            self.execution_success = self.success
+        if self.segment_exit_codes is None:
+            self.segment_exit_codes = []
 
 
 # Shared policy instance
@@ -174,6 +188,13 @@ class BaseTools:
                 exit_code=result.get("exit_code"),
             ),
             success=result["success"],
+            execution_success=result.get("execution_success", result["success"]),
+            exit_code=result.get("exit_code"),
+            stdout=result.get("stdout", ""),
+            stderr=result.get("stderr", ""),
+            timed_out=result.get("timed_out", False),
+            cancelled=result.get("cancelled", False),
+            segment_exit_codes=list(result.get("segment_exit_codes", [])),
         )
 
     def format_tool_output(self, content: str, success: bool = True,

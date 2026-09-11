@@ -31,6 +31,12 @@ class ToolTrace:
     finished_at: float = 0.0
     latency_ms: float = 0.0
     success: bool = True
+    execution_success: bool = True
+    observed_failure: bool = False
+    semantic_status: str = ""
+    observation: str = ""
+    exit_code: Optional[int] = None
+    segment_exit_codes: List[int] = field(default_factory=list)
     loop_guard_blocked: bool = False
     guard_type: str = ""
     guard_reason: str = ""
@@ -47,6 +53,22 @@ class ToolTrace:
     cwd: str = ""
     workspace_root: str = ""
     session_id: str = ""
+    # Progress-aware governance evidence
+    intent_key: str = ""
+    observation_fingerprint: str = ""
+    semantic_state: str = ""
+    progress_detected: bool = False
+    progress_reason: List[str] = field(default_factory=list)
+    stagnation_reason: List[str] = field(default_factory=list)
+    recovery_stage: str = ""
+    open_blocker_count: int = 0
+    oscillation_detected: bool = False
+    verification_improved: bool = False
+    completion_guard_triggered: bool = False
+    governance_decision: str = ""
+    workspace_before_digest: str = ""
+    workspace_after_digest: str = ""
+    changed_paths: List[str] = field(default_factory=list)
 
     def to_dict(self) -> Dict[str, Any]:
         return {
@@ -56,6 +78,12 @@ class ToolTrace:
             'finished_at': round(self.finished_at, 3),
             'latency_ms': round(self.latency_ms, 1),
             'success': self.success,
+            'execution_success': self.execution_success,
+            'observed_failure': self.observed_failure,
+            'semantic_status': self.semantic_status,
+            'observation': self.observation,
+            'exit_code': self.exit_code,
+            'segment_exit_codes': list(self.segment_exit_codes),
             'loop_guard_blocked': self.loop_guard_blocked,
             'guard_type': self.guard_type or (
                 "HARD_CIRCUIT_BREAKER" if self.circuit_breaker_triggered
@@ -73,6 +101,21 @@ class ToolTrace:
             'cwd': self.cwd,
             'workspace_root': self.workspace_root,
             'session_id': self.session_id,
+            'intent_key': self.intent_key,
+            'observation_fingerprint': self.observation_fingerprint,
+            'semantic_state': self.semantic_state,
+            'progress_detected': self.progress_detected,
+            'progress_reason': list(self.progress_reason),
+            'stagnation_reason': list(self.stagnation_reason),
+            'recovery_stage': self.recovery_stage,
+            'open_blocker_count': self.open_blocker_count,
+            'oscillation_detected': self.oscillation_detected,
+            'verification_improved': self.verification_improved,
+            'completion_guard_triggered': self.completion_guard_triggered,
+            'governance_decision': self.governance_decision,
+            'workspace_before_digest': self.workspace_before_digest,
+            'workspace_after_digest': self.workspace_after_digest,
+            'changed_paths': list(self.changed_paths),
         }
 
 
@@ -88,6 +131,7 @@ class TurnTrace:
     assistant_content: str = ""
     compression_triggered: bool = False
     reflection_triggered: bool = False
+    completion_guard_triggered: bool = False
     tools: List[ToolTrace] = field(default_factory=list)
 
     def to_dict(self) -> Dict[str, Any]:
@@ -101,6 +145,7 @@ class TurnTrace:
             'assistant_content': self.assistant_content,
             'compression_triggered': self.compression_triggered,
             'reflection_triggered': self.reflection_triggered,
+            'completion_guard_triggered': self.completion_guard_triggered,
             'tools': [t.to_dict() for t in self.tools],
         }
 
@@ -128,7 +173,12 @@ class TaskTrace:
     no_tool_retry_count: int = 0
     runtime_error: str = ""
     provider_diagnostic: Dict[str, Any] = field(default_factory=dict)
+    completion_guard_trigger_count: int = 0
+    completion_guard_triggered: bool = False
+    governance_decision: str = ""
+    open_blocker_count: int = 0
     environment: Dict[str, Any] = field(default_factory=dict)
+    attempt_events: List[Dict[str, Any]] = field(default_factory=list)
     turns: List[TurnTrace] = field(default_factory=list)
 
     def to_dict(self) -> Dict[str, Any]:
@@ -153,6 +203,11 @@ class TaskTrace:
             'no_tool_retry_count': self.no_tool_retry_count,
             'runtime_error': self.runtime_error,
             'provider_diagnostic': dict(self.provider_diagnostic),
+            'completion_guard_trigger_count': self.completion_guard_trigger_count,
+            'completion_guard_triggered': self.completion_guard_triggered,
+            'governance_decision': self.governance_decision,
+            'open_blocker_count': self.open_blocker_count,
             'environment': dict(self.environment),
+            'attempt_events': [dict(event) for event in self.attempt_events],
             'turns': [t.to_dict() for t in self.turns],
         }

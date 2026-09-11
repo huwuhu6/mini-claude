@@ -40,11 +40,11 @@ class PreflightResult:
             f"{name} {version}" for name, version in self.detected_toolchains.items()
         ) or "none detected"
         constraint = (
-            "External dependency downloads (npm install, pip install, cargo add, "
-            "go get, and similar commands) are unavailable. Use only pre-installed "
-            "or local modules and report the blocker immediately."
+            "External dependency downloads may be unavailable according to the startup snapshot. "
+            "Treat this as time-bounded evidence: verify the actual target operation "
+            "and allow recovery if connectivity changes."
             if self.network_access == "OFFLINE"
-            else "Network is reachable, but dependency commands still require normal tool and permission checks."
+            else "Network is reachable in the startup snapshot; dependency commands still require normal tool and permission checks."
         )
         return (
             "[Environment Probes Context]\n"

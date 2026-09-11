@@ -15,7 +15,7 @@ from providers.base import LLMProvider, Message, ToolDefinition
 from providers.manager import ProviderManager
 from core.tools.base_tools import BaseTools, ToolResult
 from core.runtime_context.shell_session import ShellSession
-from core.loop_guard import LoopGuard
+from core.loop_controller import AttemptHistory, CommandNormalizer, RuntimeDecision, RuntimePolicy
 
 logger = logging.getLogger(__name__)
 
@@ -65,7 +65,7 @@ class SubAgent:
         self.provider = provider
         self.model = model or getattr(provider, 'model', '')
         self.messages: List[Message] = []
-        self.loop_guard = LoopGuard()
+        self.runtime_policy = RuntimePolicy(AttemptHistory(maxlen=32))
 
     def get_tools(self) -> List[Dict[str, Any]]:
         """Get tools available based on agent type."""
@@ -217,16 +217,35 @@ class SubAgent:
 
                     if args_parse_error:
                         result_str = args_parse_error
+                        # A proposed call still becomes one canonical fact,
+                        # even when dispatch never starts.
+                        intent = CommandNormalizer.normalize(tname, args)
+                        self.runtime_policy.record_attempt(
+                            turn=iteration + 1, tool_name=tname,
+                            intent_key=intent.to_key(), args_fingerprint="",
+                            success=False, result_text=result_str,
+                            failure_category="INVALID_ARGUMENTS",
+                        )
                     else:
-                        # ── Loop guard: intercept before execution ─
-                        loop_msg = self.loop_guard.check(tname, args)
-                        if loop_msg:
-                            result_str = loop_msg
-                        else:
+                        intent = CommandNormalizer.normalize(tname, args)
+                        pre = self.runtime_policy.before_execution(
+                            tool_name=tname, args=args, args_fingerprint="", turn=iteration + 1,
+                        )
+                        if pre.action is RuntimeDecision.ALLOW:
                             result_str = self.execute_tool(tname, args)
-                    # Record every call (executed or intercepted) for pattern tracking
-                    if not args_parse_error:
-                        self.loop_guard.record(tname, args)
+                            blocked = ""
+                        else:
+                            result_str = self.runtime_policy.message(pre)
+                            blocked = pre.reason
+                        _, post = self.runtime_policy.record_attempt(
+                            turn=iteration + 1, tool_name=tname, intent_key=intent.to_key(),
+                            args_fingerprint="", success=pre.action is RuntimeDecision.ALLOW
+                            and not result_str.startswith("Error:"),
+                            result_text=result_str, block_reason=blocked,
+                        )
+                        if post.action is RuntimeDecision.HARD_STOP:
+                            logger.warning("子代理 RuntimePolicy HARD_STOP: %s", post.reason)
+                            result_str = self.runtime_policy.message(post)
                     logger.debug(f"  [sub:{task_id}] {tname}: {result_str[:120]}")
                     self.messages.append(Message(
                         role='tool', content=result_str,

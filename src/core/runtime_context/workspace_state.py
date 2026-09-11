@@ -3,11 +3,10 @@
 from __future__ import annotations
 
 import hashlib
-import json
 import re
 from dataclasses import dataclass
 from pathlib import Path
-from typing import Dict, Optional
+from typing import Dict
 
 
 @dataclass(frozen=True)
@@ -41,14 +40,10 @@ class WorkspaceStateGuard:
 
     def __init__(self, workspace_root: Path):
         self.workspace_root = Path(workspace_root).resolve()
-        self._write_stalls = 0
-        self._last_read_key: Optional[str] = None
-        self._read_stalls = 0
 
     def reset(self) -> None:
-        self._write_stalls = 0
-        self._last_read_key = None
-        self._read_stalls = 0
+        """Compatibility no-op; all lifecycle state belongs to AttemptHistory."""
+        return None
 
     def is_write_operation(self, tool_name: str, args: dict) -> bool:
         if tool_name in self._WRITE_TOOLS:
@@ -90,17 +85,11 @@ class WorkspaceStateGuard:
         return WorkspaceMutation(changed)
 
     def observe_write(self, mutation: WorkspaceMutation) -> Optional[str]:
-        self._last_read_key = None
-        self._read_stalls = 0
-        if mutation.changed:
-            self._write_stalls = 0
-            return None
-        self._write_stalls += 1
         return None
 
     @property
     def write_stalled(self) -> bool:
-        return self._write_stalls >= 2
+        return False
 
     def pending_write_message(self) -> Optional[str]:
         if not self.write_stalled:
@@ -113,19 +102,4 @@ class WorkspaceStateGuard:
         )
 
     def observe_read(self, tool_name: str, args: dict) -> Optional[str]:
-        self._write_stalls = 0
-        key = json.dumps(
-            {"tool": tool_name, "args": args}, sort_keys=True, ensure_ascii=False,
-        )
-        if key == self._last_read_key:
-            self._read_stalls += 1
-        else:
-            self._last_read_key = key
-            self._read_stalls = 1
-        if self._read_stalls < 3:
-            return None
-        return (
-            "[System Guard: State Stalled Detected]\n"
-            "Warning: 3 consecutive queries repeated the same target without new information.\n"
-            "Action Required: Re-read with a different scope or change your technical approach."
-        )
+        return None

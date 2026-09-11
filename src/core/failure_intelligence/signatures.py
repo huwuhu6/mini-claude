@@ -26,6 +26,15 @@ _ClassificationRule = Tuple[
 ]
 
 _CLASSIFICATION_RULES: list[_ClassificationRule] = [
+    (re.compile(r'PROCESS_SEGMENT_EXIT\s*=\s*-?\d+'),
+     FailureCategory.PROCESS_FAILURE,
+     Recoverability.PARTIALLY_RECOVERABLE,
+     "复合 shell 命令中的一个子进程返回了非零状态", 0.95),
+    (re.compile(r'controlled .*?(?:unavailable|immutable)|verdict\s*[:=]\s*fail|'
+                r'summary=.*?(?:denied|forbidden)'),
+     FailureCategory.CAPABILITY_UNAVAILABLE,
+     Recoverability.USER_INTERVENTION_REQUIRED,
+     "目标能力或资源明确不可用，需要报告真实阻断或寻找合法替代", 0.95),
     (re.compile(r'\[WinError 5\]|\[Errno 13\]'),
      FailureCategory.PERMISSION_DENIED,
      Recoverability.USER_INTERVENTION_REQUIRED,
@@ -51,6 +60,14 @@ _CLASSIFICATION_RULES: list[_ClassificationRule] = [
      FailureCategory.NETWORK_UNREACHABLE,
      Recoverability.USER_INTERVENTION_REQUIRED,
      "网络不可达或 DNS 解析失败，无法连接到目标服务器", 0.90),
+
+    # HTTP 5xx is an explicit remote-service failure even when the wrapper
+    # reports process exit code 0.  It is evidence, not a permanent invariant.
+    (re.compile(r'HTTP(?:/\d(?:\.\d)?)?\s*(?:Error\s*)?5\d\d|'
+                r'status[_ ]?code\s*[=:\"]+\s*5\d\d'),
+     FailureCategory.NETWORK_UNREACHABLE,
+     Recoverability.PARTIALLY_RECOVERABLE,
+     "目标服务返回 5xx，当前服务状态不可用，但仍可能恢复", 0.85),
 
     # ── TIMEOUT ─────────────────────────────────────────────
     (re.compile(r'timed out|Timeout|timeout|Read timed out|'

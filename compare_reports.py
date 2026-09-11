@@ -21,6 +21,9 @@ import time
 from pathlib import Path
 from typing import Any
 
+sys.path.insert(0, str(Path(__file__).resolve().parent / "src"))
+from core.evaluation.anti_loop import grade_trial  # noqa: E402
+
 # ── 确认 stdout 使用 UTF-8 ───────────────────────────────
 if hasattr(sys.stdout, "reconfigure"):
     sys.stdout.reconfigure(encoding="utf-8", errors="replace")
@@ -345,13 +348,21 @@ def _metric_trial_validity(metric: dict[str, Any]) -> str:
 
 
 def _apply_governance_counts(result: dict[str, Any], metrics: list[dict[str, Any]]) -> None:
-    """Populate confusion counts from VALID trials, including single trials."""
-    valid = [m for m in metrics if _metric_trial_validity(m) == "VALID"]
+    """Populate confusion counts from every classifiable trial.
+
+    Trial validity remains an execution-health diagnostic.  It must not remove
+    a trial from the Anti-Loop governance denominator when a contract class
+    and an observed stop/continue decision are available.
+    """
+    classifiable = [
+        m for m in metrics
+        if m.get("anti_loop_governance_class") in {"TP", "TN", "FP", "FN"}
+    ]
     for key in ("TP", "TN", "FP", "FN"):
         result[f"anti_loop_{key}"] = sum(
-            1 for m in valid if m.get("anti_loop_governance_class") == key
+            1 for m in classifiable if m.get("anti_loop_governance_class") == key
         )
-    result["valid_governance_trials"] = len(valid)
+    result["valid_governance_trials"] = len(classifiable)
     result["infra_error_trials"] = sum(_metric_trial_validity(m) == "INFRA_ERROR" for m in metrics)
     result["eval_error_trials"] = sum(_metric_trial_validity(m) == "EVAL_ERROR" for m in metrics)
     total = sum(result.get(f"anti_loop_{key}", 0) for key in ("TP", "TN", "FP", "FN"))
@@ -360,6 +371,16 @@ def _apply_governance_counts(result: dict[str, Any], metrics: list[dict[str, Any
     result["stop_precision"] = tp / (tp + fp) if tp + fp else 0.0
     result["stop_recall"] = tp / (tp + fn) if tp + fn else 0.0
     result["false_stop_rate"] = fp / (fp + tn) if fp + tn else 0.0
+    recovery_trials = [
+        m for m in metrics if m.get("behavior_class") == "must_recover"
+    ]
+    recovery_successes = sum(
+        bool(m.get("anti_loop_outcome_success", m.get("outcome_pass", False)))
+        for m in recovery_trials
+    )
+    result["solvable_success_rate"] = (
+        recovery_successes / len(recovery_trials) if recovery_trials else 0.0
+    )
     result["governance_accuracy"] = (tp + tn) / total if total else 0.0
 
 
@@ -492,7 +513,7 @@ def _include_result_cases(
     results_by_version: dict[str, dict[str, Any] | None],
 ) -> None:
     """将没有 trace 的 case 状态补入矩阵，避免执行结果消失。"""
-    for version, _ in versions:
+    for version, version_dir in versions:
         results = results_by_version.get(version)
         if not results or results.get("_error"):
             continue
@@ -506,6 +527,40 @@ def _include_result_cases(
                 grouped.setdefault(str(result["case_id"]), []).append(result)
 
         for case_id, case_results in grouped.items():
+            contract: dict[str, Any] = {}
+            try:
+                contract = json.loads(
+                    (TASKS_ROOT / case_id / "config.json").read_text(encoding="utf-8")
+                ).get("evaluation", {})
+            except (OSError, json.JSONDecodeError):
+                contract = {}
+            accounting_metrics: list[dict[str, Any]] = []
+            for ordinal, item in enumerate(case_results, start=1):
+                run_index = int(item.get("run_index") or ordinal)
+                trace: dict[str, Any] | None = None
+                trace_path = version_dir / f"trace_{case_id}_r{run_index:02d}.json"
+                try:
+                    trace = json.loads(trace_path.read_text(encoding="utf-8"))
+                except (OSError, json.JSONDecodeError):
+                    trace = None
+                graded = grade_trial(
+                    contract,
+                    trace,
+                    {
+                        "verify_status": item.get("verify_status"),
+                        "final_status": item.get("final_status", ""),
+                        "runtime_error": item.get("runtime_error", ""),
+                    },
+                )
+                accounting_metrics.append({
+                    "behavior_class": contract.get("behavior_class"),
+                    "trial_validity": item.get("trial_validity"),
+                    "runtime_error": item.get("runtime_error"),
+                    "_trace_status": item.get("trace_status"),
+                    "anti_loop_governance_class": graded.get("governance_class"),
+                    "anti_loop_outcome_success": graded.get("outcome_success", False),
+                    "outcome_pass": item.get("outcome_pass", False),
+                })
             version_metrics = matrix.setdefault(case_id, {}).get(version)
             statuses = [
                 item.get("eval_result", item.get("verify_status", "FAILED"))
@@ -526,15 +581,7 @@ def _include_result_cases(
                 version_metrics["_pass_count"] = pass_count
                 _apply_governance_counts(
                     version_metrics,
-                    [
-                        {
-                            "trial_validity": item.get("trial_validity"),
-                            "runtime_error": item.get("runtime_error"),
-                            "_trace_status": item.get("trace_status"),
-                            "anti_loop_governance_class": (item.get("anti_loop") or {}).get("governance_class"),
-                        }
-                        for item in case_results
-                    ],
+                    accounting_metrics,
                 )
                 if missing_trace_count:
                     version_metrics["_missing_trace_count"] = missing_trace_count
@@ -553,15 +600,7 @@ def _include_result_cases(
             }
             _apply_governance_counts(
                 matrix[case_id][version],
-                [
-                    {
-                        "trial_validity": item.get("trial_validity"),
-                        "runtime_error": item.get("runtime_error"),
-                        "_trace_status": item.get("trace_status"),
-                        "anti_loop_governance_class": (item.get("anti_loop") or {}).get("governance_class"),
-                    }
-                    for item in case_results
-                ],
+                accounting_metrics,
             )
 
 
@@ -759,20 +798,31 @@ def _render_trial_validity_summary(
 ) -> list[str]:
     lines = [
         "## Trial Validity / Denominator\n",
-        "只有 `VALID` Trial 进入 TP/TN/FP/FN；Provider、Agent、Evaluator 失败保留在执行分母。\n",
-        "| version | planned | attempted | valid governance | infra errors | eval errors |",
+        "有 contract 的 Trial 都进入 TP/TN/FP/FN；Provider、Agent、Evaluator 失败同时保留为执行健康度诊断。\n",
+        "| version | planned | attempted | governance denominator | infra errors | eval errors |",
         "|---|---:|---:|---:|---:|---:|",
     ]
     for version, payload in (results_by_version or {}).items():
         if not payload or payload.get("_error"):
             continue
         records = [r for r in payload.get("results", []) if isinstance(r, dict)]
-        valid = sum(r.get("trial_validity") == "VALID" for r in records)
+        governance = sum(
+            grade_trial(
+                {"behavior_class": r.get("behavior_class")},
+                None,
+                {
+                    "verify_status": r.get("verify_status"),
+                    "final_status": r.get("final_status", ""),
+                    "runtime_error": r.get("runtime_error", ""),
+                },
+            ).get("governance_class") in {"TP", "TN", "FP", "FN"}
+            for r in records
+        )
         infra = sum(r.get("trial_validity") == "INFRA_ERROR" for r in records)
         eval_errors = sum(r.get("trial_validity") == "EVAL_ERROR" for r in records)
         lines.append(
             f"| `{version}` | {payload.get('planned_trials', 0)} | "
-            f"{payload.get('attempted_trials', len(records))} | {valid} | {infra} | {eval_errors} |"
+            f"{payload.get('attempted_trials', len(records))} | {governance} | {infra} | {eval_errors} |"
         )
     lines.append("")
     return lines

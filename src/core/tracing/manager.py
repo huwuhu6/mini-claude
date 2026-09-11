@@ -167,6 +167,12 @@ class TraceManager:
         result_preview: str = "",
         started_at: Optional[float] = None,
         finished_at: Optional[float] = None,
+        execution_success: Optional[bool] = None,
+        observed_failure: bool = False,
+        semantic_status: str = "",
+        observation: str = "",
+        exit_code: Optional[int] = None,
+        segment_exit_codes: Optional[list[int]] = None,
         # Failure Intelligence fields
         failure_category: str = "",
         recoverability: str = "",
@@ -180,6 +186,22 @@ class TraceManager:
         circuit_breaker_triggered: bool = False,
         guard_type: str = "",
         guard_reason: str = "",
+        # Progress-aware governance fields
+        intent_key: str = "",
+        observation_fingerprint: str = "",
+        semantic_state: str = "",
+        progress_detected: bool = False,
+        progress_reason: Optional[list[str]] = None,
+        stagnation_reason: Optional[list[str]] = None,
+        recovery_stage: str = "",
+        open_blocker_count: int = 0,
+        oscillation_detected: bool = False,
+        verification_improved: bool = False,
+        completion_guard_triggered: bool = False,
+        governance_decision: str = "",
+        workspace_before_digest: str = "",
+        workspace_after_digest: str = "",
+        changed_paths: Optional[list[str]] = None,
     ) -> None:
         """Record a single tool call into the current turn.
 
@@ -202,6 +224,12 @@ class TraceManager:
             finished_at=f,
             latency_ms=latency,
             success=success,
+            execution_success=success if execution_success is None else execution_success,
+            observed_failure=observed_failure,
+            semantic_status=semantic_status,
+            observation=observation,
+            exit_code=exit_code,
+            segment_exit_codes=list(segment_exit_codes or []),
             loop_guard_blocked=loop_guard_blocked,
             guard_type=guard_type,
             guard_reason=guard_reason,
@@ -215,12 +243,56 @@ class TraceManager:
             cwd=cwd,
             workspace_root=workspace_root,
             session_id=session_id,
+            intent_key=intent_key,
+            observation_fingerprint=observation_fingerprint,
+            semantic_state=semantic_state,
+            progress_detected=progress_detected,
+            progress_reason=list(progress_reason or []),
+            stagnation_reason=list(stagnation_reason or []),
+            recovery_stage=recovery_stage,
+            open_blocker_count=open_blocker_count,
+            oscillation_detected=oscillation_detected,
+            verification_improved=verification_improved,
+            completion_guard_triggered=completion_guard_triggered,
+            governance_decision=governance_decision,
+            workspace_before_digest=workspace_before_digest,
+            workspace_after_digest=workspace_after_digest,
+            changed_paths=list(changed_paths or []),
         )
         turn.tools.append(trace)
         turn.tool_calls_count += 1
 
         if loop_guard_blocked:
             task.loop_guard_trigger_count += 1
+
+    def record_attempt_event(self, event: Dict[str, Any]) -> None:
+        """Persist the unified runtime fact alongside the tool trace."""
+        if self.current_task is not None:
+            self.current_task.attempt_events.append(dict(event))
+
+    def update_last_attempt_event(self, event: Dict[str, Any]) -> None:
+        """Refresh derived decision facts without duplicating an attempt."""
+        if self.current_task is not None and self.current_task.attempt_events:
+            self.current_task.attempt_events[-1] = dict(event)
+
+    def annotate_current_tool(self, **fields: Any) -> None:
+        """Attach post-execution governance evidence to the latest tool trace."""
+        if not self.current_turn or not self.current_turn.tools:
+            return
+        trace = self.current_turn.tools[-1]
+        for name, value in fields.items():
+            if hasattr(trace, name):
+                setattr(trace, name, value)
+
+    def record_completion_guard(self, decision: str, open_blockers: int) -> None:
+        if self.current_task:
+            self.current_task.completion_guard_trigger_count += 1
+            self.current_task.completion_guard_triggered = True
+            self.current_task.governance_decision = decision
+            self.current_task.open_blocker_count = open_blockers
+        if self.current_turn:
+            self.current_turn.reflection_triggered = True
+            self.current_turn.completion_guard_triggered = True
 
     # ── Event Counters (lightweight, no turn required for task-level) ──
 
