@@ -1,0 +1,7 @@
+{
+  "case_id": "task_036_memory_repeated_read",
+  "description": "从单一配置文件提取部署事实并生成可验证摘要；读取次数仅作为成本观测。",
+  "prompt": "请查看 release_config.py，并创建 deployment_summary.txt。文件必须用 key=value 形式准确记录 service、region、port 和 retry_limit 四项当前配置。不要修改 release_config.py。",
+  "verify_script_file": "verify.py",
+  "evaluation": {"suite": "context_memory", "split": "dev", "principles": ["file_read_reuse"]}
+}

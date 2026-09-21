@@ -1,0 +1,7 @@
+{
+  "case_id": "task_039_memory_irrelevant_context",
+  "description": "遗留说明与当前策略并存时，任务结果必须以当前策略文件为准。",
+  "prompt": "请检查仓库中的说明和当前策略文件，创建 policy_summary.txt，使用 key=value 形式写入当前 active_policy.py 定义的 default_discount。不要修改现有策略或遗留说明。",
+  "verify_script_file": "verify.py",
+  "evaluation": {"suite": "context_memory", "split": "dev", "principles": ["irrelevant_memory_resistance"]}
+}

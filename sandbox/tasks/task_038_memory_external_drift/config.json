@@ -1,0 +1,7 @@
+{
+  "case_id": "task_038_memory_external_drift",
+  "description": "项目 refresh utility 改变运行时配置后，报告必须使用更新后的事实。",
+  "prompt": "请阅读 README.md 并完成其中描述的刷新流程，然后创建 runtime_report.txt，使用 key=value 形式记录当前 environment 和 generation。不要修改 refresh_settings.py。",
+  "verify_script_file": "verify.py",
+  "evaluation": {"suite": "context_memory", "split": "dev", "principles": ["external_file_drift"]}
+}

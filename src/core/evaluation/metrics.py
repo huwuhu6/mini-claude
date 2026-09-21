@@ -9,6 +9,38 @@ from __future__ import annotations
 from typing import Any, Dict, Optional
 
 
+def compute_file_read_metrics(data: Dict[str, Any]) -> Dict[str, float | int]:
+    """Compute read metrics from structured trace facts, without runtime state.
+
+    A read is redundant only when an earlier successful read has the exact
+    same normalized path, returned line range and content freshness hash.
+    Reading a new range or a file changed since the prior read is not counted.
+    """
+    seen: set[tuple[str, int, int, str]] = set()
+    read_count = 0
+    redundant_count = 0
+    for turn in data.get("turns", []):
+        for tool in turn.get("tools", []):
+            path = tool.get("file_read_path")
+            freshness = tool.get("file_read_freshness")
+            start = tool.get("file_read_start_line")
+            end = tool.get("file_read_end_line")
+            if not isinstance(path, str) or not path or not isinstance(freshness, str) or not freshness:
+                continue
+            if not isinstance(start, int) or not isinstance(end, int) or start <= 0 or end < start:
+                continue
+            key = (path, start, end, freshness)
+            read_count += 1
+            if key in seen:
+                redundant_count += 1
+            seen.add(key)
+    return {
+        "read_file_count": read_count,
+        "redundant_read_count": redundant_count,
+        "redundant_read_ratio": redundant_count / read_count if read_count else 0.0,
+    }
+
+
 def compute_duplicate_tool_ratio(data: Dict[str, Any]) -> Optional[float]:
     """Ratio of consecutively-duplicate tool calls to total tool calls.
 

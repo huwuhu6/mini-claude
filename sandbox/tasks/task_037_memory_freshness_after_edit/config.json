@@ -1,0 +1,7 @@
+{
+  "case_id": "task_037_memory_freshness_after_edit",
+  "description": "修改文件后必须以修改后的事实生成摘要，不能沿用旧读取结果。",
+  "prompt": "请将 service_policy.py 中的 MAX_RETRIES 从 2 改为 4，并创建 policy_summary.txt，使用 key=value 形式记录 max_retries 和 backoff_seconds 的当前值。",
+  "verify_script_file": "verify.py",
+  "evaluation": {"suite": "context_memory", "split": "dev", "principles": ["freshness_after_edit"]}
+}

@@ -27,6 +27,7 @@ from core.evaluation.anti_loop import (  # noqa: E402
     BENCHMARK_CONTRACT_VERSION,
     grade_trial,
 )
+from core.evaluation.metrics import compute_file_read_metrics  # noqa: E402
 
 # ── 确认 stdout 使用 UTF-8 ───────────────────────────────
 if hasattr(sys.stdout, "reconfigure"):
@@ -60,6 +61,9 @@ _METRIC_FIELDS = (
     "benchmark_contract_version",
     "trial_validity",
     "runtime_error",
+    "read_file_count",
+    "redundant_read_count",
+    "redundant_read_ratio",
 )
 
 
@@ -264,6 +268,7 @@ def _load_trace_metrics(trace_path: Path) -> dict[str, Any]:
     result["_tool_distribution"] = _fmt_tool_distribution(dist_dict)
     result["_tool_sequence"] = _compute_tool_sequence(raw)
     result["_read_saved_log"] = _compute_saved_log_read(raw)
+    result.update(compute_file_read_metrics(raw))
     anti_loop = raw.get("anti_loop")
     if isinstance(anti_loop, dict) and schema == ANTI_LOOP_GRADING_SCHEMA_VERSION:
         result.update({f"anti_loop_{k}": v for k, v in anti_loop.items()})
@@ -1086,6 +1091,9 @@ _DETAIL_METRICS = [
     ("Peak Turn Tokens", "peak_turn_tokens"),
     ("总延迟",        "total_latency_seconds"),
     ("工具调用次数",  "total_tool_calls"),
+    ("read_file 次数", "read_file_count"),
+    ("冗余读取次数", "redundant_read_count"),
+    ("冗余读取率", "redundant_read_ratio"),
     ("工具命中率",    "tool_call_precision"),
     ("工具失败次数",  "_tool_failure_count"),
     ("每轮 Token",    "_avg_tokens_per_turn"),
@@ -1110,6 +1118,7 @@ _NUMERIC_KEYS = {
     "loop_guard_trigger_count", "circuit_breaker_trigger_count",
     "self_healing_convergence_speed", "compression_count",
     "rollback_count",
+    "read_file_count", "redundant_read_count", "redundant_read_ratio",
 }
 
 # 不参与 Δ 计算的字段（非数值且字符串对比无意义）

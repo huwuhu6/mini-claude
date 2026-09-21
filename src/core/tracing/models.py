@@ -71,6 +71,10 @@ class ToolTrace:
     changed_paths: List[str] = field(default_factory=list)
     evidence_ids: List[str] = field(default_factory=list)
     governance_evidence_ids: List[str] = field(default_factory=list)
+    file_read_path: str = ""
+    file_read_start_line: int = 0
+    file_read_end_line: int = 0
+    file_read_freshness: str = ""
 
     def to_dict(self) -> Dict[str, Any]:
         return {
@@ -120,6 +124,10 @@ class ToolTrace:
             'changed_paths': list(self.changed_paths),
             'evidence_ids': list(self.evidence_ids),
             'governance_evidence_ids': list(self.governance_evidence_ids),
+            'file_read_path': self.file_read_path,
+            'file_read_start_line': self.file_read_start_line,
+            'file_read_end_line': self.file_read_end_line,
+            'file_read_freshness': self.file_read_freshness,
         }
 
 
@@ -196,6 +204,9 @@ class TaskTrace:
     finished_at: float = 0.0
     total_turns: int = 0
     total_tool_calls: int = 0
+    read_file_count: int = 0
+    redundant_read_count: int = 0
+    redundant_read_ratio: float = 0.0
     estimated_prompt_tokens: int = 0
     actual_prompt_tokens: int = 0
     main_prompt_tokens: int = 0
@@ -245,6 +256,9 @@ class TaskTrace:
             'finished_at': round(self.finished_at, 3),
             'total_turns': self.total_turns,
             'total_tool_calls': self.total_tool_calls,
+            'read_file_count': self.read_file_count,
+            'redundant_read_count': self.redundant_read_count,
+            'redundant_read_ratio': self.redundant_read_ratio,
             'estimated_prompt_tokens': self.estimated_prompt_tokens,
             'actual_prompt_tokens': self.actual_prompt_tokens,
             'main_prompt_tokens': self.main_prompt_tokens,

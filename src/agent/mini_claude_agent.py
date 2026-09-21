@@ -2203,6 +2203,16 @@ class MiniClaudeAgent:
                         workspace_root=str(self.runtime_context.workspace_root),
                         session_id=self.runtime_context.shell_session.session_id,
                     )
+                    if t_success and tname == "read_file":
+                        read_range = self._read_file_result_range(result_text)
+                        freshness = self._file_freshness(args.get("path", ""))
+                        if read_range is not None and freshness is not None:
+                            self.trace.record_file_read(
+                                str(args.get("path", "")),
+                                read_range[0],
+                                read_range[1],
+                                freshness,
+                            )
 
                     # Progress-aware evidence is computed after the existing
                     # guards and Failure Intelligence have classified the call.

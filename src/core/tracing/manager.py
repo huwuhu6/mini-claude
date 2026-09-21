@@ -59,6 +59,7 @@ class TraceManager:
         self.writer = TraceWriter(trace_dir)
         self.current_task: Optional[TaskTrace] = None
         self.current_turn: Optional[TurnTrace] = None
+        self._file_read_keys: set[tuple[str, int, int, str]] = set()
 
     # ── Task Lifecycle ─────────────────────────────────────────────────
 
@@ -78,6 +79,7 @@ class TraceManager:
             environment=dict(environment or {}),
         )
         self.current_turn = None
+        self._file_read_keys = set()
         logger.debug(f"Trace: task started [{tid}]")
         return tid
 
@@ -287,6 +289,34 @@ class TraceManager:
         for name, value in fields.items():
             if hasattr(trace, name):
                 setattr(trace, name, value)
+
+    def record_file_read(
+        self,
+        path: str,
+        start_line: int,
+        end_line: int,
+        freshness: str,
+    ) -> None:
+        """Record a successful, range-explicit file read for offline metrics."""
+        task = self.current_task
+        if task is None:
+            return
+        key = (path, start_line, end_line, freshness)
+        redundant = key in self._file_read_keys
+        self._file_read_keys.add(key)
+        task.read_file_count += 1
+        if redundant:
+            task.redundant_read_count += 1
+        task.redundant_read_ratio = (
+            task.redundant_read_count / task.read_file_count
+            if task.read_file_count else 0.0
+        )
+        self.annotate_current_tool(
+            file_read_path=path,
+            file_read_start_line=start_line,
+            file_read_end_line=end_line,
+            file_read_freshness=freshness,
+        )
 
     def record_completion_guard(
         self, decision: str, open_blockers: int, *, governance_action: str = "",
