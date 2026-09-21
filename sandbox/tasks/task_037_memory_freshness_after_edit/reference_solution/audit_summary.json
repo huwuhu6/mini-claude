@@ -1,1 +1,1 @@
-{"scope": "regional", "minimum_approvers": 2, "catalog_owners": {"accounts": "identity", "orders": "commerce", "search": "discovery"}}
+{"scope": "regional", "minimum_approvers": 2, "catalog_owners": {"accounts": "identity", "orders": "commerce", "search": "discovery", "events": "platform", "ledger": "payments", "mail": "operations", "profiles": "identity"}}

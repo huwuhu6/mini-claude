@@ -1,1 +1,1 @@
-{"channel": "canary", "rollback_limit": 2, "components": {"api": "platform", "billing": "payments", "worker": "operations"}}
+{"channel": "canary", "rollback_limit": 2, "components": {"api": "platform", "billing": "payments", "worker": "operations", "events": "platform", "ledger": "payments", "mailer": "operations", "search": "discovery"}}

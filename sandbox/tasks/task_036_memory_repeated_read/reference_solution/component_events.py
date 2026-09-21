@@ -1,0 +1,2 @@
+NAME = "events"
+OWNER = "platform"
