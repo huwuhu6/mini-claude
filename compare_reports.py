@@ -64,6 +64,9 @@ _METRIC_FIELDS = (
     "read_file_count",
     "redundant_read_count",
     "redundant_read_ratio",
+    "same_version_reread_count",
+    "overlap_reread_lines",
+    "overlap_reread_ratio",
 )
 
 
@@ -1094,6 +1097,9 @@ _DETAIL_METRICS = [
     ("read_file 次数", "read_file_count"),
     ("冗余读取次数", "redundant_read_count"),
     ("冗余读取率", "redundant_read_ratio"),
+    ("同版本重复读取", "same_version_reread_count"),
+    ("重叠重复行数", "overlap_reread_lines"),
+    ("重叠重复率", "overlap_reread_ratio"),
     ("工具命中率",    "tool_call_precision"),
     ("工具失败次数",  "_tool_failure_count"),
     ("每轮 Token",    "_avg_tokens_per_turn"),
@@ -1119,6 +1125,7 @@ _NUMERIC_KEYS = {
     "self_healing_convergence_speed", "compression_count",
     "rollback_count",
     "read_file_count", "redundant_read_count", "redundant_read_ratio",
+    "same_version_reread_count", "overlap_reread_lines", "overlap_reread_ratio",
 }
 
 # 不参与 Δ 计算的字段（非数值且字符串对比无意义）

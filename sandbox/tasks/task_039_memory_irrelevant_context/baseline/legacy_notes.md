@@ -1,3 +1,3 @@
-# Historical migration note
+# Runtime refresh
 
-The retired promotional campaign used discount=0.15. It is not the active policy.
+Run `python refresh_settings.py` before reporting the current runtime settings.

@@ -12,6 +12,7 @@ TASKS = (
     "task_038_memory_external_drift",
     "task_039_memory_irrelevant_context",
 )
+BENCHMARK_CONFIGS = ROOT / "configs" / "benchmarks"
 
 
 def _verify(case_name: str, source: str, tmp_path) -> subprocess.CompletedProcess:
@@ -34,6 +35,18 @@ def test_memory_cases_have_explicit_dev_metadata():
         assert config["case_id"] == case_name
         assert config["evaluation"]["suite"] == "context_memory"
         assert config["evaluation"]["split"] == "dev"
+
+
+def test_memory_ab_configs_only_change_the_memory_feature_flag():
+    import yaml
+
+    off = yaml.safe_load((BENCHMARK_CONFIGS / "context_memory_off.yaml").read_text(encoding="utf-8"))
+    on = yaml.safe_load((BENCHMARK_CONFIGS / "context_memory_on.yaml").read_text(encoding="utf-8"))
+
+    assert off["features"]["memory"] is False
+    assert on["features"]["memory"] is True
+    off["features"]["memory"] = on["features"]["memory"]
+    assert off == on
 
 
 def test_memory_case_baselines_fail_and_reference_solutions_pass(tmp_path):

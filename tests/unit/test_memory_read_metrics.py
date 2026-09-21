@@ -38,7 +38,26 @@ def test_redundant_read_requires_same_path_range_and_unchanged_freshness():
         "read_file_count": 4,
         "redundant_read_count": 1,
         "redundant_read_ratio": 0.25,
+        "same_version_reread_count": 2,
+        "overlap_reread_lines": 20,
+        "overlap_reread_ratio": 0.25,
     }
+
+
+def test_same_version_and_overlap_metrics_use_interval_union_and_canonical_paths():
+    metrics = compute_file_read_metrics(_trace_with_reads([
+        ("./src/../app.py", 1, 10, "v1"),
+        ("app.py", 5, 15, "v1"),       # overlaps 5-10
+        ("app.py", 7, 8, "v1"),        # wholly covered, adds 2 not 2+4
+        ("app.py", 16, 20, "v1"),      # adjacent but not overlapping
+        ("app.py", 1, 10, "v2"),       # a new version is not a reread
+    ]))
+
+    assert metrics["read_file_count"] == 5
+    assert metrics["redundant_read_count"] == 0
+    assert metrics["same_version_reread_count"] == 3
+    assert metrics["overlap_reread_lines"] == 8
+    assert metrics["overlap_reread_ratio"] == 8 / 38
 
 
 def test_trace_persists_file_read_facts_and_task_level_metrics(tmp_path):

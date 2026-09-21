@@ -1,7 +1,9 @@
+import json
 from pathlib import Path
 
-source = Path("service_policy.py").read_text(encoding="utf-8")
-assert "MAX_RETRIES = 4" in source
-assert "BACKOFF_SECONDS = 5" in source
-actual = dict(line.split("=", 1) for line in Path("policy_summary.txt").read_text(encoding="utf-8").splitlines() if "=" in line)
-assert actual == {"max_retries": "4", "backoff_seconds": "5"}, actual
+actual = json.loads(Path("audit_summary.json").read_text(encoding="utf-8"))
+assert actual == {
+    "scope": "regional",
+    "minimum_approvers": 2,
+    "catalog_owners": {"accounts": "identity", "orders": "commerce", "search": "discovery"},
+}, actual

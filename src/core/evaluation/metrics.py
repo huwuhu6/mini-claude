@@ -6,7 +6,28 @@ Each function accepts a parsed trace dict (from TaskTrace.to_dict()) and
 returns a single value or None when data is insufficient.
 """
 from __future__ import annotations
+import posixpath
 from typing import Any, Dict, Optional
+
+
+def _canonical_read_path(path: str) -> str:
+    """Defensively normalize persisted path facts from older traces."""
+    return posixpath.normpath(path.replace("\\", "/"))
+
+
+def _overlap_with_covered(intervals: list[tuple[int, int]], start: int, end: int) -> int:
+    return sum(max(0, min(end, covered_end) - max(start, covered_start) + 1)
+               for covered_start, covered_end in intervals)
+
+
+def _merge_interval(intervals: list[tuple[int, int]], start: int, end: int) -> list[tuple[int, int]]:
+    merged: list[tuple[int, int]] = []
+    for current_start, current_end in sorted([*intervals, (start, end)]):
+        if merged and current_start <= merged[-1][1] + 1:
+            merged[-1] = (merged[-1][0], max(merged[-1][1], current_end))
+        else:
+            merged.append((current_start, current_end))
+    return merged
 
 
 def compute_file_read_metrics(data: Dict[str, Any]) -> Dict[str, float | int]:
@@ -17,8 +38,13 @@ def compute_file_read_metrics(data: Dict[str, Any]) -> Dict[str, float | int]:
     Reading a new range or a file changed since the prior read is not counted.
     """
     seen: set[tuple[str, int, int, str]] = set()
+    seen_versions: set[tuple[str, str]] = set()
+    covered_by_version: dict[tuple[str, str], list[tuple[int, int]]] = {}
     read_count = 0
     redundant_count = 0
+    same_version_reread_count = 0
+    overlap_reread_lines = 0
+    total_read_lines = 0
     for turn in data.get("turns", []):
         for tool in turn.get("tools", []):
             path = tool.get("file_read_path")
@@ -29,15 +55,29 @@ def compute_file_read_metrics(data: Dict[str, Any]) -> Dict[str, float | int]:
                 continue
             if not isinstance(start, int) or not isinstance(end, int) or start <= 0 or end < start:
                 continue
-            key = (path, start, end, freshness)
+            canonical_path = _canonical_read_path(path)
+            key = (canonical_path, start, end, freshness)
+            version_key = (canonical_path, freshness)
             read_count += 1
+            total_read_lines += end - start + 1
             if key in seen:
                 redundant_count += 1
+            if version_key in seen_versions:
+                same_version_reread_count += 1
+            intervals = covered_by_version.get(version_key, [])
+            overlap_reread_lines += _overlap_with_covered(intervals, start, end)
+            covered_by_version[version_key] = _merge_interval(intervals, start, end)
             seen.add(key)
+            seen_versions.add(version_key)
     return {
         "read_file_count": read_count,
         "redundant_read_count": redundant_count,
         "redundant_read_ratio": redundant_count / read_count if read_count else 0.0,
+        "same_version_reread_count": same_version_reread_count,
+        "overlap_reread_lines": overlap_reread_lines,
+        "overlap_reread_ratio": (
+            overlap_reread_lines / total_read_lines if total_read_lines else 0.0
+        ),
     }
 
 

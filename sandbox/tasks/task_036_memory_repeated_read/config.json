@@ -1,7 +1,7 @@
 {
   "case_id": "task_036_memory_repeated_read",
-  "description": "从单一配置文件提取部署事实并生成可验证摘要；读取次数仅作为成本观测。",
-  "prompt": "请查看 release_config.py，并创建 deployment_summary.txt。文件必须用 key=value 形式准确记录 service、region、port 和 retry_limit 四项当前配置。不要修改 release_config.py。",
+  "description": "跨越多个独立组件调查后，仍需将早期发布事实与完整组件清单合并。",
+  "prompt": "请审查当前发布目标和全部 component_*.py 文件，创建 release_manifest.json。它必须记录当前 release channel、rollback limit，以及每个组件的 owner。不要修改已有源文件。",
   "verify_script_file": "verify.py",
-  "evaluation": {"suite": "context_memory", "split": "dev", "principles": ["file_read_reuse"]}
+  "evaluation": {"suite": "context_memory", "split": "dev", "principles": ["long_gap_recall"]}
 }

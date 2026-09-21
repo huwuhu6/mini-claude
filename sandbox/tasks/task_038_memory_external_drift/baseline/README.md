@@ -1,3 +1,3 @@
-# Runtime refresh
+# Service policy update
 
-`refresh_settings.py` simulates the deployment refresh. Run it before reporting the current runtime settings.
+The policy controls retry behavior. Workload owners are maintained in their own files.

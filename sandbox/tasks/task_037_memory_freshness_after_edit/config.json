@@ -1,7 +1,7 @@
 {
   "case_id": "task_037_memory_freshness_after_edit",
-  "description": "修改文件后必须以修改后的事实生成摘要，不能沿用旧读取结果。",
-  "prompt": "请将 service_policy.py 中的 MAX_RETRIES 从 2 改为 4，并创建 policy_summary.txt，使用 key=value 形式记录 max_retries 和 backoff_seconds 的当前值。",
+  "description": "低阈值实验配置下，压缩历史后仍应能使用早期锚点事实完成多文件审计。",
+  "prompt": "请审查 audit_anchor.py 和全部 catalog_*.py 文件，创建 audit_summary.json。它必须记录 audit scope、minimum approvers，以及每个 catalog 的 owner。不要修改已有源文件。",
   "verify_script_file": "verify.py",
-  "evaluation": {"suite": "context_memory", "split": "dev", "principles": ["freshness_after_edit"]}
+  "evaluation": {"suite": "context_memory", "split": "dev", "principles": ["compressed_history_recall"]}
 }

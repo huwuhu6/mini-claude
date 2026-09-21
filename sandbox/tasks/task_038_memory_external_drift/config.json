@@ -1,7 +1,7 @@
 {
   "case_id": "task_038_memory_external_drift",
-  "description": "项目 refresh utility 改变运行时配置后，报告必须使用更新后的事实。",
-  "prompt": "请阅读 README.md 并完成其中描述的刷新流程，然后创建 runtime_report.txt，使用 key=value 形式记录当前 environment 和 generation。不要修改 refresh_settings.py。",
+  "description": "修改已读取策略后，最终交付必须使用新版本事实而非旧 observation。",
+  "prompt": "请将 service_policy.py 中的 MAX_RETRIES 从 2 改为 4。随后审查全部 workload_*.py，并创建 policy_summary.json，记录当前 max_retries、backoff_seconds 和各 workload owner。不要修改 workload 文件。",
   "verify_script_file": "verify.py",
-  "evaluation": {"suite": "context_memory", "split": "dev", "principles": ["external_file_drift"]}
+  "evaluation": {"suite": "context_memory", "split": "dev", "principles": ["freshness_after_mutation"]}
 }

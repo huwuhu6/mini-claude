@@ -1,7 +1,7 @@
 {
   "case_id": "task_039_memory_irrelevant_context",
-  "description": "遗留说明与当前策略并存时，任务结果必须以当前策略文件为准。",
-  "prompt": "请检查仓库中的说明和当前策略文件，创建 policy_summary.txt，使用 key=value 形式写入当前 active_policy.py 定义的 default_discount。不要修改现有策略或遗留说明。",
+  "description": "外部脚本更新已读取配置后，最终报告必须采用更新后的文件事实。",
+  "prompt": "请阅读 README.md 并执行其中描述的刷新流程。然后审查 owner_*.py 文件，创建 runtime_report.json，记录当前 environment、generation 和各 owner 的 team。不要修改 refresh_settings.py 或 owner 文件。",
   "verify_script_file": "verify.py",
-  "evaluation": {"suite": "context_memory", "split": "dev", "principles": ["irrelevant_memory_resistance"]}
+  "evaluation": {"suite": "context_memory", "split": "dev", "principles": ["external_file_drift"]}
 }

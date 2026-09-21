@@ -42,7 +42,7 @@ def test_all_task_contracts_are_valid():
         if path.is_dir() and (path / "config.json").is_file()
     )
 
-    assert len(case_dirs) == 35
+    assert len(case_dirs) == 39
     errors = []
     for case_dir in case_dirs:
         _, task_errors = _validate_task(case_dir)
