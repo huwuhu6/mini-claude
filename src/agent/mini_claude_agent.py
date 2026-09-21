@@ -163,6 +163,7 @@ class MiniClaudeAgent:
         # Structured file memory is deliberately separate from durable
         # conversation history.  The feature flag controls all reads/writes.
         self.memory = StructuredContextMemory()
+        self._memory_file_fingerprints: Dict[str, tuple[tuple[int, int], str]] = {}
 
         # Tool dispatcher — dict-based routing bound once at init (s_full.py TOOL_HANDLERS pattern)
         self.tool_dispatcher = {
@@ -1396,17 +1397,39 @@ class MiniClaudeAgent:
             return None
         return tuple(int(value) for value in match.groups())
 
-    def _file_freshness(self, path: str) -> Optional[str]:
-        """Return a cheap, deterministic content hash for a workspace file."""
+    def _canonical_workspace_file(self, path: str) -> tuple[str, Path]:
+        """Authorize a file path and give Memory/Trace one workspace-relative identity."""
+        file_path = self.tools.safe_path(path)
+        workspace_root = getattr(self, "workdir", self.tools.workdir).resolve()
         try:
-            file_path = self.tools.safe_path(path)
+            canonical = file_path.relative_to(workspace_root).as_posix()
+        except ValueError as exc:
+            raise ValueError(f"Memory path must be inside the primary workspace: {path}") from exc
+        return canonical, file_path
+
+    def _file_freshness(self, path: str) -> Optional[str]:
+        """Return a content hash, avoiding re-reads while file metadata is unchanged."""
+        try:
+            canonical_path, file_path = self._canonical_workspace_file(path)
             if not file_path.is_file():
+                getattr(self, "_memory_file_fingerprints", {}).pop(canonical_path, None)
                 return None
+            stat = file_path.stat()
+            metadata = (stat.st_size, stat.st_mtime_ns)
+            fingerprints = getattr(self, "_memory_file_fingerprints", None)
+            if fingerprints is None:
+                fingerprints = {}
+                self._memory_file_fingerprints = fingerprints
+            cached = fingerprints.get(canonical_path)
+            if cached is not None and cached[0] == metadata:
+                return cached[1]
             digest = hashlib.sha256()
             with file_path.open("rb") as handle:
                 for chunk in iter(lambda: handle.read(64 * 1024), b""):
                     digest.update(chunk)
-            return digest.hexdigest()
+            freshness = digest.hexdigest()
+            fingerprints[canonical_path] = (metadata, freshness)
+            return freshness
         except (OSError, ValueError) as exc:
             logger.debug("Unable to refresh structured memory for %s: %s", path, exc)
             return None
@@ -1442,15 +1465,16 @@ class MiniClaudeAgent:
         if not isinstance(path, str) or not path.strip():
             return
         try:
+            canonical_path, _ = self._canonical_workspace_file(path)
             if tool_name == "read_file":
                 read_range = self._read_file_result_range(tool_result.content)
-                freshness = self._file_freshness(path)
+                freshness = self._file_freshness(canonical_path)
                 if read_range is None or freshness is None:
                     return
                 start_line, end_line, total_lines = read_range
-                self.memory.remember_file(path, freshness)
+                self.memory.remember_file(canonical_path, freshness)
                 self.memory.record_observation(
-                    path,
+                    canonical_path,
                     start_line,
                     end_line,
                     self._read_file_observation(
@@ -1459,8 +1483,8 @@ class MiniClaudeAgent:
                     freshness,
                 )
             elif tool_name in {"write_file", "edit_file"}:
-                self.memory.remember_file(path, self._file_freshness(path))
-                self.memory.invalidate(path)
+                self.memory.remember_file(canonical_path, self._file_freshness(canonical_path))
+                self.memory.invalidate(canonical_path)
         except (OSError, ValueError) as exc:
             logger.debug("Structured memory update skipped for %s: %s", tool_name, exc)
 
@@ -2205,10 +2229,15 @@ class MiniClaudeAgent:
                     )
                     if t_success and tname == "read_file":
                         read_range = self._read_file_result_range(result_text)
-                        freshness = self._file_freshness(args.get("path", ""))
+                        read_path = args.get("path", "")
+                        try:
+                            canonical_path, _ = self._canonical_workspace_file(read_path)
+                        except (TypeError, ValueError):
+                            canonical_path = ""
+                        freshness = self._file_freshness(canonical_path) if canonical_path else None
                         if read_range is not None and freshness is not None:
                             self.trace.record_file_read(
-                                str(args.get("path", "")),
+                                canonical_path,
                                 read_range[0],
                                 read_range[1],
                                 freshness,

@@ -21,6 +21,17 @@ def test_recent_files_follow_lru_order_and_evict_oldest():
     assert memory.recent_files == ("a.py", "c.py")
 
 
+def test_path_aliases_share_one_memory_identity():
+    memory = StructuredContextMemory()
+
+    memory.record_observation("src/../app.py", 1, 5, "first", "v1")
+    memory.record_observation("./app.py", 1, 5, "updated", "v1")
+
+    assert memory.recent_files == ("app.py",)
+    assert len(memory.observations) == 1
+    assert memory.get_observation("app.py", 1, 5, "v1").observation == "updated"
+
+
 def test_observations_keep_ranges_separate_for_same_path():
     memory = StructuredContextMemory()
     memory.record_observation("src/app.py", 1, 20, "imports", "v1")
@@ -72,3 +83,7 @@ def test_render_is_bounded_and_never_claims_a_range_is_a_whole_file():
     assert "src/app.py lines 41-60" in rendered
     assert "whole file" not in rendered.lower()
     assert "…" in rendered
+
+
+def test_empty_memory_renders_no_transient_payload():
+    assert StructuredContextMemory().render() == ""

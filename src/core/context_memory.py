@@ -7,6 +7,7 @@ from __future__ import annotations
 
 from collections import OrderedDict
 from dataclasses import dataclass
+import posixpath
 from time import time
 from typing import Callable, Optional
 
@@ -53,8 +54,11 @@ class StructuredContextMemory:
 
     @staticmethod
     def _path_key(path: str) -> str:
-        key = str(path).strip().replace("\\", "/")
-        if not key:
+        raw_path = str(path).strip().replace("\\", "/")
+        if not raw_path:
+            raise ValueError("Memory path must not be empty")
+        key = posixpath.normpath(raw_path)
+        if key in {"", "."}:
             raise ValueError("Memory path must not be empty")
         return key
 
@@ -157,6 +161,8 @@ class StructuredContextMemory:
             max(0, int(max_chars)), self.max_render_chars,
         )
         if budget == 0:
+            return ""
+        if not self._recent_files and not self._observations:
             return ""
 
         lines: list[str] = ["Recent files: " + (", ".join(reversed(self.recent_files)) or "none")]

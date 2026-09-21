@@ -78,6 +78,48 @@ def test_successful_write_invalidates_existing_file_observations(tmp_path):
     assert agent.memory.recent_files == ("app.py",)
 
 
+def test_path_aliases_share_one_canonical_runtime_identity_then_invalidate(tmp_path):
+    path = tmp_path / "app.py"
+    path.write_text("before\n", encoding="utf-8")
+    agent = _agent(tmp_path)
+    result = agent.tools.read_file("./app.py")
+
+    agent._update_structured_memory("read_file", {"path": "./app.py"}, result, True)
+    agent._update_structured_memory(
+        "edit_file", {"path": "src/../app.py"}, ToolResult("edited"), True,
+    )
+
+    assert {
+        agent._canonical_workspace_file(alias)[0]
+        for alias in ("app.py", "./app.py", "src/../app.py")
+    } == {"app.py"}
+    assert agent.memory.recent_files == ("app.py",)
+    assert agent.memory.observations == ()
+
+
+def test_unchanged_recent_file_does_not_rehash_on_each_hot_context_render(tmp_path, monkeypatch):
+    path = tmp_path / "app.py"
+    path.write_text("line\n", encoding="utf-8")
+    agent = _agent(tmp_path)
+    result = agent.tools.read_file("app.py")
+    agent._update_structured_memory("read_file", {"path": "app.py"}, result, True)
+
+    original_open = Path.open
+    reads = 0
+
+    def counting_open(self, *args, **kwargs):
+        nonlocal reads
+        if self == path and args and args[0] == "rb":
+            reads += 1
+        return original_open(self, *args, **kwargs)
+
+    monkeypatch.setattr(Path, "open", counting_open)
+    agent._get_dynamic_hot_context()
+    agent._get_dynamic_hot_context()
+
+    assert reads == 0
+
+
 def test_external_file_drift_invalidates_before_transient_render(tmp_path):
     path = tmp_path / "app.py"
     path.write_text("before\n", encoding="utf-8")
