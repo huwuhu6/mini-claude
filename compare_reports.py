@@ -758,13 +758,23 @@ def _render_provenance(
         config_hash = str(agent_config.get("config_sha256", ""))
         if config_hash:
             config_hashes.add(config_hash)
-        model_conditions.add(json.dumps({k: agent_config.get(k) for k in ("provider", "model", "temperature", "max_tokens")}, sort_keys=True))
+        comparable_config = {
+            k: agent_config.get(k) for k in (
+                "provider", "model", "temperature", "max_tokens",
+                "context_window_tokens", "microcompact_token_threshold",
+                "full_compression_token_threshold", "memory",
+            )
+        }
+        model_conditions.add(json.dumps(comparable_config, sort_keys=True))
         platform_name = str(environment.get("platform", "-")).replace("|", "\\|")
         lines.append(
             f"| `{version}` | `{_short_sha(agent.get('commit'))}` | "
             f"{('dirty' if agent.get('worktree_dirty', agent.get('dirty')) else 'clean')} | "
             f"{environment.get('python', '-')} | {platform_name} | "
             f"`{_short_sha(suite_hash)}` | {len(manifest.get('tasks', []))} |"
+        )
+        lines.append(
+            "> effective config: " + json.dumps(comparable_config, ensure_ascii=False, sort_keys=True)
         )
 
     if missing_manifest:
@@ -774,7 +784,7 @@ def _render_provenance(
     if len(config_hashes) > 1:
         lines.append("> ⚠ Agent config hash 不一致，结果不可直接比较。")
     if len(model_conditions) > 1:
-        lines.append("> ⚠ provider/model/temperature/max_tokens 不一致，结果不可直接比较。")
+        lines.append("> ⚠ provider/model/temperature/max_tokens 或 Context override 不一致，结果不可直接比较。")
     if len(grading_schemas) > 1 or (grading_schemas and str(ANTI_LOOP_GRADING_SCHEMA_VERSION) not in grading_schemas):
         lines.append(
             f"> ⚠ Anti-Loop grading schema 不一致或不是 v{ANTI_LOOP_GRADING_SCHEMA_VERSION}；"

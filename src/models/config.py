@@ -115,6 +115,33 @@ class Config:
     logging: LoggingConfig = field(default_factory=LoggingConfig)
 
 
+def apply_runtime_overrides(config: Config, overrides: Optional[Dict[str, Any]] = None) -> Config:
+    """Apply ephemeral evaluation overrides without persisting configuration."""
+    values = dict(overrides or {})
+    compression_keys = {
+        "context_window_tokens",
+        "microcompact_token_threshold",
+        "full_compression_token_threshold",
+    }
+    unknown = set(values) - compression_keys - {"memory"}
+    if unknown:
+        raise ValueError(f"Unsupported runtime config override(s): {sorted(unknown)}")
+
+    compression = {
+        "context_window_tokens": config.compression.context_window_tokens,
+        "microcompact_token_threshold": config.compression.microcompact_token_threshold,
+        "full_compression_token_threshold": config.compression.full_compression_token_threshold,
+        "max_transcripts": config.compression.max_transcripts,
+    }
+    for key in compression_keys:
+        if key in values and values[key] is not None:
+            compression[key] = values[key]
+    config.compression = CompressionConfig(**compression)
+    if "memory" in values and values["memory"] is not None:
+        config.features.memory = bool(values["memory"])
+    return config
+
+
 class ConfigManager:
     def __init__(self, config_path: Optional[Path] = None):
         self.config_path = config_path or Path("configs/default.yaml")

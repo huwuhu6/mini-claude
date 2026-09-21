@@ -25,7 +25,7 @@ _src_path = str(_project_root / 'src')
 if _src_path not in sys.path:
     sys.path.insert(0, _src_path)
 
-from models.config import ConfigManager, Config
+from models.config import ConfigManager, Config, apply_runtime_overrides
 from models.task import Task, TaskManager, TaskStatus
 from models.teammate import Teammate, TeammateStatus, TeammateRole
 from models.todo import TodoManager
@@ -109,7 +109,8 @@ class MiniClaudeAgent:
                  workspace_root: Optional[Path] = None,
                  workdir: Optional[Path] = None,
                  workspace_confirmed: bool = False,
-                 runtime_data_root: Optional[Path] = None):
+                 runtime_data_root: Optional[Path] = None,
+                 config_overrides: Optional[Dict[str, Any]] = None):
         self._ui_event_handler: Optional[Callable[[str, Dict[str, Any]], None]] = None
         self._last_assistant_note: Optional[str] = None
         # ── Resolve workspace root (explicit > legacy > cwd fallback) ──
@@ -126,6 +127,7 @@ class MiniClaudeAgent:
         # Config must be loaded first (used by _setup_logging)
         self.config_manager = ConfigManager(config_path)
         self.config = self.config_manager.get_config()
+        apply_runtime_overrides(self.config, config_overrides)
         # Probe before session subsystems start so the system prompt and audit
         # record share the same bounded environment facts.
         self.preflight = run_preflight(self.workdir)
@@ -1605,24 +1607,55 @@ class MiniClaudeAgent:
         Returns:
             True if compression (full or micro) was actually triggered.
         """
+        before_count = len(self.messages)
+        compression_type = "none"
         if self.feature_manager.is_enabled('compression'):
             before = copy.deepcopy(self.messages)
             if self.compressor.should_compress(
                 self.messages, estimated_prompt_tokens=estimated_prompt_tokens,
             ):
                 logger.info("触发自动压缩")
+                compression_type = "full"
                 self.messages = self.compressor.compress(self.messages)
             elif self.compressor.should_microcompact(
                 self.messages, estimated_prompt_tokens=estimated_prompt_tokens,
             ):
                 logger.info("触发微压缩")
+                compression_type = "micro"
                 self.messages = self.compressor.microcompact(self.messages)
             changed = self.messages != before
             summary_usage = self.compressor.consume_last_summary_usage()
             if summary_usage is not None:
                 self._record_provider_usage(summary_usage, source="summary")
+            self._last_compression_observation = {
+                "compression_type": compression_type if changed else "none",
+                "before": before_count,
+                "after": len(self.messages),
+                "retained_read_file_results": self._retained_read_file_result_count(),
+            }
             return changed
+        self._last_compression_observation = {
+            "compression_type": "none",
+            "before": before_count,
+            "after": len(self.messages),
+            "retained_read_file_results": self._retained_read_file_result_count(),
+        }
         return False
+
+    def _retained_read_file_result_count(self) -> int:
+        """Count read_file results still represented in durable history."""
+        read_call_ids = set()
+        for message in self.messages:
+            for tool_call in message.tool_calls or []:
+                function = tool_call.get("function", {}) if isinstance(tool_call, dict) else {}
+                if isinstance(function, dict) and function.get("name") == "read_file":
+                    call_id = tool_call.get("id")
+                    if call_id:
+                        read_call_ids.add(call_id)
+        return sum(
+            1 for message in self.messages
+            if message.role == "tool" and message.tool_call_id in read_call_ids
+        )
 
     def _drain_background_notifications(self) -> Optional[str]:
         """Drain background task notifications and return as formatted string.
@@ -1737,6 +1770,16 @@ class MiniClaudeAgent:
             workspace_confirmed=self._workspace_confirmed,
             require_tool_call=require_tool_call,
             environment=self.preflight.to_dict(),
+            effective_config={
+                "provider": self.config.llm.provider,
+                "model": self.config.llm.model,
+                "context_window_tokens": self.config.compression.context_window_tokens,
+                "microcompact_token_threshold": self.config.compression.microcompact_token_threshold,
+                "full_compression_token_threshold": self.config.compression.full_compression_token_threshold,
+                "memory": self.config.features.memory,
+                "max_tokens": self.config.llm.max_tokens,
+                "temperature": self.config.llm.temperature,
+            },
         )
         self.runtime_context.current_task_id = tid
         self.runtime_policy.reset()
@@ -1766,7 +1809,17 @@ class MiniClaudeAgent:
                     system_prompt=self.system_prompt,
                     tools=tools,
                 )
-                if self._check_auto_compress(estimated_prompt_tokens):
+                changed = self._check_auto_compress(estimated_prompt_tokens)
+                compression_observation = getattr(
+                    self, "_last_compression_observation", {
+                        "compression_type": "none",
+                        "before": len(self.messages),
+                        "after": len(self.messages),
+                        "retained_read_file_results": 0,
+                    },
+                )
+                self.trace.record_compression_observation(**compression_observation)
+                if changed:
                     self.trace.record_compression()
 
                 # ── Safety net: normalize tool chains before API call ──

@@ -67,7 +67,8 @@ class TraceManager:
                     workspace_root: str = "",
                     workspace_confirmed: bool = False,
                     require_tool_call: bool = False,
-                    environment: Optional[Dict[str, Any]] = None) -> str:
+                    environment: Optional[Dict[str, Any]] = None,
+                    effective_config: Optional[Dict[str, Any]] = None) -> str:
         """Begin a new task-level trace.  Returns task_id."""
         tid = task_id or str(uuid.uuid4())[:8]
         self.current_task = TaskTrace(
@@ -77,6 +78,7 @@ class TraceManager:
             workspace_confirmed=workspace_confirmed,
             require_tool_call=require_tool_call,
             environment=dict(environment or {}),
+            effective_config=dict(effective_config or {}),
         )
         self.current_turn = None
         self._file_read_keys = set()
@@ -334,6 +336,22 @@ class TraceManager:
             self.current_turn.completion_guard_triggered = True
 
     # ── Event Counters (lightweight, no turn required for task-level) ──
+
+    def record_compression_observation(
+        self,
+        compression_type: str,
+        before: int,
+        after: int,
+        retained_read_file_results: int = 0,
+    ) -> None:
+        """Record per-turn compression qualification facts."""
+        if self.current_turn:
+            self.current_turn.compression_type = compression_type
+            self.current_turn.compression_message_count_before = max(int(before), 0)
+            self.current_turn.compression_message_count_after = max(int(after), 0)
+            self.current_turn.retained_read_file_results = max(
+                int(retained_read_file_results), 0,
+            )
 
     def record_compression(self) -> None:
         """Record that compression was triggered in the current turn."""

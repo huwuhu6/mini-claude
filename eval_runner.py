@@ -46,6 +46,7 @@ BASE_DIR = Path(__file__).resolve().parent
 _src = str(BASE_DIR / "src")
 if _src not in sys.path:
     sys.path.insert(0, _src)
+from models.config import ConfigManager, apply_runtime_overrides
 
 try:
     from core.runtime_data import RuntimeDataPaths
@@ -117,6 +118,22 @@ def _positive_int(value: str) -> int:
     if parsed < 1:
         raise argparse.ArgumentTypeError("必须是正整数")
     return parsed
+
+
+def _effective_config_metadata(overrides: Optional[dict[str, Any]] = None) -> dict[str, Any]:
+    """Resolve the exact Agent config after ephemeral evaluation overrides."""
+    config = ConfigManager(_CONFIG_PATH).get_config()
+    apply_runtime_overrides(config, overrides)
+    return {
+        "provider": config.llm.provider,
+        "model": config.llm.model,
+        "context_window_tokens": config.compression.context_window_tokens,
+        "microcompact_token_threshold": config.compression.microcompact_token_threshold,
+        "full_compression_token_threshold": config.compression.full_compression_token_threshold,
+        "memory": config.features.memory,
+        "max_tokens": config.llm.max_tokens,
+        "temperature": config.llm.temperature,
+    }
 
 
 def _version_label(value: str) -> str:
@@ -510,6 +527,7 @@ def _select_cases(
 
 def _write_run_manifest(
     version: str, run_id: str, case_dirs: list[Path], configs: dict[str, dict[str, Any]],
+    config_overrides: Optional[dict[str, Any]] = None,
 ) -> dict[str, Any]:
     """Persist enough provenance to reproduce and interpret a result directory."""
     tasks = [_task_metadata(case_dir, configs[case_dir.name]) for case_dir in case_dirs]
@@ -531,6 +549,7 @@ def _write_run_manifest(
         if isinstance(configured_max_iterations, int) and configured_max_iterations > 0
         else EFFECTIVE_MAX_ITERATIONS
     )
+    effective_config = _effective_config_metadata(config_overrides)
     metadata: dict[str, Any] = {
         "run_id": run_id,
         "benchmark_contract_version": BENCHMARK_CONTRACT_VERSION,
@@ -548,11 +567,9 @@ def _write_run_manifest(
             "platform": platform.platform(),
         },
         "agent_config": {
-            "provider": llm_cfg.get("provider", agent_config.get("provider")),
-            "model": llm_cfg.get("model", agent_config.get("model")),
-            "temperature": llm_cfg.get("temperature", agent_config.get("temperature")),
-            "max_tokens": llm_cfg.get("max_tokens", agent_config.get("max_tokens")),
+            **effective_config,
             "config_sha256": _sha256_file(_CONFIG_PATH),
+            "runtime_overrides": dict(config_overrides or {}),
             "feature_flags": agent_config.get("features", agent_config.get("feature_flags", {})),
             "configured_max_iterations": configured_max_iterations,
             "effective_max_iterations": effective_max_iterations,
@@ -686,6 +703,7 @@ def _run_agent(
     prompt: str, require_tool_call: bool = False,
     env_updates: Optional[dict[str, str]] = None,
     runtime_data_root: Path | None = None,
+    config_overrides: Optional[dict[str, Any]] = None,
 ) -> tuple[Optional[Path], float, str | None]:
     """实例化 Agent 并执行 prompt，返回 trace、耗时和异常原因。"""
     # 延迟导入，使 --validate-only 不依赖 LLM、tiktoken 或 API 环境。
@@ -701,6 +719,7 @@ def _run_agent(
             workspace_root=SHADOW_WORKSPACE,
             workspace_confirmed=True,
             runtime_data_root=runtime_data_root,
+            config_overrides=config_overrides,
         )
         print("  🤖 Agent 已初始化，正在执行 prompt…")
         t0 = time.perf_counter()
@@ -776,6 +795,7 @@ def run_case(
     run_idx: int = 1,
     total_runs: int = 1,
     trial_index: int = 1,
+    config_overrides: Optional[dict[str, Any]] = None,
 ) -> dict[str, Any]:
     """运行单个评测 case，返回结果字典。"""
     case_id = case_dir.name
@@ -832,6 +852,7 @@ def run_case(
     trace_path, agent_duration, agent_error = _run_agent(
         prompt, require_tool_call=bool(verify_script_name), env_updates=fixture_env,
         runtime_data_root=runtime_data_root,
+        config_overrides=config_overrides,
     )
 
     # ── Step 3: 动态路由断言（黄雀在后验证） ───────────────
@@ -1216,7 +1237,23 @@ def main() -> None:
         "--validate-only", action="store_true",
         help="只校验任务契约，不启动 Agent 或写入评测结果",
     )
+    parser.add_argument("--context-window-tokens", type=_positive_int)
+    parser.add_argument("--microcompact-threshold", type=_positive_int)
+    parser.add_argument("--full-compression-threshold", type=_positive_int)
+    parser.add_argument("--memory", choices=("on", "off"))
     args = parser.parse_args()
+    config_overrides = {
+        key: value for key, value in {
+            "context_window_tokens": args.context_window_tokens,
+            "microcompact_token_threshold": args.microcompact_threshold,
+            "full_compression_token_threshold": args.full_compression_threshold,
+            "memory": None if args.memory is None else args.memory == "on",
+        }.items() if value is not None
+    }
+    try:
+        effective_config = _effective_config_metadata(config_overrides)
+    except (TypeError, ValueError) as exc:
+        parser.error(str(exc))
     version = args.version
     task_filter: set[str] | None = None if not args.task else {t.strip() for t in args.task.split(",")}
 
@@ -1299,7 +1336,10 @@ def main() -> None:
         print(f"  🔧 每任务运行 {args.runs} 次\n")
 
     run_id = datetime.now(timezone.utc).strftime("%Y%m%dT%H%M%SZ")
-    run_metadata = _write_run_manifest(version, run_id, case_dirs, task_configs)
+    run_metadata = _write_run_manifest(
+        version, run_id, case_dirs, task_configs, config_overrides,
+    )
+    run_metadata["effective_config"] = effective_config
     run_metadata["selected_suite"] = args.suite
     run_metadata["selected_split"] = selection_split
     run_metadata["planned_trials"] = len(case_dirs) * args.runs
@@ -1319,6 +1359,7 @@ def main() -> None:
                         case_dir, version, run_metadata,
                         run_idx=run_idx, total_runs=args.runs,
                         trial_index=trial_index,
+                        config_overrides=config_overrides,
                     )
                 except Exception as exc:
                     print(f"  ❌ Case [{case_dir.name}] 崩溃: {exc}")
