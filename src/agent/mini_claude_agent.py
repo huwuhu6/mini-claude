@@ -3,6 +3,7 @@ Mini Claude Agent - Unified agent integrating all systems.
 """
 from __future__ import annotations
 import logging
+import hashlib
 import os
 import sys
 import json
@@ -40,6 +41,7 @@ from core.background import BackgroundProcessor, BackgroundTaskStatus
 from core.subagent import SubAgentManager, SubAgentType, SubAgentResult
 from core.console import ConsoleCommandSystem, Command
 from core.compression import Compressor
+from core.context_memory import StructuredContextMemory
 from core.loop_guard import canonicalize_args
 from core.loop_controller import (
     AttemptHistory, AttemptStatus, CommandNormalizer, RuntimeDecision,
@@ -158,6 +160,9 @@ class MiniClaudeAgent:
             shell_session=self.runtime_context.shell_session,
         )
         self.command_policy = CommandPolicy()
+        # Structured file memory is deliberately separate from durable
+        # conversation history.  The feature flag controls all reads/writes.
+        self.memory = StructuredContextMemory()
 
         # Tool dispatcher — dict-based routing bound once at init (s_full.py TOOL_HANDLERS pattern)
         self.tool_dispatcher = {
@@ -322,6 +327,10 @@ class MiniClaudeAgent:
         self.feature_manager.register_feature(FeatureDefinition(
             name='compression', description='Context compression',
             category='core', enabled=features_config.compression,
+        ))
+        self.feature_manager.register_feature(FeatureDefinition(
+            name='memory', description='Transient structured file memory',
+            category='core', enabled=features_config.memory,
         ))
         self.feature_manager.register_feature(FeatureDefinition(
             name='background', description='Background command execution',
@@ -1376,6 +1385,86 @@ class MiniClaudeAgent:
         return False
 
     @staticmethod
+    def _read_file_result_range(result_text: str) -> Optional[tuple[int, int, int]]:
+        """Extract the actual bounded range returned by ``read_file``."""
+        match = re.search(
+            r"^--- FILE: .+? \(LINES: (\d+)-(\d+) of (\d+)\) ---$",
+            result_text,
+            re.MULTILINE,
+        )
+        if not match:
+            return None
+        return tuple(int(value) for value in match.groups())
+
+    def _file_freshness(self, path: str) -> Optional[str]:
+        """Return a cheap, deterministic content hash for a workspace file."""
+        try:
+            file_path = self.tools.safe_path(path)
+            if not file_path.is_file():
+                return None
+            digest = hashlib.sha256()
+            with file_path.open("rb") as handle:
+                for chunk in iter(lambda: handle.read(64 * 1024), b""):
+                    digest.update(chunk)
+            return digest.hexdigest()
+        except (OSError, ValueError) as exc:
+            logger.debug("Unable to refresh structured memory for %s: %s", path, exc)
+            return None
+
+    @staticmethod
+    def _read_file_observation(result_text: str, start_line: int, end_line: int, total_lines: int) -> str:
+        """Create a bounded factual note without asking an LLM to summarize."""
+        body = result_text.split("---", 2)[-1]
+        body = body.split("--- END FILE:", 1)[0]
+        preview = " ".join(body.split())[:160]
+        return f"Read lines {start_line}-{end_line} of {total_lines}: {preview}"
+
+    def _refresh_structured_memory_freshness(self) -> None:
+        """Drop stale observations before they are transiently shown to the model."""
+        for path in self.memory.recent_files:
+            freshness = self._file_freshness(path)
+            if freshness is None:
+                self.memory.invalidate(path)
+            else:
+                self.memory.refresh_freshness(path, freshness)
+
+    def _update_structured_memory(
+        self,
+        tool_name: str,
+        args: Dict[str, Any],
+        tool_result: ToolResult,
+        success: bool,
+    ) -> None:
+        """Single post-tool hook for the first file-memory integration."""
+        if not success or not self.feature_manager.is_enabled("memory"):
+            return
+        path = args.get("path")
+        if not isinstance(path, str) or not path.strip():
+            return
+        try:
+            if tool_name == "read_file":
+                read_range = self._read_file_result_range(tool_result.content)
+                freshness = self._file_freshness(path)
+                if read_range is None or freshness is None:
+                    return
+                start_line, end_line, total_lines = read_range
+                self.memory.remember_file(path, freshness)
+                self.memory.record_observation(
+                    path,
+                    start_line,
+                    end_line,
+                    self._read_file_observation(
+                        tool_result.content, start_line, end_line, total_lines,
+                    ),
+                    freshness,
+                )
+            elif tool_name in {"write_file", "edit_file"}:
+                self.memory.remember_file(path, self._file_freshness(path))
+                self.memory.invalidate(path)
+        except (OSError, ValueError) as exc:
+            logger.debug("Structured memory update skipped for %s: %s", tool_name, exc)
+
+    @staticmethod
     def _empty_usage_metrics() -> Dict[str, Any]:
         return {
             "turns": 0,
@@ -1579,7 +1668,14 @@ class MiniClaudeAgent:
         if inbox_text:
             parts.append(f"<inbox>\n{inbox_text}\n</inbox>")
 
-        # 4. Nag reminder (soft prompt, not persisted)
+        # 4. Structured file memory (transient; never appended to messages).
+        if self.feature_manager.is_enabled("memory"):
+            self._refresh_structured_memory_freshness()
+            memory_text = self.memory.render()
+            if memory_text:
+                parts.append(f"<structured-file-memory>\n{memory_text}\n</structured-file-memory>")
+
+        # 5. Nag reminder (soft prompt, not persisted)
         if self.todo.has_open_items() and rounds_without_todo >= 3:
             parts.append("<nag>Consider updating your todos.</nag>")
 
@@ -2076,6 +2172,9 @@ class MiniClaudeAgent:
                         and not state_guard_blocked
                         and bool(tool_result.execution_success)
                     )
+                    self._update_structured_memory(
+                        tname, args, tool_result, t_success,
+                    )
                     self.trace.record_tool_call(
                         tool_name=tname, args_hash=args_hash,
                         success=t_success,
@@ -2296,6 +2395,7 @@ class MiniClaudeAgent:
         lines.append(f"  功能: subagent={self.config.features.subagent}, "
                       f"tasks={self.config.features.tasks}, "
                       f"compression={self.config.features.compression}, "
+                      f"memory={self.config.features.memory}, "
                       f"background={self.config.features.background}, "
                       f"team={self.config.features.team}, "
                       f"skills={self.config.features.skills}")
