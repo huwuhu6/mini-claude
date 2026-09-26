@@ -678,3 +678,22 @@ v8 首次捕获到具体运行时异常：`Invalid \\escape: line 1 column 22`�
 
 基线的失败不应污染下一轮。验证器从原始 Trace 中解析本用例 `run_background` 返回的 Popen PID，在完成端口
 判定后只终止该 PID 的进程树。它不扫描端口，也不终止不属于该 fixture 的其他进程。
+
+## 2026-09-26：Harbor 公开评测接入
+
+Commit: `8034061`, `4a754f4`
+Commit Description: `feat(eval): 增加非交互 Agent 单次执行入口`；`feat(eval): 接入 Harbor 自定义 Agent 适配器`
+
+### Description
+
+原有 CLI 面向交互式 REPL，而内部 Evaluation Runner 直接管理 Agent 生命周期。为了接入公开 Benchmark，新增一个显式绑定 workspace 的单次执行入口，复用现有 Agent、ProviderManager、WorkspaceAuthority 和 Trace；Harbor 适配器只负责把当前源码构建为 wheel、送入任务容器、传入任务指令并运行该入口。任务是否成功仍由 Harbor verifier 判定。适配器不包含 Terminal-Bench 任务语义，未来可由相同入口调用其他 Harbor dataset。
+
+### Result / Evidence
+
+Harbor 固定为 `0.23.0`。headless/adapter 确定性测试 `7 passed`；受影响的 CLI、RuntimeContext、Agent、Trace、Evaluation 回归 `110 passed`；本地 wheel 检查确认包含 headless 模块和 console entry。
+
+Terminal-Bench 2.0 Oracle 仅尝试了 1 个 task：`terminal-bench/make-mips-interpreter`。Harbor 下载了任务，但 Docker 从配置的 USTC registry mirror 拉取 `alexgshaw/make-mips-interpreter:20251031` 时返回 EOF，容器未启动，verifier 未执行。因此尚无有效 Oracle reward，也未运行 MiniClaude 的真实 Provider smoke。Windows GBK 控制台随后在输出错误堆栈时发生编码异常；它不是任务失败的根因。
+
+### Decision / Limitation
+
+本阶段仅提交并推送可确定性验证的 feature branch。正式集成前须恢复 Docker 镜像拉取并通过 Oracle 与 MiniClaude 单任务 smoke。当前结果不能证明 Harbor 端到端接入已成功，更不能说明 MiniClaude 的 Terminal-Bench 能力。原生 Trace 中的部分文件重读指标在此基线尚不存在，不能当作已采集指标。

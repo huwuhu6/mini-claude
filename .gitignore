@@ -15,6 +15,7 @@ s_full.py
 task_list.md
 /example
 /logs
+/benchmark/harbor/jobs/
 # Keep task fixtures versioned; generated evaluation results remain ignored.
 /sandbox/*
 !/sandbox/tasks/

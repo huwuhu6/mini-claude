@@ -46,6 +46,8 @@ mini-claude [path] [-y|--yes]
 - `eval_runner.py`：基于 `sandbox/tasks/` 的隔离评测运行器
 - `compare_reports.py`：比较历史评测 trace 并生成报告
 
+通过 Harbor 运行 Terminal-Bench 2.0 的安装与小规模 smoke 流程见 [Harbor 集成说明](docs/evaluation/harbor.md)。
+
 这些模块的成熟度不完全相同。CLI、runtime context、工具循环、trace 和评测代码属于当前主线；队友、后台任务、skills 和部分历史兼容逻辑更适合视为实验性或扩展模块。
 
 ## 快速开始
