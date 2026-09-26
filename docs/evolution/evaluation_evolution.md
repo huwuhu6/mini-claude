@@ -697,3 +697,9 @@ Terminal-Bench 2.0 Oracle 仅尝试了 1 个 task：`terminal-bench/make-mips-in
 ### Decision / Limitation
 
 本阶段仅提交并推送可确定性验证的 feature branch。正式集成前须恢复 Docker 镜像拉取并通过 Oracle 与 MiniClaude 单任务 smoke。当前结果不能证明 Harbor 端到端接入已成功，更不能说明 MiniClaude 的 Terminal-Bench 能力。原生 Trace 中的部分文件重读指标在此基线尚不存在，不能当作已采集指标。
+
+### 同日环境复核
+
+Docker daemon 版本 `29.2.0` 一直正常运行。Host 的 Clash `127.0.0.1:7890` 可连，Docker Hub 经代理返回正常的 HTTP 401 认证挑战；USTC mirror 经代理访问仍中断。将同一镜像以明确的 `registry-1.docker.io` 地址拉取后，本地加上任务预期镜像名，不修改全局 Docker 设置。重跑同一个 `terminal-bench/make-mips-interpreter` Oracle task：1 trial、0 exception、reward `1.0`，耗时约 1 分 45 秒。前述“Oracle 未通过”结论因此只适用于首次网络失败的 trial，Harbor/Docker/verifier 链路已由后一次结果证明可用。
+
+MiniClaude 真实 smoke 在启动前被自动审批拦截：已有的对外发送授权只覆盖旧的 `task_036` qualification，未覆盖这次 Terminal-Bench 指令及容器工作区发送到 DashScope。未发起 Provider 请求，也没有 MiniClaude trial/reward。获得该具体数据范围的授权前不运行 MiniClaude 或 3-task smoke，也不将 feature branch 合并进基线分支。
