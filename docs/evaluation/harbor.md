@@ -16,6 +16,8 @@ Harbor host Python 与容器 Python 是两个环境。适配器从当前 checkou
 
 默认配置使用 DashScope `deepseek-v4-flash-0731`。在 Harbor 进程的环境中设置 `DASHSCOPE_API_KEY`；适配器通过 Harbor 的 agent 阶段环境传给容器，不把密钥写入命令、配置、fixture 或 Trace。不要把密钥放到仓库文件或评测命令参数中。Harbor 官方的 agent 环境变量文档解释了各阶段的隔离边界。
 
+自定义 Agent 模块位于仓库根目录的 `benchmark/`，Harbor 进程必须能导入它。在仓库根目录运行时，PowerShell 先执行 `$env:PYTHONPATH = (Get-Location).Path`；Linux/macOS 使用 `export PYTHONPATH="$(pwd)"`。这仅设置 Harbor 宿主进程的模块搜索路径，不挂载主工作区到任务容器。
+
 ## 逐级 smoke
 
 先用 Oracle 验证 Harbor、Docker、Terminal-Bench 2.0 下载与 verifier 链路，仅跑一个任务：

@@ -703,3 +703,20 @@ Terminal-Bench 2.0 Oracle 仅尝试了 1 个 task：`terminal-bench/make-mips-in
 Docker daemon 版本 `29.2.0` 一直正常运行。Host 的 Clash `127.0.0.1:7890` 可连，Docker Hub 经代理返回正常的 HTTP 401 认证挑战；USTC mirror 经代理访问仍中断。将同一镜像以明确的 `registry-1.docker.io` 地址拉取后，本地加上任务预期镜像名，不修改全局 Docker 设置。重跑同一个 `terminal-bench/make-mips-interpreter` Oracle task：1 trial、0 exception、reward `1.0`，耗时约 1 分 45 秒。前述“Oracle 未通过”结论因此只适用于首次网络失败的 trial，Harbor/Docker/verifier 链路已由后一次结果证明可用。
 
 MiniClaude 真实 smoke 在启动前被自动审批拦截：已有的对外发送授权只覆盖旧的 `task_036` qualification，未覆盖这次 Terminal-Bench 指令及容器工作区发送到 DashScope。未发起 Provider 请求，也没有 MiniClaude trial/reward。获得该具体数据范围的授权前不运行 MiniClaude 或 3-task smoke，也不将 feature branch 合并进基线分支。
+
+## 2026-09-27：Harbor 单任务真实 smoke
+
+Commit: `4a754f4`
+Commit Description: `feat(eval): 接入 Harbor 自定义 Agent 适配器`
+
+### Description
+
+获得对 `terminal-bench/make-mips-interpreter` 的明确授权后，仅运行一次 MiniClaude smoke。Harbor 宿主进程需要将仓库根目录加入 `PYTHONPATH` 才能导入位于 `benchmark/` 的适配器；首次命令在创建 trial 前因未设置该路径失败，没有发送 Provider 请求。修正启动环境后，同一任务完成了一个 trial，未修改 Agent、适配器、任务或生产配置。
+
+### Result / Evidence
+
+Harbor 安装了 MiniClaude wheel，在容器 `/app` 启动 headless Agent，执行 verifier 并保存原生 Trace。运行过程中完成 3 次 DashScope 响应、6 次工具调用（5 次 `bash`、1 次 `list_files`），累计 Provider 报告 prompt `13,527`、completion `512`、total `14,039` tokens。第 4 次模型请求在现有 20 秒请求超时后终止；Agent `final_status=FAILED`，Harbor 0 exception、reward `0.0`，trial 约 2 分 7 秒。Verifier 未通过，但运行未能完成，不能据此判断模型在该任务上的正常完成能力。Harbor 未提供美元成本，不能从 token 数推称已知费用。结果和 trace 保存在被 Git 忽略的 `benchmark/harbor/jobs/mini-claude-smoke/`。
+
+### Decision / Limitation
+
+这次验证了 adapter/容器/workspace/工具/verifier/trace 链路，但未验证 Agent 正常结束的端到端流程。按单任务止损要求，不追加试验，不运行 3-task smoke，不因任务 reward 调整 Agent。由于真实任务因 Provider 超时而失败，暂不合并至 `refactor/context-baseline-modernization`；下一步需要单独授权并解决请求超时或网络稳定性，随后再按既定门槛复核。
