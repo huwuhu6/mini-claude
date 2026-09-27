@@ -720,3 +720,20 @@ Harbor 安装了 MiniClaude wheel，在容器 `/app` 启动 headless Agent，执
 ### Decision / Limitation
 
 这次验证了 adapter/容器/workspace/工具/verifier/trace 链路，但未验证 Agent 正常结束的端到端流程。按单任务止损要求，不追加试验，不运行 3-task smoke，不因任务 reward 调整 Agent。由于真实任务因 Provider 超时而失败，暂不合并至 `refactor/context-baseline-modernization`；下一步需要单独授权并解决请求超时或网络稳定性，随后再按既定门槛复核。
+
+## 2026-09-27：Provider 超时修复与 Harbor 单任务复核
+
+Commit: `6c87d1e`
+Commit Description: `fix(provider): 延长请求超时并重试瞬时失败`
+
+### Description
+
+前次单任务 smoke 的异常链是 `APITimeoutError → ReadTimeout`。生产配置将每次模型请求限制为 20 秒，OpenAI-compatible 客户端又显式关闭重试，因此一次读取响应超时就让整个 Agent 任务进入 `FAILED`。诊断分类只匹配异常消息中的 `timeout`，未识别 `Request timed out.`，还将超时误报为普通 `PROVIDER_ERROR`。本次将默认等待设为 60 秒，允许客户端对暂时性失败最多重试一次，并修正超时分类；没有改变 Agent Loop、Benchmark Case 或 verifier。
+
+### Result / Evidence
+
+Provider/Context 相关测试 `19 passed`；扩展至 Headless、Harbor、CLI、RuntimeContext 等回归 `146 passed, 1 skipped`，`git diff --check` 通过。按授权仅重跑同一个 `terminal-bench/make-mips-interpreter` 的一个 trial：Harbor 0 exception、reward `0.0`，总耗时约 2 分 44 秒。MiniClaude 在 `/app` 执行了 17 轮、27 次工具调用，Provider 报告 prompt `168,126`、completion `4,195`、total `172,321` tokens（其中 cached `147,456`）。没有 Provider/runtime 异常；最终状态为 `CIRCUIT_BROKEN`，原因是 Agent 自身的 repeated-intent loop guard 在 replan 后作出 `HARD_STOP`。Verifier 未通过。Trace 和 verifier 结果保存在被 Git 忽略的 `benchmark/harbor/jobs/mini-claude-smoke-retry/`。
+
+### Decision / Limitation
+
+第二次任务从指令传入、容器工具执行到 Agent 自身的受控终止、Harbor verifier 与 Trace 导出均走完，没有适配器或环境异常，因而满足集成链路验收；`CIRCUIT_BROKEN` 不是任务成功，不能将 reward 0 解释成 Harbor 故障，也不能据此声称 Agent Benchmark 能力达标。按既定范围不追加 trial、不修改 Anti-Loop 或任务以追求通过率。默认 60 秒和一次重试只是可靠性修复，尚未通过批量实验证明最优。
