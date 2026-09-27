@@ -17,7 +17,7 @@ class LLMConfig:
     temperature: float = 0.0
     api_key: str = ""
     base_url: str = ""
-    timeout_ms: int = 20000
+    timeout_ms: int = 60000
 
 
 @dataclass

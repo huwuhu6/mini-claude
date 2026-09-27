@@ -9,7 +9,7 @@ llm:
   model: "deepseek-v4-flash-0731"
   max_tokens: 8000
   temperature: 0.7
-  timeout_ms: 20000
+  timeout_ms: 60000
 
   # Deepseek configuration
   deepseek:
