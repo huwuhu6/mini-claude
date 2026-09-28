@@ -1,0 +1,4 @@
+service=catalog
+region=cn-hangzhou
+port=8088
+retry_limit=3

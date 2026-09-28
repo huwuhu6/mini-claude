@@ -1,0 +1,2 @@
+SCOPE = "regional"
+MINIMUM_APPROVERS = 2

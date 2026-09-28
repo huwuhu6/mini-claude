@@ -1,0 +1,17 @@
+llm:
+  provider: "dashscope"
+  model: "deepseek-v4-flash-0731"
+  max_tokens: 8000
+  temperature: 0.7
+  timeout_ms: 20000
+  dashscope:
+    api_key: "${DASHSCOPE_API_KEY}"
+    base_url: "https://dashscope.aliyuncs.com/compatible-mode/v1"
+features:
+  compression: true
+  memory: true
+compression:
+  context_window_tokens: 1000000
+  microcompact_token_threshold: 1000
+  full_compression_token_threshold: 2000
+  max_transcripts: 100

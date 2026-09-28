@@ -1,0 +1,2 @@
+NAME = "mailer"
+OWNER = "operations"

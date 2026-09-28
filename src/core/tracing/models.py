@@ -71,6 +71,10 @@ class ToolTrace:
     changed_paths: List[str] = field(default_factory=list)
     evidence_ids: List[str] = field(default_factory=list)
     governance_evidence_ids: List[str] = field(default_factory=list)
+    file_read_path: str = ""
+    file_read_start_line: int = 0
+    file_read_end_line: int = 0
+    file_read_freshness: str = ""
 
     def to_dict(self) -> Dict[str, Any]:
         return {
@@ -120,6 +124,10 @@ class ToolTrace:
             'changed_paths': list(self.changed_paths),
             'evidence_ids': list(self.evidence_ids),
             'governance_evidence_ids': list(self.governance_evidence_ids),
+            'file_read_path': self.file_read_path,
+            'file_read_start_line': self.file_read_start_line,
+            'file_read_end_line': self.file_read_end_line,
+            'file_read_freshness': self.file_read_freshness,
         }
 
 
@@ -151,6 +159,10 @@ class TurnTrace:
     token_usage: int = 0
     assistant_content: str = ""
     compression_triggered: bool = False
+    compression_type: str = "none"
+    compression_message_count_before: int = 0
+    compression_message_count_after: int = 0
+    retained_read_file_results: int = 0
     reflection_triggered: bool = False
     completion_guard_triggered: bool = False
     tools: List[ToolTrace] = field(default_factory=list)
@@ -182,6 +194,10 @@ class TurnTrace:
             'token_usage': self.token_usage,
             'assistant_content': self.assistant_content,
             'compression_triggered': self.compression_triggered,
+            'compression_type': self.compression_type,
+            'compression_message_count_before': self.compression_message_count_before,
+            'compression_message_count_after': self.compression_message_count_after,
+            'retained_read_file_results': self.retained_read_file_results,
             'reflection_triggered': self.reflection_triggered,
             'completion_guard_triggered': self.completion_guard_triggered,
             'tools': [t.to_dict() for t in self.tools],
@@ -196,6 +212,9 @@ class TaskTrace:
     finished_at: float = 0.0
     total_turns: int = 0
     total_tool_calls: int = 0
+    read_file_count: int = 0
+    redundant_read_count: int = 0
+    redundant_read_ratio: float = 0.0
     estimated_prompt_tokens: int = 0
     actual_prompt_tokens: int = 0
     main_prompt_tokens: int = 0
@@ -235,6 +254,7 @@ class TaskTrace:
     governance_evidence_ids: List[str] = field(default_factory=list)
     open_blocker_count: int = 0
     environment: Dict[str, Any] = field(default_factory=dict)
+    effective_config: Dict[str, Any] = field(default_factory=dict)
     attempt_events: List[Dict[str, Any]] = field(default_factory=list)
     turns: List[TurnTrace] = field(default_factory=list)
 
@@ -245,6 +265,9 @@ class TaskTrace:
             'finished_at': round(self.finished_at, 3),
             'total_turns': self.total_turns,
             'total_tool_calls': self.total_tool_calls,
+            'read_file_count': self.read_file_count,
+            'redundant_read_count': self.redundant_read_count,
+            'redundant_read_ratio': self.redundant_read_ratio,
             'estimated_prompt_tokens': self.estimated_prompt_tokens,
             'actual_prompt_tokens': self.actual_prompt_tokens,
             'main_prompt_tokens': self.main_prompt_tokens,
@@ -284,6 +307,7 @@ class TaskTrace:
             'governance_evidence_ids': list(self.governance_evidence_ids),
             'open_blocker_count': self.open_blocker_count,
             'environment': dict(self.environment),
+            'effective_config': dict(self.effective_config),
             'attempt_events': [dict(event) for event in self.attempt_events],
             'turns': [t.to_dict() for t in self.turns],
         }

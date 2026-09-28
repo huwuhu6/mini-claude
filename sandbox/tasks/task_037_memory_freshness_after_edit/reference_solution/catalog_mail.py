@@ -1,0 +1,2 @@
+CATALOG = "mail"
+OWNER = "operations"

@@ -3,6 +3,7 @@ Mini Claude Agent - Unified agent integrating all systems.
 """
 from __future__ import annotations
 import logging
+import hashlib
 import os
 import sys
 import json
@@ -24,7 +25,7 @@ _src_path = str(_project_root / 'src')
 if _src_path not in sys.path:
     sys.path.insert(0, _src_path)
 
-from models.config import ConfigManager, Config
+from models.config import ConfigManager, Config, apply_runtime_overrides
 from models.task import Task, TaskManager, TaskStatus
 from models.teammate import Teammate, TeammateStatus, TeammateRole
 from models.todo import TodoManager
@@ -40,6 +41,7 @@ from core.background import BackgroundProcessor, BackgroundTaskStatus
 from core.subagent import SubAgentManager, SubAgentType, SubAgentResult
 from core.console import ConsoleCommandSystem, Command
 from core.compression import Compressor
+from core.context_memory import StructuredContextMemory
 from core.loop_guard import canonicalize_args
 from core.loop_controller import (
     AttemptHistory, AttemptStatus, CommandNormalizer, RuntimeDecision,
@@ -107,7 +109,8 @@ class MiniClaudeAgent:
                  workspace_root: Optional[Path] = None,
                  workdir: Optional[Path] = None,
                  workspace_confirmed: bool = False,
-                 runtime_data_root: Optional[Path] = None):
+                 runtime_data_root: Optional[Path] = None,
+                 config_overrides: Optional[Dict[str, Any]] = None):
         self._ui_event_handler: Optional[Callable[[str, Dict[str, Any]], None]] = None
         self._last_assistant_note: Optional[str] = None
         # ── Resolve workspace root (explicit > legacy > cwd fallback) ──
@@ -124,6 +127,7 @@ class MiniClaudeAgent:
         # Config must be loaded first (used by _setup_logging)
         self.config_manager = ConfigManager(config_path)
         self.config = self.config_manager.get_config()
+        apply_runtime_overrides(self.config, config_overrides)
         # Probe before session subsystems start so the system prompt and audit
         # record share the same bounded environment facts.
         self.preflight = run_preflight(self.workdir)
@@ -158,6 +162,10 @@ class MiniClaudeAgent:
             shell_session=self.runtime_context.shell_session,
         )
         self.command_policy = CommandPolicy()
+        # Structured file memory is deliberately separate from durable
+        # conversation history.  The feature flag controls all reads/writes.
+        self.memory = StructuredContextMemory()
+        self._memory_file_fingerprints: Dict[str, tuple[tuple[int, int], str]] = {}
 
         # Tool dispatcher — dict-based routing bound once at init (s_full.py TOOL_HANDLERS pattern)
         self.tool_dispatcher = {
@@ -322,6 +330,10 @@ class MiniClaudeAgent:
         self.feature_manager.register_feature(FeatureDefinition(
             name='compression', description='Context compression',
             category='core', enabled=features_config.compression,
+        ))
+        self.feature_manager.register_feature(FeatureDefinition(
+            name='memory', description='Transient structured file memory',
+            category='core', enabled=features_config.memory,
         ))
         self.feature_manager.register_feature(FeatureDefinition(
             name='background', description='Background command execution',
@@ -1376,6 +1388,109 @@ class MiniClaudeAgent:
         return False
 
     @staticmethod
+    def _read_file_result_range(result_text: str) -> Optional[tuple[int, int, int]]:
+        """Extract the actual bounded range returned by ``read_file``."""
+        match = re.search(
+            r"^--- FILE: .+? \(LINES: (\d+)-(\d+) of (\d+)\) ---$",
+            result_text,
+            re.MULTILINE,
+        )
+        if not match:
+            return None
+        return tuple(int(value) for value in match.groups())
+
+    def _canonical_workspace_file(self, path: str) -> tuple[str, Path]:
+        """Authorize a file path and give Memory/Trace one workspace-relative identity."""
+        file_path = self.tools.safe_path(path)
+        workspace_root = getattr(self, "workdir", self.tools.workdir).resolve()
+        try:
+            canonical = file_path.relative_to(workspace_root).as_posix()
+        except ValueError as exc:
+            raise ValueError(f"Memory path must be inside the primary workspace: {path}") from exc
+        return canonical, file_path
+
+    def _file_freshness(self, path: str) -> Optional[str]:
+        """Return a content hash, avoiding re-reads while file metadata is unchanged."""
+        try:
+            canonical_path, file_path = self._canonical_workspace_file(path)
+            if not file_path.is_file():
+                getattr(self, "_memory_file_fingerprints", {}).pop(canonical_path, None)
+                return None
+            stat = file_path.stat()
+            metadata = (stat.st_size, stat.st_mtime_ns)
+            fingerprints = getattr(self, "_memory_file_fingerprints", None)
+            if fingerprints is None:
+                fingerprints = {}
+                self._memory_file_fingerprints = fingerprints
+            cached = fingerprints.get(canonical_path)
+            if cached is not None and cached[0] == metadata:
+                return cached[1]
+            digest = hashlib.sha256()
+            with file_path.open("rb") as handle:
+                for chunk in iter(lambda: handle.read(64 * 1024), b""):
+                    digest.update(chunk)
+            freshness = digest.hexdigest()
+            fingerprints[canonical_path] = (metadata, freshness)
+            return freshness
+        except (OSError, ValueError) as exc:
+            logger.debug("Unable to refresh structured memory for %s: %s", path, exc)
+            return None
+
+    @staticmethod
+    def _read_file_observation(result_text: str, start_line: int, end_line: int, total_lines: int) -> str:
+        """Create a bounded factual note without asking an LLM to summarize."""
+        body = result_text.split("---", 2)[-1]
+        body = body.split("--- END FILE:", 1)[0]
+        preview = " ".join(body.split())[:160]
+        return f"Read lines {start_line}-{end_line} of {total_lines}: {preview}"
+
+    def _refresh_structured_memory_freshness(self) -> None:
+        """Drop stale observations before they are transiently shown to the model."""
+        for path in self.memory.recent_files:
+            freshness = self._file_freshness(path)
+            if freshness is None:
+                self.memory.invalidate(path)
+            else:
+                self.memory.refresh_freshness(path, freshness)
+
+    def _update_structured_memory(
+        self,
+        tool_name: str,
+        args: Dict[str, Any],
+        tool_result: ToolResult,
+        success: bool,
+    ) -> None:
+        """Single post-tool hook for the first file-memory integration."""
+        if not success or not self.feature_manager.is_enabled("memory"):
+            return
+        path = args.get("path")
+        if not isinstance(path, str) or not path.strip():
+            return
+        try:
+            canonical_path, _ = self._canonical_workspace_file(path)
+            if tool_name == "read_file":
+                read_range = self._read_file_result_range(tool_result.content)
+                freshness = self._file_freshness(canonical_path)
+                if read_range is None or freshness is None:
+                    return
+                start_line, end_line, total_lines = read_range
+                self.memory.remember_file(canonical_path, freshness)
+                self.memory.record_observation(
+                    canonical_path,
+                    start_line,
+                    end_line,
+                    self._read_file_observation(
+                        tool_result.content, start_line, end_line, total_lines,
+                    ),
+                    freshness,
+                )
+            elif tool_name in {"write_file", "edit_file"}:
+                self.memory.remember_file(canonical_path, self._file_freshness(canonical_path))
+                self.memory.invalidate(canonical_path)
+        except (OSError, ValueError) as exc:
+            logger.debug("Structured memory update skipped for %s: %s", tool_name, exc)
+
+    @staticmethod
     def _empty_usage_metrics() -> Dict[str, Any]:
         return {
             "turns": 0,
@@ -1492,24 +1607,55 @@ class MiniClaudeAgent:
         Returns:
             True if compression (full or micro) was actually triggered.
         """
+        before_count = len(self.messages)
+        compression_type = "none"
         if self.feature_manager.is_enabled('compression'):
             before = copy.deepcopy(self.messages)
             if self.compressor.should_compress(
                 self.messages, estimated_prompt_tokens=estimated_prompt_tokens,
             ):
                 logger.info("触发自动压缩")
+                compression_type = "full"
                 self.messages = self.compressor.compress(self.messages)
             elif self.compressor.should_microcompact(
                 self.messages, estimated_prompt_tokens=estimated_prompt_tokens,
             ):
                 logger.info("触发微压缩")
+                compression_type = "micro"
                 self.messages = self.compressor.microcompact(self.messages)
             changed = self.messages != before
             summary_usage = self.compressor.consume_last_summary_usage()
             if summary_usage is not None:
                 self._record_provider_usage(summary_usage, source="summary")
+            self._last_compression_observation = {
+                "compression_type": compression_type if changed else "none",
+                "before": before_count,
+                "after": len(self.messages),
+                "retained_read_file_results": self._retained_read_file_result_count(),
+            }
             return changed
+        self._last_compression_observation = {
+            "compression_type": "none",
+            "before": before_count,
+            "after": len(self.messages),
+            "retained_read_file_results": self._retained_read_file_result_count(),
+        }
         return False
+
+    def _retained_read_file_result_count(self) -> int:
+        """Count read_file results still represented in durable history."""
+        read_call_ids = set()
+        for message in self.messages:
+            for tool_call in message.tool_calls or []:
+                function = tool_call.get("function", {}) if isinstance(tool_call, dict) else {}
+                if isinstance(function, dict) and function.get("name") == "read_file":
+                    call_id = tool_call.get("id")
+                    if call_id:
+                        read_call_ids.add(call_id)
+        return sum(
+            1 for message in self.messages
+            if message.role == "tool" and message.tool_call_id in read_call_ids
+        )
 
     def _drain_background_notifications(self) -> Optional[str]:
         """Drain background task notifications and return as formatted string.
@@ -1579,7 +1725,14 @@ class MiniClaudeAgent:
         if inbox_text:
             parts.append(f"<inbox>\n{inbox_text}\n</inbox>")
 
-        # 4. Nag reminder (soft prompt, not persisted)
+        # 4. Structured file memory (transient; never appended to messages).
+        if self.feature_manager.is_enabled("memory"):
+            self._refresh_structured_memory_freshness()
+            memory_text = self.memory.render()
+            if memory_text:
+                parts.append(f"<structured-file-memory>\n{memory_text}\n</structured-file-memory>")
+
+        # 5. Nag reminder (soft prompt, not persisted)
         if self.todo.has_open_items() and rounds_without_todo >= 3:
             parts.append("<nag>Consider updating your todos.</nag>")
 
@@ -1617,6 +1770,16 @@ class MiniClaudeAgent:
             workspace_confirmed=self._workspace_confirmed,
             require_tool_call=require_tool_call,
             environment=self.preflight.to_dict(),
+            effective_config={
+                "provider": self.config.llm.provider,
+                "model": self.config.llm.model,
+                "context_window_tokens": self.config.compression.context_window_tokens,
+                "microcompact_token_threshold": self.config.compression.microcompact_token_threshold,
+                "full_compression_token_threshold": self.config.compression.full_compression_token_threshold,
+                "memory": self.config.features.memory,
+                "max_tokens": self.config.llm.max_tokens,
+                "temperature": self.config.llm.temperature,
+            },
         )
         self.runtime_context.current_task_id = tid
         self.runtime_policy.reset()
@@ -1646,7 +1809,17 @@ class MiniClaudeAgent:
                     system_prompt=self.system_prompt,
                     tools=tools,
                 )
-                if self._check_auto_compress(estimated_prompt_tokens):
+                changed = self._check_auto_compress(estimated_prompt_tokens)
+                compression_observation = getattr(
+                    self, "_last_compression_observation", {
+                        "compression_type": "none",
+                        "before": len(self.messages),
+                        "after": len(self.messages),
+                        "retained_read_file_results": 0,
+                    },
+                )
+                self.trace.record_compression_observation(**compression_observation)
+                if changed:
                     self.trace.record_compression()
 
                 # ── Safety net: normalize tool chains before API call ──
@@ -2076,6 +2249,9 @@ class MiniClaudeAgent:
                         and not state_guard_blocked
                         and bool(tool_result.execution_success)
                     )
+                    self._update_structured_memory(
+                        tname, args, tool_result, t_success,
+                    )
                     self.trace.record_tool_call(
                         tool_name=tname, args_hash=args_hash,
                         success=t_success,
@@ -2104,6 +2280,21 @@ class MiniClaudeAgent:
                         workspace_root=str(self.runtime_context.workspace_root),
                         session_id=self.runtime_context.shell_session.session_id,
                     )
+                    if t_success and tname == "read_file":
+                        read_range = self._read_file_result_range(result_text)
+                        read_path = args.get("path", "")
+                        try:
+                            canonical_path, _ = self._canonical_workspace_file(read_path)
+                        except (TypeError, ValueError):
+                            canonical_path = ""
+                        freshness = self._file_freshness(canonical_path) if canonical_path else None
+                        if read_range is not None and freshness is not None:
+                            self.trace.record_file_read(
+                                canonical_path,
+                                read_range[0],
+                                read_range[1],
+                                freshness,
+                            )
 
                     # Progress-aware evidence is computed after the existing
                     # guards and Failure Intelligence have classified the call.
@@ -2296,6 +2487,7 @@ class MiniClaudeAgent:
         lines.append(f"  功能: subagent={self.config.features.subagent}, "
                       f"tasks={self.config.features.tasks}, "
                       f"compression={self.config.features.compression}, "
+                      f"memory={self.config.features.memory}, "
                       f"background={self.config.features.background}, "
                       f"team={self.config.features.team}, "
                       f"skills={self.config.features.skills}")

@@ -1,0 +1,2 @@
+CHANNEL = "canary"
+ROLLBACK_LIMIT = 2

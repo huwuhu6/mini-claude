@@ -27,6 +27,7 @@ from core.tools.base_tools import (
     TOOL_OUTPUT_MAX_CHARS,
     BaseTools,
 )
+from models.config import Config
 from providers.base import Message
 from providers.deepseek import DeepseekProvider
 
@@ -192,9 +193,9 @@ def test_provider_parse_failure_enters_agent_failed_path_before_append():
     agent._emit_ui_event = lambda *args, **kwargs: None
     agent._current_user_prompt = "task"
     agent._workspace_confirmed = False
-    agent.config = types.SimpleNamespace(
-        llm=types.SimpleNamespace(max_tokens=10, temperature=0),
-    )
+    agent.config = Config()
+    agent.config.llm.max_tokens = 10
+    agent.config.llm.temperature = 0
     agent.messages = [Message(role="user", content="task")]
     agent.runtime_context = types.SimpleNamespace(
         current_task_id=None,
