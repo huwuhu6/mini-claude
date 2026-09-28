@@ -69,9 +69,9 @@ class TerminalUI:
         print(text, file=self.stream)
 
     def handle_event(self, event: str, data: dict[str, Any]) -> None:
-        if event == "thinking":
+        if event in {"model_request_started", "thinking"}:
             iteration = data.get("iteration", 0)
-            self._write(self._paint(f"  · 分析中 · 第 {iteration} 轮", self._DIM))
+            self._write(self._paint(f"  · 请求模型 · 第 {iteration} 轮", self._DIM))
         elif event == "assistant_note":
             text = str(data.get("text", "")).strip()
             if text:

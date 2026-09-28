@@ -7,8 +7,8 @@ import logging
 import time
 import uuid
 from pathlib import Path
-from typing import Optional, List, TYPE_CHECKING
-from dataclasses import dataclass
+from typing import Optional, List, TYPE_CHECKING, Any, Dict
+from dataclasses import dataclass, field
 
 from core.runtime_context.command_policy import CommandPolicy
 from cli.authority import WorkspaceAuthority
@@ -69,6 +69,7 @@ class ToolResult:
     timed_out: bool = False
     cancelled: bool = False
     segment_exit_codes: Optional[List[int]] = None
+    output_visibility: Dict[str, Any] = field(default_factory=dict)
 
     def __post_init__(self) -> None:
         if self.execution_success is None:
@@ -220,12 +221,13 @@ class BaseTools:
         result = self.shell_session.execute(
             command, timeout=timeout, cwd_override=cwd_override,
         )
+        formatted, visibility = self._format_tool_output_with_visibility(
+            result["content"],
+            success=result["success"],
+            exit_code=result.get("exit_code"),
+        )
         return ToolResult(
-            content=self.format_tool_output(
-                result["content"],
-                success=result["success"],
-                exit_code=result.get("exit_code"),
-            ),
+            content=formatted,
             success=result["success"],
             execution_success=result.get("execution_success", result["success"]),
             exit_code=result.get("exit_code"),
@@ -234,19 +236,35 @@ class BaseTools:
             timed_out=result.get("timed_out", False),
             cancelled=result.get("cancelled", False),
             segment_exit_codes=list(result.get("segment_exit_codes", [])),
+            output_visibility=visibility,
         )
 
     def format_tool_output(self, content: str, success: bool = True,
                            exit_code: Optional[int] = None) -> str:
         """Persist oversized tool output and return a bounded inspection window."""
+        formatted, _ = self._format_tool_output_with_visibility(content, success, exit_code)
+        return formatted
+
+    def _format_tool_output_with_visibility(
+        self, content: str, success: bool = True,
+        exit_code: Optional[int] = None,
+    ) -> tuple[str, Dict[str, Any]]:
+        """Return the model-visible text and non-content visibility metadata."""
         output = content
         if content.startswith("[Exit Code: ") and "\n" in content:
             output = content.split("\n", 1)[1]
         lines = output.splitlines()
         total_lines = len(lines)
         total_chars = len(output)
-        if total_lines <= 40 and total_chars <= 2000:
-            return content
+        if total_lines <= READ_FILE_MAX_LINES and total_chars <= TOOL_OUTPUT_PREVIEW_CHARS:
+            return content, {
+                "truncated": False,
+                "original_lines": total_lines,
+                "original_chars": total_chars,
+                "visible_chars": total_chars,
+                "selected_line_ranges": [[1, total_lines]] if total_lines else [],
+                "saved_path": "",
+            }
 
         logs_dir = self.workdir.resolve() / ".agent" / "logs"
         log_name = f"cmd_{time.strftime('%Y%m%d_%H%M%S')}_{uuid.uuid4().hex[:8]}.log"
@@ -283,10 +301,24 @@ class BaseTools:
             "[Tip]: Use `search_code` or `read_file` with line ranges on the saved "
             "log file to inspect specific errors or sections."
         )
-        return _bound_tool_output(
+        bounded = _bound_tool_output(
             formatted,
             "⚠️ 工具输出预览达到硬上限，已进一步截断；请使用保存的日志路径分段读取。",
         )
+        head_end = min(10, total_lines)
+        tail_start = max(1, total_lines - 19)
+        selected_ranges = (
+            [[1, total_lines]] if tail_start <= head_end + 1
+            else [[1, head_end], [tail_start, total_lines]]
+        )
+        return bounded, {
+            "truncated": True,
+            "original_lines": total_lines,
+            "original_chars": total_chars,
+            "visible_chars": len(head) + len(tail),
+            "selected_line_ranges": selected_ranges,
+            "saved_path": saved_path if not saved_path.startswith("<failed:") else "",
+        }
 
     @staticmethod
     def _read_file_window(file_path: Path, encoding: str,

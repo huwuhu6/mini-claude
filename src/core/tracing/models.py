@@ -42,6 +42,7 @@ class ToolTrace:
     guard_reason: str = ""
     error_message: str = ""
     result_preview: str = ""
+    output_visibility: Dict[str, Any] = field(default_factory=dict)
     # Failure Intelligence fields
     failure_category: str = ""
     recoverability: str = ""
@@ -57,6 +58,7 @@ class ToolTrace:
     intent_key: str = ""
     observation_fingerprint: str = ""
     semantic_state: str = ""
+    observation_changed: bool = False
     progress_detected: bool = False
     progress_reason: List[str] = field(default_factory=list)
     stagnation_reason: List[str] = field(default_factory=list)
@@ -73,7 +75,7 @@ class ToolTrace:
     governance_evidence_ids: List[str] = field(default_factory=list)
 
     def to_dict(self) -> Dict[str, Any]:
-        return {
+        data = {
             'tool_name': self.tool_name,
             'args_hash': self.args_hash,
             'started_at': round(self.started_at, 3),
@@ -106,6 +108,7 @@ class ToolTrace:
             'intent_key': self.intent_key,
             'observation_fingerprint': self.observation_fingerprint,
             'semantic_state': self.semantic_state,
+            'observation_changed': self.observation_changed,
             'progress_detected': self.progress_detected,
             'progress_reason': list(self.progress_reason),
             'stagnation_reason': list(self.stagnation_reason),
@@ -121,6 +124,9 @@ class ToolTrace:
             'evidence_ids': list(self.evidence_ids),
             'governance_evidence_ids': list(self.governance_evidence_ids),
         }
+        if self.output_visibility:
+            data['output_visibility'] = dict(self.output_visibility)
+        return data
 
 
 @dataclass
@@ -150,13 +156,17 @@ class TurnTrace:
     summary_cache_hit_rate: float = 0.0
     token_usage: int = 0
     assistant_content: str = ""
+    provider_finish_reason: str = ""
+    reasoning_content_chars: Optional[int] = None
+    main_reasoning_tokens: Optional[int] = None
+    summary_reasoning_tokens: Optional[int] = None
     compression_triggered: bool = False
     reflection_triggered: bool = False
     completion_guard_triggered: bool = False
     tools: List[ToolTrace] = field(default_factory=list)
 
     def to_dict(self) -> Dict[str, Any]:
-        return {
+        data = {
             'iteration': self.iteration,
             'started_at': round(self.started_at, 3),
             'finished_at': round(self.finished_at, 3),
@@ -186,6 +196,15 @@ class TurnTrace:
             'completion_guard_triggered': self.completion_guard_triggered,
             'tools': [t.to_dict() for t in self.tools],
         }
+        if self.provider_finish_reason:
+            data['provider_finish_reason'] = self.provider_finish_reason
+        if self.reasoning_content_chars is not None:
+            data['reasoning_content_chars'] = self.reasoning_content_chars
+        if self.main_reasoning_tokens is not None:
+            data['main_reasoning_tokens'] = self.main_reasoning_tokens
+        if self.summary_reasoning_tokens is not None:
+            data['summary_reasoning_tokens'] = self.summary_reasoning_tokens
+        return data
 
 
 @dataclass
@@ -235,6 +254,7 @@ class TaskTrace:
     governance_evidence_ids: List[str] = field(default_factory=list)
     open_blocker_count: int = 0
     environment: Dict[str, Any] = field(default_factory=dict)
+    request_config: Dict[str, Any] = field(default_factory=dict)
     attempt_events: List[Dict[str, Any]] = field(default_factory=list)
     turns: List[TurnTrace] = field(default_factory=list)
 
@@ -284,6 +304,7 @@ class TaskTrace:
             'governance_evidence_ids': list(self.governance_evidence_ids),
             'open_blocker_count': self.open_blocker_count,
             'environment': dict(self.environment),
+            'request_config': dict(self.request_config),
             'attempt_events': [dict(event) for event in self.attempt_events],
             'turns': [t.to_dict() for t in self.turns],
         }

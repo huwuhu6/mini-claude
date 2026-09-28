@@ -11,10 +11,12 @@ Without persistent shell session: ~34 turns with repeated cd, cwd loss.
 With persistent shell session: <= 12 turns, no repeated cd needed.
 """
 from __future__ import annotations
+import json
 import sys
 import tempfile
 import time
 from pathlib import Path
+from types import SimpleNamespace
 
 # ── Ensure src is importable ─────────────────────────────────────
 _PROJECT_ROOT = Path(__file__).resolve().parent.parent.parent
@@ -29,7 +31,7 @@ from core.runtime_context import (
 )
 from core.runtime_context.preflight import _version_command
 from core.background import BackgroundProcessor, BackgroundTaskStatus
-from core.tools.base_tools import BaseTools
+from core.tools.base_tools import BaseTools, ToolResult
 from core.tracing import ToolTrace, TaskTrace, TraceManager
 from agent.mini_claude_agent import MiniClaudeAgent
 
@@ -209,7 +211,7 @@ def test_long_bash_output_is_saved_and_can_be_read_in_windows():
         workspace = Path(temp_dir)
         script = workspace / "emit_output.py"
         script.write_text(
-            "for index in range(1, 66):\n"
+            "for index in range(1, 202):\n"
             "    print(f'log line {index}')\n",
             encoding="utf-8",
         )
@@ -219,13 +221,17 @@ def test_long_bash_output_is_saved_and_can_be_read_in_windows():
 
         assert result.success
         assert "Output is too long" in result.content
-        assert "Total 65 lines" in result.content
+        assert "Total 201 lines" in result.content
         assert "log line 1" in result.content
-        assert "log line 65" in result.content
+        assert "log line 201" in result.content
         saved_path = next((workspace / ".agent" / "logs").glob("cmd_*.log"))
         saved_content = saved_path.read_text(encoding="utf-8")
-        assert len(saved_content.splitlines()) == 65
-        assert saved_content.endswith("log line 65")
+        assert len(saved_content.splitlines()) == 201
+        assert saved_content.endswith("log line 201")
+        assert result.output_visibility["truncated"] is True
+        assert result.output_visibility["original_lines"] == 201
+        assert result.output_visibility["selected_line_ranges"] == [[1, 10], [182, 201]]
+        assert result.output_visibility["saved_path"] == f".agent/logs/{saved_path.name}"
         window = tools.read_file(f".agent/logs/{saved_path.name}", 31, 35)
         assert window.success
         assert "log line 31" in window.content
@@ -250,6 +256,107 @@ def test_short_tool_output_is_returned_unchanged():
         tools = BaseTools(Path(temp_dir))
         content = "[Exit Code: 0]\nsmall output"
         assert tools.format_tool_output(content) == content
+
+
+def test_mid_sized_source_window_is_visible_without_reopening_log(tmp_path):
+    script = tmp_path / "emit_source.py"
+    script.write_text(
+        "for number in range(1, 57):\n"
+        "    print(f'source line {number}')\n",
+        encoding="utf-8",
+    )
+    tools = BaseTools(tmp_path, shell_session=ShellSession(tmp_path))
+    result = tools.run_bash(f'"{sys.executable}" "{script}"')
+
+    assert result.success
+    assert "source line 1" in result.content
+    assert "source line 28" in result.content
+    assert "source line 56" in result.content
+    assert "Output is too long" not in result.content
+    assert result.output_visibility["truncated"] is False
+    assert not (tmp_path / ".agent" / "logs").exists()
+
+
+def test_bash_visibility_metadata_reaches_trace(tmp_path):
+    tools = BaseTools(tmp_path, shell_session=ShellSession(tmp_path))
+    result = tools.run_bash(
+        f'"{sys.executable}" -c "print(chr(10).join(str(i) for i in range(201)))"'
+    )
+    assert result.success
+    assert result.output_visibility["truncated"] is True
+    assert result.output_visibility["visible_chars"] < result.output_visibility["original_chars"]
+
+    manager = TraceManager()
+    manager.start_task()
+    manager.start_turn(0)
+    manager.record_tool_call(
+        tool_name="bash",
+        args_hash="safe-test-command",
+        success=True,
+        result_preview=result.content,
+        output_visibility=result.output_visibility,
+    )
+    manager._close_turn()
+    recorded = manager.current_task.to_dict()["turns"][0]["tools"][0]
+    assert recorded["output_visibility"] == result.output_visibility
+    assert recorded["output_visibility"]["saved_path"].startswith(".agent/logs/")
+    assert "output_visibility" not in ToolTrace(tool_name="read_file").to_dict()
+
+
+def test_agent_records_tool_visibility_in_trace_and_session(tmp_path):
+    workspace = tmp_path / "workspace"
+    workspace.mkdir()
+    data_root = tmp_path / "runtime"
+    agent = MiniClaudeAgent(
+        workspace_root=workspace,
+        workspace_confirmed=True,
+        runtime_data_root=data_root,
+    )
+
+    class FakeProvider:
+        last_error_diagnostic = {}
+
+        def __init__(self):
+            self.calls = 0
+
+        def create_message(self, *args, **kwargs):
+            self.calls += 1
+            if self.calls == 1:
+                return {
+                    "content": "",
+                    "tool_calls": [{"id": "call-1", "function": {
+                        "name": "bash", "arguments": json.dumps({"command": "echo test"}),
+                    }}],
+                    "usage": {},
+                }
+            return {"content": "done", "tool_calls": [], "usage": {}}
+
+        def parse_response(self, response):
+            return response
+
+    visibility = {
+        "truncated": True,
+        "original_lines": 201,
+        "original_chars": 5000,
+        "visible_chars": 1000,
+        "selected_line_ranges": [[1, 10], [182, 201]],
+        "saved_path": ".agent/logs/cmd_test.log",
+    }
+    provider = FakeProvider()
+    agent.provider_manager = SimpleNamespace(get_primary_provider=lambda: provider)
+    agent._execute_tool = lambda *args, **kwargs: ToolResult(
+        content="bounded preview", output_visibility=visibility,
+    )
+    try:
+        assert agent.chat("Inspect tool output") == "done"
+        trace_path = next((data_root / "traces").glob("task_*.json"))
+        trace = json.loads(trace_path.read_text(encoding="utf-8"))
+        assert trace["turns"][0]["tools"][0]["output_visibility"] == visibility
+        session_path = next((data_root / "sessions").glob("session_*.jsonl"))
+        events = [json.loads(line) for line in session_path.read_text(encoding="utf-8").splitlines()]
+        assert next(event for event in events if event["type"] == "tool_result")["output_visibility"] == visibility
+    finally:
+        agent.shutdown()
 
 
 def test_trace_keeps_head_and_tail_for_fileized_output():

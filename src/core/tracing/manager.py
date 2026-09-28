@@ -66,7 +66,8 @@ class TraceManager:
                     workspace_root: str = "",
                     workspace_confirmed: bool = False,
                     require_tool_call: bool = False,
-                    environment: Optional[Dict[str, Any]] = None) -> str:
+                    environment: Optional[Dict[str, Any]] = None,
+                    request_config: Optional[Dict[str, Any]] = None) -> str:
         """Begin a new task-level trace.  Returns task_id."""
         tid = task_id or str(uuid.uuid4())[:8]
         self.current_task = TaskTrace(
@@ -76,6 +77,7 @@ class TraceManager:
             workspace_confirmed=workspace_confirmed,
             require_tool_call=require_tool_call,
             environment=dict(environment or {}),
+            request_config=dict(request_config or {}),
         )
         self.current_turn = None
         logger.debug(f"Trace: task started [{tid}]")
@@ -165,6 +167,7 @@ class TraceManager:
         loop_guard_blocked: bool = False,
         error_message: str = "",
         result_preview: str = "",
+        output_visibility: Optional[dict] = None,
         started_at: Optional[float] = None,
         finished_at: Optional[float] = None,
         execution_success: Optional[bool] = None,
@@ -237,6 +240,7 @@ class TraceManager:
             guard_reason=guard_reason,
             error_message=error_message[:200],
             result_preview=_trace_result_preview(result_preview),
+            output_visibility=dict(output_visibility or {}),
             failure_category=failure_category,
             recoverability=recoverability,
             strategy_fingerprint=strategy_fingerprint,
@@ -362,6 +366,12 @@ class TraceManager:
         completion = value("completion_tokens")
         total = value("total_tokens")
         cached = min(value("cached_tokens"), prompt)
+        raw_reasoning = usage.get("reasoning_tokens") if isinstance(usage, dict) else None
+        reasoning = (
+            min(raw_reasoning, completion)
+            if isinstance(raw_reasoning, int) and not isinstance(raw_reasoning, bool)
+            and raw_reasoning >= 0 else None
+        )
         turn.token_usage += total
         turn.actual_prompt_tokens += prompt
         turn.completion_tokens += completion
@@ -383,6 +393,8 @@ class TraceManager:
         )
 
         if source == "summary":
+            if reasoning is not None:
+                turn.summary_reasoning_tokens = (turn.summary_reasoning_tokens or 0) + reasoning
             turn.summary_prompt_tokens += prompt
             turn.summary_completion_tokens += completion
             turn.summary_total_tokens += total
@@ -408,6 +420,8 @@ class TraceManager:
             return
 
         estimate = max(int(estimated_prompt_tokens), 0)
+        if reasoning is not None:
+            turn.main_reasoning_tokens = (turn.main_reasoning_tokens or 0) + reasoning
         turn.estimated_prompt_tokens += estimate
         turn.main_prompt_tokens += prompt
         turn.main_cached_tokens += cached
@@ -438,3 +452,13 @@ class TraceManager:
         """Record the LLM's text response for the current turn."""
         if self.current_turn:
             self.current_turn.assistant_content = content
+
+    def record_provider_finish_reason(self, reason: str | None) -> None:
+        """Record the protocol ending, without persisting private reasoning text."""
+        if self.current_turn and reason:
+            self.current_turn.provider_finish_reason = reason
+
+    def record_reasoning_content_chars(self, length: int | None) -> None:
+        """Record whether reasoning text was returned, without saving its contents."""
+        if self.current_turn and isinstance(length, int) and not isinstance(length, bool):
+            self.current_turn.reasoning_content_chars = max(length, 0)

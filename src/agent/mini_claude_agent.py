@@ -378,7 +378,10 @@ class MiniClaudeAgent:
             'api_key': api_key,
             'base_url': base_url,
             'timeout': llm.timeout_ms / 1000.0,
+            'stream': llm.stream,
         }
+        if llm.reasoning_effort is not None:
+            provider_config['reasoning_effort'] = llm.reasoning_effort
 
         if api_key:
             try:
@@ -637,7 +640,11 @@ class MiniClaudeAgent:
         all_tools = [
             {
                 'name': 'bash',
-                'description': f'Run a shell command. Platform: {_platform_label}.',
+                'description': (
+                    f'Run a shell command. Platform: {_platform_label}. '
+                    'Large output is saved under .agent/logs and only a preview is returned; '
+                    'use read_file with line ranges on that path for omitted content.'
+                ),
                 'input_schema': {
                     'type': 'object',
                     'properties': {
@@ -1546,7 +1553,9 @@ class MiniClaudeAgent:
         return text
 
     def _get_dynamic_hot_context(self,
-                                  rounds_without_todo: int = 0) -> str:
+                                  rounds_without_todo: int = 0,
+                                  iteration: Optional[int] = None,
+                                  max_iterations: Optional[int] = None) -> str:
         """Aggregate all transient dynamic state into one hot-context block.
 
         This data is injected temporarily before each LLM call and must
@@ -1583,6 +1592,21 @@ class MiniClaudeAgent:
         if self.todo.has_open_items() and rounds_without_todo >= 3:
             parts.append("<nag>Consider updating your todos.</nag>")
 
+        # A late-run budget hint is advisory; it never vetoes legitimate reads.
+        if (iteration is not None and max_iterations is not None
+                and max_iterations > 0 and 2 * (iteration + 1) >= max_iterations):
+            remaining = max(max_iterations - iteration - 1, 0)
+            parts.append(
+                "<execution-budget>"
+                f"Model call {iteration + 1}/{max_iterations}; "
+                f"{remaining} calls remain after this one. "
+                "If this task requires edits, prioritize a small verifiable "
+                "implementation over open-ended investigation. If blocked, "
+                "identify the specific missing evidence. Do not claim "
+                "unverified completion."
+                "</execution-budget>"
+            )
+
         if not parts:
             return ""
         return "<dynamic_context>\n" + "\n".join(parts) + "\n</dynamic_context>"
@@ -1617,6 +1641,14 @@ class MiniClaudeAgent:
             workspace_confirmed=self._workspace_confirmed,
             require_tool_call=require_tool_call,
             environment=self.preflight.to_dict(),
+            request_config={
+                "provider": self.config.llm.provider,
+                "model": self.config.llm.model,
+                "max_tokens": self.config.llm.max_tokens,
+                "reasoning_effort": self.config.llm.reasoning_effort,
+                "temperature": self.config.llm.temperature,
+                "stream": self.config.llm.stream,
+            },
         )
         self.runtime_context.current_task_id = tid
         self.runtime_policy.reset()
@@ -1629,8 +1661,8 @@ class MiniClaudeAgent:
         self._last_assistant_note = None
         for iteration in range(max_iterations):
             try:
-                self._emit_ui_event("thinking", iteration=iteration + 1)
-                self.session_recorder.record("thinking", turn=iteration + 1)
+                self._emit_ui_event("model_request_started", iteration=iteration + 1)
+                self.session_recorder.record("model_request_started", turn=iteration + 1)
                 logger.info("LLM_TURN_START: iteration=%s messages=%s", iteration + 1, len(self.messages))
                 # ── Start turn-level trace for this iteration ──
                 self.trace.start_turn(iteration)
@@ -1639,6 +1671,8 @@ class MiniClaudeAgent:
                 self.messages = Compressor._clean_tool_chains(self.messages)
                 hot_text = self._get_dynamic_hot_context(
                     rounds_without_todo=rounds_without_todo,
+                    iteration=iteration,
+                    max_iterations=max_iterations,
                 )
                 msgs_for_llm = self._build_request_messages(hot_text)
                 estimated_prompt_tokens = self.compressor.estimate_prompt_tokens(
@@ -1680,12 +1714,12 @@ class MiniClaudeAgent:
                 parsed = self._parse_response(provider, response)
                 content = parsed.get('content', '')
                 tool_calls = parsed.get('tool_calls', [])
+                finish_reason = parsed.get('finish_reason')
+                self.trace.record_provider_finish_reason(finish_reason)
+                self.trace.record_reasoning_content_chars(
+                    parsed.get('reasoning_content_chars')
+                )
 
-                if content and tool_calls:
-                    logger.info("LLM_NOTE[%s]: %s", iteration + 1, content)
-                    self.session_recorder.record("assistant_note", turn=iteration + 1, content=content)
-                    self._last_assistant_note = content
-                    self._emit_ui_event("assistant_note", text=content)
                 logger.info(
                     "LLM_TURN_RESULT: iteration=%s tool_calls=%s",
                     iteration + 1,
@@ -1703,6 +1737,20 @@ class MiniClaudeAgent:
                     source="main",
                 )
                 self.last_metrics["turns"] = iteration + 1
+
+                if finish_reason in {"length", "max_tokens"}:
+                    self.trace.end_task("FAILED", "PROVIDER_OUTPUT_LIMIT")
+                    return "错误: 模型输出达到上限，本轮回复可能不完整，任务未完成。"
+
+                if not tool_calls and not content.strip():
+                    self.trace.end_task("FAILED", "EMPTY_PROVIDER_RESPONSE")
+                    return "错误: 模型未返回可见回复或工具调用，任务未完成。"
+
+                if content and tool_calls:
+                    logger.info("LLM_NOTE[%s]: %s", iteration + 1, content)
+                    self.session_recorder.record("assistant_note", turn=iteration + 1, content=content)
+                    self._last_assistant_note = content
+                    self._emit_ui_event("assistant_note", text=content)
 
                 if not tool_calls:
                     self.messages.append(Message(role='assistant', content=content))
@@ -1911,6 +1959,7 @@ class MiniClaudeAgent:
                                 intent_key=intent.to_key(),
                                 observation_fingerprint=decision.event.observation_fingerprint,
                                 semantic_state=decision.event.semantic_state,
+                                observation_changed=decision.observation_changed,
                                 progress_detected=decision.progress_detected,
                                 progress_reason=list(decision.progress_reason),
                                 stagnation_reason=list(decision.stagnation_reason),
@@ -2082,6 +2131,7 @@ class MiniClaudeAgent:
                         loop_guard_blocked=bool(v3_block_msg) or state_guard_blocked,
                         error_message="" if t_success else result_text[:200],
                         result_preview=result_text,
+                        output_visibility=tool_result.output_visibility,
                         started_at=t_start, finished_at=t_end,
                         execution_success=bool(tool_result.execution_success),
                         observed_failure=observation_evidence.observed_failure,
@@ -2128,6 +2178,7 @@ class MiniClaudeAgent:
                         command_blocked=bool(v3_block_msg) or state_guard_blocked,
                         block_reason=(v3_block_msg or "STATE_STALLED"),
                         args_fingerprint=args_hash,
+                        duration_ms=max((t_end - t_start) * 1000, 0.0),
                         execution_success=bool(tool_result.execution_success),
                         observed_failure=observation_evidence.observed_failure,
                         semantic_status=observation_evidence.semantic_status,
@@ -2143,6 +2194,7 @@ class MiniClaudeAgent:
                         intent_key=intent.to_key(),
                         observation_fingerprint=progress_decision.event.observation_fingerprint,
                         semantic_state=progress_decision.event.semantic_state,
+                        observation_changed=progress_decision.observation_changed,
                         progress_detected=progress_decision.progress_detected,
                         progress_reason=list(progress_decision.progress_reason),
                         stagnation_reason=list(progress_decision.stagnation_reason),
@@ -2171,6 +2223,8 @@ class MiniClaudeAgent:
                         success=t_success,
                         blocked=bool(v3_block_msg) or state_guard_blocked,
                         result=result_text,
+                        **({"output_visibility": tool_result.output_visibility}
+                           if tool_result.output_visibility else {}),
                     )
                     self._emit_ui_event(
                         "tool_result",
@@ -2243,9 +2297,9 @@ class MiniClaudeAgent:
                 self.trace.end_task("FAILED")
                 return f"错误: {error_message}"
 
-        logger.warning(f"工具循环已达最大次数 ({max_iterations})，强制终止")
-        self.trace.end_task("LOOP_ABORTED")
-        return "错误: 工具执行次数过多，已自动终止。"
+        logger.warning(f"模型调用轮次已达最大次数 ({max_iterations})，强制终止")
+        self.trace.end_task("LOOP_ABORTED", "GLOBAL_ITERATION_LIMIT")
+        return f"错误: 模型调用已达 {max_iterations} 轮上限，任务未完成。"
 
     def _parse_response(self, provider, response: Any) -> Dict[str, Any]:
         """Parse provider response safely."""

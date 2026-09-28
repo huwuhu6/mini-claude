@@ -193,7 +193,10 @@ def test_provider_parse_failure_enters_agent_failed_path_before_append():
     agent._current_user_prompt = "task"
     agent._workspace_confirmed = False
     agent.config = types.SimpleNamespace(
-        llm=types.SimpleNamespace(max_tokens=10, temperature=0),
+            llm=types.SimpleNamespace(
+                provider="dashscope", model="test", max_tokens=10,
+                reasoning_effort=None, temperature=0, stream=True,
+            ),
     )
     agent.messages = [Message(role="user", content="task")]
     agent.runtime_context = types.SimpleNamespace(
