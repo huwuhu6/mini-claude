@@ -384,6 +384,11 @@ def test_repeated_read_same_observation_replans_but_paged_reads_are_allowed():
     decisions = [_record(policy, history, "read_file", args, success=True, result="same") [1]
                  for _ in range(4)]
     assert decisions[-1].action is RuntimeDecision.REPLAN
+    assert policy.before_execution(
+        tool_name="read_file", args=args, args_fingerprint="x", turn=5
+    ).action is RuntimeDecision.ALLOW
+    assert _record(policy, history, "read_file", args, success=True, result="same")[1].action is RuntimeDecision.ALLOW
+    assert policy.finalize().action is RuntimeDecision.ALLOW
 
     paged = AttemptHistory()
     paged_policy = RuntimePolicy(paged)
@@ -426,6 +431,30 @@ def test_state_oscillation_is_detected_even_when_probe_changes_a_file():
     assert history.all()[-1].semantic_state == "a|b|a|b"
     assert decision.action is RuntimeDecision.REPLAN
     assert policy.finalize().action is RuntimeDecision.HARD_STOP
+
+
+def test_distinct_bash_inspections_of_same_file_are_not_blocked():
+    from core.loop_controller import AttemptHistory, RuntimeDecision, RuntimePolicy
+
+    history = AttemptHistory()
+    policy = RuntimePolicy(history)
+    commands = [
+        "grep -n opcode /app/my_stdlib.c",
+        "sed -n '1,120p' /app/my_stdlib.c",
+        "sed -n '120,300p' /app/my_stdlib.c",
+        "sed -n '300,800p' /app/my_stdlib.c",
+        "grep -n macro /app/my_stdlib.c",
+    ]
+    assert len({CommandNormalizer.normalize("bash", {"command": command}).to_key()
+                for command in commands}) == 1
+    for command in commands:
+        args = {"command": command}
+        assert policy.before_execution(
+            tool_name="bash", args=args, args_fingerprint="x", turn=len(history) + 1
+        ).action is RuntimeDecision.ALLOW
+        _, decision = _record(policy, history, "bash", args, success=True, result=command)
+        assert decision.action is RuntimeDecision.ALLOW
+    assert policy.finalize().action is RuntimeDecision.ALLOW
 
 
 def test_capability_invariant_stops_immediately_but_dynamic_failure_does_not():

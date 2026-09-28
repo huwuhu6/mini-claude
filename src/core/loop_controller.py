@@ -722,9 +722,7 @@ class RuntimePolicy:
 
     def before_execution(self, *, tool_name: str, args: Dict[str, Any],
                          args_fingerprint: str, turn: int) -> RuntimePolicyDecision:
-        intent = CommandNormalizer.normalize(tool_name, args)
         prior = list(self.history.recent(self.loop_detector.intent_horizon))
-        same = [event for event in prior if event.intent_key == intent.to_key()]
         noop_writes = [event for event in prior[-3:]
                        if event.tool_name in {"edit_file", "write_file"}
                        and event.status is AttemptStatus.SUCCESS
@@ -733,14 +731,8 @@ class RuntimePolicy:
             return RuntimePolicyDecision(RuntimeDecision.REPLAN,
                 "consecutive no-op writes", LoopEvidence(True, "NOOP_MUTATION", len(noop_writes), 3,
                                                           "consecutive write attempts produced no diff"))
-        if len(same) >= 4 and not self.loop_detector._has_intervening_change(prior, same[-4:]):
-            kind = "OBSERVATION_STAGNATION" if len({e.observation_fingerprint for e in same[-4:]}) == 1 else "INTENT_REPETITION"
-            evidence = LoopEvidence(True, kind, len(same), self.loop_detector.intent_horizon,
-                                    "same intent repeated without relevant state change")
-            if self._replans(prior) >= 1:
-                return RuntimePolicyDecision(RuntimeDecision.HARD_STOP,
-                    "repeated intent after replan opportunity", evidence)
-            return RuntimePolicyDecision(RuntimeDecision.REPLAN, evidence.reason, evidence)
+        # A normalized intent can cover different grep patterns or sed ranges.
+        # Let reads run; inspect their actual observations afterwards.
         return RuntimePolicyDecision()
 
     def observe(self, event: AttemptEvent) -> RuntimePolicyDecision:
@@ -755,16 +747,6 @@ class RuntimePolicy:
             )
             self._remember_attempt_decision(decision)
             return decision
-        if loop.suspected:
-            if self._replans(self.history) >= 1 and loop.occurrences >= 5:
-                decision = RuntimePolicyDecision(RuntimeDecision.HARD_STOP,
-                    f"{loop.kind}: {loop.reason}; replan already attempted", loop, failure)
-                self._remember_attempt_decision(decision)
-                return decision
-            decision = RuntimePolicyDecision(RuntimeDecision.REPLAN,
-                f"{loop.kind}: {loop.reason}", loop, failure)
-            self._remember_attempt_decision(decision)
-            return decision
         if failure.occurrences >= 3 and failure.strategy_diversity <= 1:
             # This is only a recent stagnation signal. A single failure or an
             # old task-lifetime count never has authority to terminate.
@@ -777,6 +759,18 @@ class RuntimePolicy:
                 f"recent failure recurrence: {failure.reason}", loop, failure)
             self._remember_attempt_decision(decision)
             return decision
+        if loop.kind == "STATE_OSCILLATION" and self._replans(self.history) >= 1:
+            decision = RuntimePolicyDecision(RuntimeDecision.HARD_STOP,
+                f"{loop.kind}: {loop.reason}; replan already attempted", loop, failure)
+            self._remember_attempt_decision(decision)
+            return decision
+        if loop.suspected and loop.kind != "INTENT_REPETITION" and self._replans(self.history) == 0:
+            # Stagnant observations merit one hint, not an execution veto or
+            # termination. Changing observations are weaker evidence still.
+            decision = RuntimePolicyDecision(RuntimeDecision.REPLAN,
+                f"{loop.kind}: {loop.reason}", loop, failure)
+            self._remember_attempt_decision(decision)
+            return decision
         decision = RuntimePolicyDecision(RuntimeDecision.ALLOW, "recent evidence is not stagnant", loop, failure)
         self._remember_attempt_decision(decision)
         return decision
@@ -785,7 +779,7 @@ class RuntimePolicy:
         """Gate an unsupported final answer without killing a live recovery."""
         events = list(self.history)
         recent_loop = self.loop_detector.inspect(self.history)
-        if recent_loop.suspected and self._replans(events) >= 1:
+        if recent_loop.kind == "STATE_OSCILLATION" and self._replans(events) >= 1:
             decision = RuntimePolicyDecision(
                 RuntimeDecision.HARD_STOP,
                 f"{recent_loop.kind}: {recent_loop.reason}; replan opportunity was already given",
@@ -1022,7 +1016,8 @@ class RuntimePolicyAdapter:
                 blocker_category: str = "", workspace_before=None,
                 workspace_after=None, workspace_root: str = "",
                 command_blocked: bool = False, block_reason: str = "",
-                args_fingerprint: str = "", execution_success: Optional[bool] = None,
+                args_fingerprint: str = "", duration_ms: float = 0.0,
+                execution_success: Optional[bool] = None,
                 observed_failure: bool = False, semantic_status: str = "",
                 observation: str = "", exit_code: Optional[int] = None,
                 segment_exit_codes: Iterable[int] = (), resolution_evidence: str = "",
@@ -1035,6 +1030,7 @@ class RuntimePolicyAdapter:
             workspace_before=workspace_before if isinstance(workspace_before, dict) else None,
             workspace_after=workspace_after if isinstance(workspace_after, dict) else None,
             block_reason=block_reason if command_blocked else "",
+            duration_ms=duration_ms,
             execution_success=execution_success,
             observed_failure=observed_failure,
             semantic_status=semantic_status,
@@ -1046,14 +1042,23 @@ class RuntimePolicyAdapter:
             evidence_ids=evidence_ids,
         )
         previous = self.policy.history.recent(2)
-        progress = len(previous) < 2 or event.observation_fingerprint != previous[-2].observation_fingerprint
-        return _AdapterDecision(event=event, decision=decision, progress_detected=progress)
+        observation_changed = (
+            len(previous) < 2
+            or event.observation_fingerprint != previous[-2].observation_fingerprint
+        )
+        return _AdapterDecision(
+            event=event,
+            decision=decision,
+            observation_changed=observation_changed,
+            progress_detected=event.workspace_changed or event.verification_improved,
+        )
 
 
 @dataclass(frozen=True)
 class _AdapterDecision:
     event: AttemptEvent
     decision: RuntimePolicyDecision
+    observation_changed: bool = False
     progress_detected: bool = False
 
     @property
@@ -1074,15 +1079,24 @@ class _AdapterDecision:
 
     @property
     def progress_reason(self) -> tuple[str, ...]:
-        return ("OBSERVATION_CHANGED",) if self.progress_detected else ()
+        reasons = []
+        if self.event.workspace_changed:
+            reasons.append("WORKSPACE_CHANGED")
+        if self.event.verification_improved:
+            reasons.append("VERIFICATION_IMPROVED")
+        return tuple(reasons)
 
     @property
     def stagnation_reason(self) -> tuple[str, ...]:
-        return () if self.progress_detected else ("SAME_OBSERVATION",)
+        return () if self.observation_changed else ("SAME_OBSERVATION",)
 
     @property
     def recovery_stage(self):
-        return type("Stage", (), {"value": "HEALTHY" if self.progress_detected else "SUSPECTED_STALL"})()
+        stage = (
+            "HEALTHY" if self.progress_detected else
+            "OBSERVING" if self.observation_changed else "SUSPECTED_STALL"
+        )
+        return type("Stage", (), {"value": stage})()
 
     @property
     def open_blocker_count(self) -> int:

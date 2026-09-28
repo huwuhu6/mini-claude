@@ -14,10 +14,12 @@ class LLMConfig:
     provider: str = "deepseek"
     model: str = "deepseek-chat"
     max_tokens: int = 8000
+    reasoning_effort: Optional[str] = None
     temperature: float = 0.0
     api_key: str = ""
     base_url: str = ""
     timeout_ms: int = 60000
+    stream: bool = True
 
 
 @dataclass
