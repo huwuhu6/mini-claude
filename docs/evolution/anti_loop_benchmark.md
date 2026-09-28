@@ -83,3 +83,54 @@ Observation 规范化移除 ANSI、工作区绝对路径、临时路径、时间
 合成 Progress Governance 测试以及仓库 `tests/` 在显式可写 Runtime 根目录下通过：167 passed；DEV/HOLDOUT validate-only 分别选择 12/5 个冻结 Case，suite hash 仍为 `6ded4f86a1ec2e1f0a9fed208e2e57575253668018bd7f9f3631b89dc85e31ba`。Candidate DEV×3 已真实启动并完整写入 36 个 Trial，但 Provider 返回 HTTP 402 `Insufficient Balance`，全部被归类为 `INFRA_ERROR`，因此没有产生可比较的 Candidate 治理指标，也没有运行 Holdout。
 
 当前实现的关系判断仍含有限 heuristic：替代恢复需要相关 intent、策略或具有验证形态的成功观察；Runtime 无法仅凭一般工具文本证明 evaluator-side 业务结果。Candidate 需要在 Provider 恢复可用后重新以同一 Fixture 运行 DEV×3，届时停止 Case chasing，只比较通用不变量支持的行为。
+
+## 2026-09-27：降低相似工具调用的拦截权限
+
+Commit: `2edcd0b`
+Commit Description: `fix(runtime): 收敛循环拦截并提升 Provider 与工具反馈可靠性`
+
+### Description
+
+过去较小的 Context 窗口和过早压缩容易造成反复读取，循环治理因此逐步加强。但 Context 基线后来扩展到 1M 窗口、250K/500K 压缩阈值后，不能再仅凭当年的失忆风险推断当前每次相似读取都应被阻断。Harbor 的 `make-mips-interpreter` 单次轨迹给出具体反例：任务没有发生压缩；不同范围的 `sed` 和不同模式的 `grep` 仍归为同一文件意图，随后一次 `REPLAN` 和一次执行前 `HARD_STOP` 阻断了正常文件检查。这是证据粒度与执行权限不匹配，不是已经证实的任务级“死循环”。
+
+本次不扩写 Bash 归一化器，也不取消全局迭代上限、能力缺失和真实失败的防线。相似意图在执行前不再直接拦截；变化中的观察只作为诊断证据；重复得到相同观察最多提示一次重新规划，不再仅凭该证据硬终止。明确的业务状态振荡、真实失败的近期复发和明确的能力缺失仍保留原有强防线。会话 JSONL 保持原始字段；已有 `--debug flow` 入口改为不回显提示、参数或工具输出的简明执行视图，区分执行、失败与拦截。
+
+### Result / Evidence
+
+针对不同 `sed/grep` 范围、重复读取、无效写入、能力缺失以及会话视图的确定性测试通过。完整 unit/integration suite 在精确排除两个已确认的 Evaluation oracle mutation 旧失败后为 `285 passed, 1 skipped, 2 deselected`；Anti-Loop DEV 12 个既有 Case 的 `--validate-only` 通过。原 Harbor 轨迹记录 17 轮、27 次工具尝试、0 次 Context Compression、1 次被策略阻断；这些是旧版本的观察，不是新版本的任务通过率。
+
+### Decision / Limitation
+
+这次变更只证明“相似读取不应被粗粒度规则直接阻断”的确定性不变量，以及原始轨迹中的误拦截路径得到针对性覆盖。随后获授权对两个既有 DEV Case 各运行 1 次真实 Provider trial，结果归档于忽略目录 `sandbox/eval_results/loop_governance_trial/`：
+
+- `task_025_progressive_pytest`：5 轮、6 次工具调用、22,485 Token，治理没有提前停止（TN），但 verifier 报 `evaluator-owned oracle modified: test_discounts.py`。静态检查发现 baseline 中该文件的 SHA-256 与 verifier 写死的 oracle hash 不一致；trace 只显示 Agent 写入 `discounts.py`，因此这次 verifier 失败不能归因于 Agent 修改了测试文件，也不能计为有效的任务结果对照。
+- `task_033_shell_state_oscillation`：14 轮、20 次工具调用、119,780 Token，最终由未解决失败的 completion guard 停止（治理指标 TP），但 verifier 报终止决策未与目标 `/state -> 200` 形成因果关联（`STOP_UNGROUNDED`）。这个终止路径不是本次放松的“相似意图”拦截路径；不能把 TP 当作业务任务通过。
+
+另获授权在同一隔离 worktree 通过 Harbor 0.23.0 重跑 Terminal-Bench 2.0 的 `make-mips-interpreter`，只执行 1 trial。旧轨迹为 17 轮、27 次工具尝试、一次粗粒度拦截、`CIRCUIT_BROKEN`、172,321 Provider-reported Token；新轨迹为 29 轮、46 次工具尝试、零次治理拦截、零次压缩，确实越过了旧误停位置。但新运行第 29 轮的 DashScope 请求经过配置的 60 秒 timeout 和一次 SDK retry 后失败，MiniClaude 最终状态 `FAILED`；Harbor 仍正常运行 verifier，reward 0，3/3 检查失败。新轨迹中成功请求的 Provider usage 为 550,060 prompt、26,854 completion、576,914 total Token，其中 509,952 prompt Token 命中缓存；超时请求没有 Provider usage，实际计费可能高于 Trace 可见累计。新运行也没有文件写入，不能将失败归因于 verifier 或仅归因于超时。两次模型轨迹并非逐步相同，单次重跑只能说明“旧规则导致的执行前拦截没有重现”，不能证明任务能力收益或统计显著改善。
+
+后续只读排查确认：默认 Provider 请求确实暴露 `write_file`/`edit_file`，Harbor 上传的是当前 checkout 构建的 wheel；本次没有工作区写入拦截。13 次归一化到 `my_stdlib.c` 的调用具有 13 种不同参数和输出，其中后期多次查看相邻行段；34 次 Bash 输出中 11 次触发长输出文件化。最高实际单轮 prompt 约 30.5K Token，远低于压缩阈值。因此“长期只读”目前是观察到的模型执行选择，不是已定位的工具权限或 Context 压缩 Bug；不据此增加第 N 轮强制写文件的规则。
+
+这次轨迹还暴露了独立的观测缺陷：46 条 `attempt_events.duration_ms` 全为 0，但对应 ToolTrace 有非零 latency。原因是 Agent 已测量工具起止时间，统一的 `RuntimePolicyAdapter.observe()` 却没有接收并传递该时长。本次补齐这条数据链，不改变治理决策。Fake Provider 的端到端测试确认写入工具暴露正常、实测工具时长能落到 TaskTrace；完整确定性 unit/integration suite 为 `288 passed, 1 skipped, 2 deselected`，其中两个 deselected 仍是已知 Evaluation oracle mutation 旧失败。修复后的时长只对新 Trace 生效，历史产物不回填。
+
+这些单次 Trial 只用于试跑和暴露测量边界，尚未运行有效的新旧真实 Provider A/B；不能据此宣称任务成功率、Token 或循环率改善。今后若评估治理收益，必须区分任务结果、真实无进展重复、Provider 成本与错误提前停止，不能用单次 Harbor 失败或工具调用次数替代对照实验。
+
+## 2026-09-28：区分观察变化与任务产物，并提示剩余轮次
+
+Commit: `2edcd0b`
+Commit Description: `fix(runtime): 收敛循环拦截并提升 Provider 与工具反馈可靠性`
+
+### Description
+
+`make-mips-interpreter` 的后续一次轨迹达到 50 次模型调用上限，期间 71 次工具调用均产生不同观察，却没有任何工作区文件变化。旧 Trace 因此将所有调用标为 `progress_detected=true / HEALTHY`。这不是 `ALLOW` 决策的输入，而是兼容层的观测标签把“看到新内容”说得像“完成任务有进展”，容易误导诊断。
+
+本次只调整该标签：单纯的新输出标为 `observation_changed`，有工作区变更或相关验证改善才标为 `progress_detected`；治理规则及执行权限不变。同时在模型调用预算消耗过半后，通过临时动态上下文告知当前轮次和剩余轮次，建议需要改文件的任务优先形成可验证的最小实现，或具体说明阻塞。提醒不持久化到对话历史，也不阻断读取。
+
+### Result / Evidence
+
+新回归测试验证只读新观察不再被标为任务进展、工作区变更仍可标为进展、预算提醒确实到达 Fake Provider 且不进入持久消息。直接受影响测试 `102 passed`；完整 unit/integration 为 `311 passed, 1 skipped, 2 deselected`，两个 deselected 仍是已知的 Evaluation oracle 变体旧失败；`git diff --check` 通过。
+
+获授权只重跑同一 Terminal-Bench 2.0 Case 一次。Harbor 结果为 1 trial、0 exception、reward 0；MiniClaude 在第 29 轮因 DashScope 60 秒读取超时而结束，Trace 为 `FAILED`，不是 50 轮预算触顶。此前 28 轮共 43 次工具调用、零次工作区变更、零次压缩；第 25–28 轮已处在预算提醒区间，模型仍在调查，未开始编写。已返回的 Provider usage 为 655,993 prompt、37,280 completion、693,273 total tokens；超时请求没有返回 usage。Harbor 的 token/cost 汇总字段仍为空，MiniClaude 原生 Trace 保留上述 usage。
+
+### Decision / Limitation
+
+保留预算提醒作为低权限提示，不增加连续只读熔断或固定 Explore/Implement 状态机。本次 trial 被 Provider 超时截断，不能证明提醒可避免 50 轮触顶，也不能根据零写入断言模型在后续轮次不会实现。单次结果不能与先前正常跑满 50 轮的轨迹作有效 A/B，今后需要在 Provider 稳定条件下进行更多任务的对照验证；不为这道题添加特例。

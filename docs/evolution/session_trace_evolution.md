@@ -142,3 +142,39 @@ D:\02_study\code\mini-claude-project-data\<project-name>-<short-hash>\
 - 更方便的 JSONL 查询和统计工具。
 
 下一步如果继续优化会话系统，建议先增加一个很小的 JSONL 查询命令，例如按 `round_id`、`call_id` 和失败状态过滤，而不是立即设计完整的日志平台。
+
+## 2026-09-27：区分等待事件与 Provider 思考用量
+
+Commit: `2edcd0b`
+Commit Description: `fix(runtime): 收敛循环拦截并提升 Provider 与工具反馈可靠性`
+
+### Description
+
+一次 Harbor 任务在尚未创建目标文件时返回了空回复，旧 Runtime 却把“没有工具调用”判为成功。会话中的 `thinking` 只是模型请求开始的事件，不包含模型返回的思考文字；Provider 解析也没有读取 `reasoning_content`，因此历史记录无法判断思考文字是否曾返回。该轮恰好耗尽配置的 8000 输出 Token，但旧 Trace 未保存结束原因，也无法确认截断。
+
+本阶段保留“截断或空回复不能算成功”的防护，并让 Trace 记录 Provider 的结束原因、思考字段字符数和 Provider 报告的思考 Token 数。思考 Token 已包含在 completion Token 内，不额外累计；Provider 未返回该字段时保持“不可用”，不伪装成零。默认不保存思考原文，避免无界日志和敏感内容扩散。增加可选 `llm.reasoning_effort` 透传到 OpenAI-compatible Provider，保持默认值为 `null`，不改变现有模型行为；Trace 只记录安全的有效请求参数，不记录 API key。
+
+### Result / Evidence
+
+Provider/Agent/Trace/Context 相关 deterministic 回归：136 passed。旧响应的思考正文与结束原因仍无法追溯。
+
+一次获授权的同 Case Harbor 试跑（`terminal-bench/make-mips-interpreter`，1 trial）验证了新增诊断字段：50 次 Main Provider 调用均以 `tool_calls` 结束，未出现 `length`；Provider 报告了 43,203 completion tokens，其中 35,697 为 reasoning tokens。Agent 做了 71 次工具调用，却没有创建任务要求的 `vm.js`；最终碰到 50 轮模型调用上限，Harbor verifier reward 为 0、Harbor exception 为 0。这与旧试跑的空回复误判不是同一个终止原因。
+
+### Decision / Limitation
+
+先补协议结束状态和用量可观测性；可选推理强度用于后续独立实验，本轮不改默认值。新试跑显示本次失败的直接原因是全局模型轮次上限，而不是输出截断，因此不应为了这一次 reward=0 盲目调高输出 Token 上限。对应的用户可见终止文案从“工具执行次数过多”修正为“模型调用轮次达到上限”，不改变上限本身。`thinking` 事件仍仅表示请求开始，不等同于 Provider 的实际思考内容。
+
+## 2026-09-28：消除会话事件中的“思考”误称
+
+Commit: `2edcd0b`
+Commit Description: `fix(runtime): 收敛循环拦截并提升 Provider 与工具反馈可靠性`
+
+### Description
+
+排查 Harbor 会话时，`thinking` 事件被误读为模型思考正文，实际上它在请求 Provider 之前发出，只有轮次；可见的行动说明在 `assistant_note`，工具调用与结果又是独立事件。三者不是重复内容，但旧命名和 DebugViewer 的“分析”标签造成了错误印象，且 latest 视图没有显示已有的 `assistant_note`。
+
+新会话改记 `model_request_started`，终端和查看器称为“请求模型”；查看器 latest 显示 `assistant_note` 的可见正文，flow 仍只显示不含正文的执行流程。旧会话里的 `thinking` 继续可读，但同样按“模型请求”解释。Provider 的私有 `reasoning_content` 仍只记录字符数和用量，不将原文混入会话日志；`assistant_note` 与 `final` 的现有正文去重规则不变。
+
+### Decision / Limitation
+
+本次只纠正可观测性语义，不自动重试 `finish_reason=length`：该状态是一次已完成但被输出上限截断的请求，不是网络瞬时故障；直接重放相同请求可能再次耗尽输出预算。是否提高单次输出上限并做有界重试，需要单独定义成本、上下文余量和不完整工具调用的安全处理。

@@ -110,3 +110,45 @@ Summary baseline 不再静默保留最后 12K chars，也不再对每条 message
 ### Decision / Limitation
 
 250K/500K 是基于当前 1M Context Window 的最低合理 baseline，不是 Benchmark 得出的最优阈值；整体 Summary 也是可解释的单次 baseline，不代表最终 Summary 策略。Provider-aware Context Budget、Summary 分块或多级算法、Recent 15 retention、Summary Trust Boundary / Prompt Injection、Value-aware Retention、Project Context Discovery、Long-term Memory 和其他 Context Strategy 留待后续 Architecture / Benchmark 阶段。本阶段不引入 Explicit Cache，也不修改 Multi-Agent、Team、Inbox/MessageBus 或 Background delivery 语义。
+
+## 2026-09-27
+
+Commit: `2edcd0b`
+Commit Description: `fix(runtime): 收敛循环拦截并提升 Provider 与工具反馈可靠性`
+
+### Description
+
+一次 Harbor Coding Agent 轨迹中，模型反复缩小源码读取范围。调查发现，Bash 输出只要超过 40 行或 2000 字符就仅向模型返回首尾预览；即使 56 行、1656 字符的普通源码窗口也会隐藏中间内容。完整输出虽保存到 `.agent/logs`，模型在该次轨迹中没有读取保存的日志。工具执行成功与模型看见完整结果是不同事实，不能把随后的补读直接判为死循环。
+
+本阶段复用已有的工具预览字符预算与 `read_file` 行数上限，允许范围内的 Bash 输出完整内联；真正超限的输出继续保存日志、返回有界预览。Bash 工具描述说明可按行读取日志，Trace 和 Session 增加结构化输出可见性信息，简明调试视图只显示截断比例，不回显输出或日志路径。
+
+### Result / Evidence
+
+确定性回归覆盖中等源码窗口完整返回、超限输出仍可分页读取、Agent 到 Trace/Session 的可见性记录和调试视图的信息隔离。非评测变体 unit/integration suite：283 passed、1 skipped；`git diff --check` 通过。按旧 Harbor 轨迹记录的原始行数/字符数静态重算，原先 11 次被截断的 Bash 输出中有 7 次会完整内联，余下 4 次仍超限。这只说明工具反馈改变，不能证明模型在重跑任务时会更早写文件或完成任务。
+
+随后获授权对同一个 Harbor `terminal-bench/make-mips-interpreter` 只运行 1 次真实 trial。新轨迹为 24 轮、37 次工具调用、6 次 Bash 输出截断、4 次读取已保存日志、0 次写文件、0 次 Context Compression 和 0 次 LoopGuard 拦截；Provider usage 为 458099 prompt、30709 completion、488808 total tokens。Harbor 无异常，但 verifier reward 为 0。旧轨迹对应 29 轮、46 次工具调用、11 次 Bash 输出截断、0 次读取日志和 0 次写文件；两次 trial 不能作为统计显著的 A/B，也不能把轮数或 Token 差值归因于本次修改。新轨迹只能支持“结果可见性和日志续读改善”，尚不支持“Coding 任务完成率改善”。
+
+### Decision / Limitation
+
+保留输出绝对硬上限和超限落盘，不增加针对任务名、源码文件、重复读取次数或固定轮次的策略。单次真实 trial 不足以证明模型行为收益可稳定复现；Provider timeout、任务环境缺少 MIPS 反汇编能力与工具可见性问题须分别归因。
+
+本次 trial 另外暴露一个独立的终止语义缺口：末轮没有工具调用也没有可见回复，completion usage 恰为配置的 `max_tokens=8000`，Runtime 仍把空回复标记为 `SUCCESS`，而 Harbor verifier 失败。当前 parser/Trace 不记录 Provider 的 `finish_reason`，因此不能确认是否因为输出预算耗尽；后续应独立处理空回复与 Provider 结束原因，不为了让这一任务通过而在本批工具输出修改里加入特例。
+
+## 2026-09-27：Provider 不完整回复的终止语义
+
+Commit: `2edcd0b`
+Commit Description: `fix(runtime): 收敛循环拦截并提升 Provider 与工具反馈可靠性`
+
+### Description
+
+上述 Harbor trial 的最后一轮消耗了配置的全部 8000 completion tokens，却没有可见回复或工具调用。Agent Loop 仅凭“没有工具调用”进入成功分支，追加空 assistant 消息并将 Trace 标记为 `SUCCESS`；OpenAI-compatible parser 同时丢弃 `finish_reason`，使后来无法判断 Provider 是否因输出预算耗尽而提前停止。
+
+本阶段保留 Provider 的结束原因到每轮 Trace；当结束原因为输出上限时，不提交可能不完整的回复或 tool call，也不把它当作任务成功。即使 Provider 没返回结束原因，只要既没有可见回复也没有工具调用，同样以明确原因失败关闭。实际发生的 Provider usage 仍计入任务累计。
+
+### Result / Evidence
+
+新增 Fake Provider 回归覆盖正常结束、缺失结束原因、空回复、输出上限下的空回复和部分回复，以及不执行可能不完整的 tool call。完整非评测变体 unit/integration suite：289 passed、1 skipped。没有为了验证本修复再次运行真实 Provider；原 trial 的原始 `finish_reason` 未被旧版本保存，因此“末轮确实由预算耗尽导致”仍是推断。
+
+### Decision / Limitation
+
+不自动重试同一请求，也不因为单个 Benchmark 任务而提高默认 `max_tokens` 或强迫模型在固定轮次写文件。继续保留 Runtime 成功终止与独立 verifier 任务成功之间的区别。该 trial 中的源码读取多为新范围或正常分页；模型在某次读取保存日志时抄错随机文件名，这属于工具引用可用性的后续问题，不应伪称为死循环或日志丢失。
