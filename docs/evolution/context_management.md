@@ -152,3 +152,24 @@ Commit Description: `fix(runtime): 收敛循环拦截并提升 Provider 与工�
 ### Decision / Limitation
 
 不自动重试同一请求，也不因为单个 Benchmark 任务而提高默认 `max_tokens` 或强迫模型在固定轮次写文件。继续保留 Runtime 成功终止与独立 verifier 任务成功之间的区别。该 trial 中的源码读取多为新范围或正常分页；模型在某次读取保存日志时抄错随机文件名，这属于工具引用可用性的后续问题，不应伪称为死循环或日志丢失。
+
+## 2026-09-29：结构化文件记忆集成后的单 Case 试跑
+
+Commit: `e8aa1ec`
+Commit Description: `feat(context): 集成结构化文件记忆与当前 Agent Runtime`
+
+### Description
+
+将既有 `feat/structured-context-memory` 合入隔离分支，并与 Harbor 试跑所用的 Runtime 变更汇合。Memory 只保存最近文件、局部读取范围和有界观察，在每次请求前作为临时上下文注入；生产默认仍为关闭。本次仅在隔离工作树的 Harbor 配置中临时启用，然后恢复默认。合并后确定性 unit/integration 为 358 passed、2 deselected（两个已知 Evaluation oracle hash 旧失败）。
+
+### Result / Evidence
+
+获授权只运行一次 Terminal-Bench 2.0 `make-mips-interpreter`，Harbor 1 trial、0 exception、reward 0。Trace 确认 `memory=true`、`stream=true`、`max_tokens=16384`；34 次模型调用、51 次工具调用、9 次 `read_file` 调用（其中一次文件不存在，8 次进入范围统计）、0 次压缩、0 次工作区变更。请求累计 714074 prompt、110851 completion（其中 105548 reasoning）、824925 total tokens，649216 prompt tokens 命中缓存。末轮 `finish_reason=length`，16384 completion tokens 全用于 reasoning，Agent 以 `PROVIDER_OUTPUT_LIMIT` 结束；verifier 三项失败，未生成目标交付物。
+
+前一次 Memory OFF 的同 Case 试跑为 43 轮、60 次工具调用、6 次 `read_file`、0 次压缩、0 次工作区变更，同样以 `PROVIDER_OUTPUT_LIMIT` 结束。两次不是相同 revision 上的多 trial 随机对照，不能把轮次或 token 差异归因于 Memory。本次读取主要是不同文件范围及日志分页，未观察到相同范围的重复成功读取；该 Case 仍没有形成记忆所需的压缩/遗忘压力。
+
+### Decision / Limitation
+
+本次只证明 Memory 与当前 Harbor Runtime 能共同运行，不能证明它减少重复探索或提高任务成功率。它没有解决模型长期只读、迟迟不创建 `vm.js` 和推理输出预算耗尽的问题；不因此默认打开 Memory，也不再为单个 Case 修改 Prompt、压缩器或治理规则。
+
+另发现一个与 Memory 合并无关的 Trace/工具状态缺口：`read_file` 的文件不存在错误被 Handler 解包为 `Error: File not found` 字符串后，通用错误识别没有识别该前缀，ToolTrace 因而标成 `success=true`；范围指标没有把它计为成功读取。后续应按 ToolResult 的结构化成功状态修复，而不是通过这个 Case 的文件名特判。本次不扩张实现。
