@@ -44,7 +44,7 @@ Commit Description: `fix(runtime): 收敛循环拦截并提升 Provider 与工�
 
 ## 2026-09-29：为默认推理强度下的输出截断增加一次恢复机会
 
-Commit: `PENDING`
+Commit: `aa062a7`
 Commit Description: `fix(runtime): 修复工具结果状态与 Provider 截断恢复`
 
 ### Description
@@ -55,8 +55,10 @@ Commit Description: `fix(runtime): 修复工具结果状态与 Provider 截断�
 
 ### Result / Evidence
 
-确定性回归覆盖一次低推理恢复后成功、再次截断后停止、截断工具调用从未执行、显式 reasoning effort 不被覆盖，以及两次 usage 均计入 Trace。完整 unit/integration：362 passed、2 deselected；两个 deselected 是已确认的 Evaluation oracle hash 旧失败；`git diff --check` 通过。此次代码修改后没有再次请求真实 Provider。
+确定性回归覆盖一次低推理恢复后成功、再次截断后停止、截断工具调用从未执行、显式 reasoning effort 不被覆盖，以及两次 usage 均计入 Trace。完整 unit/integration：362 passed、2 deselected；两个 deselected 是已确认的 Evaluation oracle hash 旧失败。提交前再次运行 Provider/Context 相关测试为 32 passed，`git diff --check` 通过。
+
+随后获授权对同一个 `make-mips-interpreter` 执行 1 次 Memory ON Harbor trial。Agent 在第 32 轮原请求与一次 `reasoning_effort=low` 重试后仍以 `finish_reason=length` 结束；该轮两次调用共消耗 32,768 completion/reasoning tokens，没有 assistant 可见内容或工具调用。Agent 因 `PROVIDER_OUTPUT_LIMIT` fail-closed；Harbor 无 harness exception，但 verifier reward 为 0，目标文件未创建。该运行确认当前低推理重试仍不足以处理持续耗尽输出预算的情况；它不是 Memory ON/OFF 对照，不能用于判断 Memory 收益。
 
 ### Decision / Limitation
 
-这为默认高推理设置提供一次有界的恢复机会，最坏会多产生一次 Provider 请求和费用；它不保证第二次一定成功，也不在同一截断文本上盲目续写或重放工具调用。实际能否降低当前任务的 `PROVIDER_OUTPUT_LIMIT` 发生率，需要之后获授权的同 Case 验证，并检查最终是否形成完整工具动作；当前只有 deterministic evidence。
+保留一次有界重试与 fail-closed，避免无限重试、执行不完整工具参数或报告假成功；但本次真实 Trace 表明仅降低到 `low` 仍可能把整份额度花在 reasoning 上。后续应评估真正改变推理模式的 Provider 支持参数，而不是单纯增加 `max_tokens`；任何新恢复机制都必须保留截断拒绝执行，并用 deterministic tests 与获授权的单次 Provider 验证。

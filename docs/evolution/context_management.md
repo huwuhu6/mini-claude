@@ -174,4 +174,4 @@ Commit Description: `feat(context): 集成结构化文件记忆与当前 Agent R
 
 另发现一个与 Memory 合并无关的 Trace/工具状态缺口：`read_file` 的文件不存在错误被 Handler 解包为 `Error: File not found` 字符串后，通用错误识别没有识别该前缀，ToolTrace 因而标成 `success=true`；范围指标没有把它计为成功读取。后续应按 ToolResult 的结构化成功状态修复，而不是通过这个 Case 的文件名特判。本次不扩张实现。
 
-2026-09-29 后续修复：`read_file` Handler 现在直接返回带有 `success/execution_success` 的 `ToolResult`，避免把文件不存在错误降成纯文本；字符串形式的 `Error:` 也进入失败识别。Fake Provider 回归确认 Trace 将缺失文件读取标为失败且不计入成功范围读取。该修复与上面的单次 Memory 试跑结果分开，代码 Commit 暂为 `PENDING`。
+2026-09-29 后续修复（Commit: `aa062a7`）：`read_file` Handler 现在直接返回带有 `success/execution_success` 的 `ToolResult`，避免把文件不存在错误降成纯文本；字符串形式的 `Error:` 也进入失败识别。Fake Provider 回归确认 Trace 将缺失文件读取标为失败且不计入成功范围读取。该工具状态修复与上面的单次 Memory 试跑结果分开。
