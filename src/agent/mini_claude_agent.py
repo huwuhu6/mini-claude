@@ -11,6 +11,7 @@ import uuid
 import time
 import shutil
 import socket
+import copy
 from collections import Counter
 from pathlib import Path
 from typing import Callable, List, Dict, Any, Optional
@@ -31,7 +32,7 @@ from models.todo import TodoManager
 from providers.base import Message, ToolDefinition as ProviderToolDef
 from providers.manager import ProviderManager
 
-from core.tools.base_tools import BaseTools, ToolResult
+from core.tools.base_tools import BaseTools, ToolResult, READ_FILE_MAX_LINES
 from core.features import FeatureManager, FeatureDefinition, FeatureDependency
 from core.messaging import MessageBus, Message as BusMessage, MessagePriority
 from core.teammate_manager import TeammateManager, TeammateConfig
@@ -234,9 +235,10 @@ class MiniClaudeAgent:
 
         # Compression
         compression_config = {
-            'token_threshold': self.config.compression.token_threshold,
+            'context_window_tokens': self.config.compression.context_window_tokens,
+            'microcompact_token_threshold': self.config.compression.microcompact_token_threshold,
+            'full_compression_token_threshold': self.config.compression.full_compression_token_threshold,
             'max_transcripts': self.config.compression.max_transcripts,
-            'microcompact_threshold': self.config.compression.microcompact_threshold,
             'transcript_dir': str(self.data_paths.root / 'transcripts'),
         }
         self.compressor = Compressor(compression_config)
@@ -264,7 +266,7 @@ class MiniClaudeAgent:
         # Runtime trace system — append-only, hook-based observability
         self.trace = TraceManager(trace_dir=self.data_paths.traces)
         # Benchmark metrics — reset each _llm_tool_cycle call
-        self.last_metrics: Dict[str, int] = {"turns": 0, "total_tokens": 0, "api_errors": 0}
+        self.last_metrics: Dict[str, Any] = self._empty_usage_metrics()
         self._cmd_history: List[tuple] = []
 
 
@@ -724,13 +726,13 @@ class MiniClaudeAgent:
             },
             {
                 'name': 'read_file',
-                'description': '读取文件的指定行范围（视窗读取）。对长文件请务必使用 start_line/end_line 限定行号范围，以节省 Token 并提升聚焦度。不传参则读取全文。行号从 1 开始计数。',
+                'description': f'按行读取文件，默认最多返回 {READ_FILE_MAX_LINES} 行；start_line/end_line 为 1-based 窗口，超过行数或字符/字节硬上限会截断。长文件请使用后续窗口继续读取。',
                 'input_schema': {
                     'type': 'object',
                     'properties': {
                         'path': {'type': 'string', 'description': '文件路径'},
                         'start_line': {'type': 'integer', 'description': '起始行号（包含），从 1 开始。不传则从头读取'},
-                        'end_line': {'type': 'integer', 'description': '结束行号（包含）。不传则读到文件末尾'},
+                        'end_line': {'type': 'integer', 'description': '结束行号（包含）；仍受后端硬上限约束，超出会截断'},
                     },
                     'required': ['path'],
                 },
@@ -1397,7 +1399,125 @@ class MiniClaudeAgent:
             return True
         return False
 
-    def _check_auto_compress(self) -> bool:
+    @staticmethod
+    def _empty_usage_metrics() -> Dict[str, Any]:
+        return {
+            "turns": 0,
+            "estimated_prompt_tokens": 0,
+            "actual_prompt_tokens": 0,
+            "main_prompt_tokens": 0,
+            "main_cached_tokens": 0,
+            "main_uncached_prompt_tokens": 0,
+            "main_cache_hit_rate": 0.0,
+            "prompt_tokens": 0,
+            "completion_tokens": 0,
+            "reasoning_tokens": 0,
+            "main_reasoning_tokens": 0,
+            "summary_reasoning_tokens": 0,
+            "total_tokens": 0,
+            "cached_tokens": 0,
+            "uncached_prompt_tokens": 0,
+            "cache_hit_rate": 0.0,
+            "summary_prompt_tokens": 0,
+            "summary_completion_tokens": 0,
+            "summary_total_tokens": 0,
+            "summary_cached_tokens": 0,
+            "summary_uncached_prompt_tokens": 0,
+            "summary_cache_hit_rate": 0.0,
+            "api_errors": 0,
+        }
+
+    def _record_provider_usage(
+        self,
+        usage: Dict[str, Any],
+        *,
+        estimated_prompt_tokens: int = 0,
+        source: str = "main",
+    ) -> None:
+        """Record estimated and provider-reported usage without conflating them."""
+        usage = usage if isinstance(usage, dict) else {}
+
+        def value(name: str) -> int:
+            raw = usage.get(name, 0)
+            return raw if isinstance(raw, int) and raw >= 0 else 0
+
+        prompt = value("prompt_tokens")
+        completion = value("completion_tokens")
+        total = value("total_tokens")
+        reasoning = value("reasoning_tokens")
+        cached = min(value("cached_tokens"), prompt)
+        self.last_metrics["total_tokens"] += total
+        self.last_metrics["actual_prompt_tokens"] += prompt
+        self.last_metrics["completion_tokens"] += completion
+        self.last_metrics["reasoning_tokens"] += reasoning
+        self.last_metrics["prompt_tokens"] += prompt
+        self.last_metrics["cached_tokens"] += cached
+        self.last_metrics["uncached_prompt_tokens"] = max(
+            self.last_metrics["prompt_tokens"] - self.last_metrics["cached_tokens"],
+            0,
+        )
+        prompt_total = self.last_metrics["prompt_tokens"]
+        self.last_metrics["cache_hit_rate"] = (
+            self.last_metrics["cached_tokens"] / prompt_total
+            if prompt_total else 0.0
+        )
+        if source == "summary":
+            self.last_metrics["summary_prompt_tokens"] += prompt
+            self.last_metrics["summary_completion_tokens"] += completion
+            self.last_metrics["summary_reasoning_tokens"] += reasoning
+            self.last_metrics["summary_total_tokens"] += total
+            self.last_metrics["summary_cached_tokens"] += cached
+            summary_prompt_total = self.last_metrics["summary_prompt_tokens"]
+            self.last_metrics["summary_uncached_prompt_tokens"] = max(
+                summary_prompt_total - self.last_metrics["summary_cached_tokens"],
+                0,
+            )
+            self.last_metrics["summary_cache_hit_rate"] = (
+                self.last_metrics["summary_cached_tokens"] / summary_prompt_total
+                if summary_prompt_total else 0.0
+            )
+        else:
+            self.last_metrics["estimated_prompt_tokens"] += max(
+                int(estimated_prompt_tokens), 0
+            )
+            self.last_metrics["main_prompt_tokens"] += prompt
+            self.last_metrics["main_reasoning_tokens"] += reasoning
+            self.last_metrics["main_cached_tokens"] += cached
+            self.last_metrics["main_uncached_prompt_tokens"] = max(
+                self.last_metrics["main_prompt_tokens"] - self.last_metrics["main_cached_tokens"],
+                0,
+            )
+            main_prompt_total = self.last_metrics["main_prompt_tokens"]
+            self.last_metrics["main_cache_hit_rate"] = (
+                self.last_metrics["main_cached_tokens"] / main_prompt_total
+                if main_prompt_total else 0.0
+            )
+
+        self.trace.record_provider_usage(
+            usage,
+            estimated_prompt_tokens=estimated_prompt_tokens,
+            source=source,
+        )
+
+    def _build_request_messages(self, hot_text: str) -> List[Message]:
+        """Build the exact transient message list sent to the provider."""
+        if not hot_text:
+            return self.messages
+        msgs_for_llm = list(self.messages)
+        if msgs_for_llm and msgs_for_llm[-1].role == 'user':
+            last = msgs_for_llm[-1]
+            msgs_for_llm[-1] = Message(
+                role='user',
+                content=last.content + "\n\n" + hot_text,
+            )
+        else:
+            msgs_for_llm.append(Message(role='user', content=hot_text))
+        return msgs_for_llm
+
+    def _check_auto_compress(
+        self,
+        estimated_prompt_tokens: Optional[int] = None,
+    ) -> bool:
         """Auto-compress if token threshold exceeded.
 
         Returns:
@@ -1405,20 +1525,30 @@ class MiniClaudeAgent:
         """
         if self.feature_manager.is_enabled('compression'):
             if not self._compression_notice_pending:
-                if ((len(self.messages) >= 4 and self.compressor.should_compress(self.messages))
-                        or (self.compressor.should_microcompact(self.messages)
+                if ((len(self.messages) > 17 and self.compressor.should_compress(
+                        self.messages, estimated_prompt_tokens=estimated_prompt_tokens))
+                        or (self.compressor.should_microcompact(
+                            self.messages, estimated_prompt_tokens=estimated_prompt_tokens)
                             and self.compressor.has_microcompact_work(self.messages))):
                     self._compression_notice_pending = True
                 return False
             self._compression_notice_pending = False
-            if self.compressor.should_compress(self.messages):
+            before = copy.deepcopy(self.messages)
+            if self.compressor.should_compress(
+                self.messages, estimated_prompt_tokens=estimated_prompt_tokens,
+            ):
                 logger.info("触发自动压缩")
                 self.messages = self.compressor.compress(self.messages)
-                return True
-            elif self.compressor.should_microcompact(self.messages):
+            elif self.compressor.should_microcompact(
+                self.messages, estimated_prompt_tokens=estimated_prompt_tokens,
+            ):
                 logger.info("触发微压缩")
                 self.messages = self.compressor.microcompact(self.messages)
-                return True
+            changed = self.messages != before
+            summary_usage = self.compressor.consume_last_summary_usage()
+            if summary_usage is not None:
+                self._record_provider_usage(summary_usage, source="summary")
+            return changed
         return False
 
     def _drain_background_notifications(self) -> Optional[str]:
@@ -1480,12 +1610,7 @@ class MiniClaudeAgent:
             parts.append(f"<agent-note>\n{note_text}\n</agent-note>")
 
         if self._compression_notice_pending:
-            parts.append(
-                "<compression-warning>下一次模型调用前将压缩较早的对话和工具输出。"
-                "请现在检查尚需保留的用户约束、关键结论及其证据，必要时调用 "
-                "update_agent_note 更新完整笔记；没有新信息时直接继续任务。"
-                "不要把未验证的推测写成事实。</compression-warning>"
-            )
+            parts.append(self._compression_warning_block())
 
         # Todo status snapshot
         if self.todo.has_open_items():
@@ -1510,6 +1635,32 @@ class MiniClaudeAgent:
             return ""
         return "<dynamic_context>\n" + "\n".join(parts) + "\n</dynamic_context>"
 
+    @staticmethod
+    def _compression_warning_block() -> str:
+        return (
+            "<compression-warning>下一次模型调用前将压缩较早的对话和工具输出。"
+            "请现在检查尚需保留的用户约束、关键结论及其证据，必要时调用 "
+            "update_agent_note 更新完整笔记；没有新信息时直接继续任务。"
+            "不要把未验证的推测写成事实。</compression-warning>"
+        )
+
+    def _sync_compression_warning(self, hot_text: str) -> str:
+        """Update the pending warning without draining notifications twice."""
+        warning = self._compression_warning_block()
+        if self._compression_notice_pending:
+            if warning in hot_text:
+                return hot_text
+            if hot_text:
+                return hot_text.replace(
+                    "\n</dynamic_context>", f"\n{warning}\n</dynamic_context>",
+                )
+            return f"<dynamic_context>\n{warning}\n</dynamic_context>"
+        if warning not in hot_text:
+            return hot_text
+        return hot_text.replace(f"{warning}\n", "").replace(
+            "<dynamic_context>\n</dynamic_context>", "",
+        )
+
     # ── Core LLM + Tool Cycle ──────────────────────────────────────
 
     def _llm_tool_cycle(
@@ -1528,7 +1679,7 @@ class MiniClaudeAgent:
         tool_defs = [ProviderToolDef(**t) for t in tools]
 
         # ── Reset benchmark metrics ──
-        self.last_metrics = {"turns": 0, "total_tokens": 0, "api_errors": 0}
+        self.last_metrics = self._empty_usage_metrics()
 
         # ── Nag tracking (s_full.py s03) ──
         rounds_without_todo = 0
@@ -1559,12 +1710,32 @@ class MiniClaudeAgent:
                 self.trace.start_turn(iteration)
                 # ── Pre-LLM: compression pipeline (s_full.py s06) ──
                 # (safe inside the loop — only modifies existing messages)
-                if self._check_auto_compress():
+                self.messages = Compressor._clean_tool_chains(self.messages)
+                hot_text = self._get_dynamic_hot_context(
+                    rounds_without_todo=rounds_without_todo,
+                )
+                msgs_for_llm = self._build_request_messages(hot_text)
+                estimated_prompt_tokens = self.compressor.estimate_prompt_tokens(
+                    msgs_for_llm,
+                    system_prompt=self.system_prompt,
+                    tools=tools,
+                )
+                if self._check_auto_compress(estimated_prompt_tokens):
                     self.trace.record_compression()
+                hot_text = self._sync_compression_warning(hot_text)
 
                 # ── Safety net: normalize tool chains before API call ──
                 # Ensures no orphaned tool messages or broken tool_calls
                 self.messages = Compressor._clean_tool_chains(self.messages)
+
+                # Rebuild after compression.  Hot context remains transient
+                # and is counted exactly once as part of the request list.
+                msgs_for_llm = self._build_request_messages(hot_text)
+                estimated_prompt_tokens = self.compressor.estimate_prompt_tokens(
+                    msgs_for_llm,
+                    system_prompt=self.system_prompt,
+                    tools=tools,
+                )
 
                 # ── Log message structure for debugging ──
                 role_counts = Counter(m.role for m in self.messages)
@@ -1572,28 +1743,6 @@ class MiniClaudeAgent:
 
                 # ── Update trace with current message count ──
                 self.trace.set_message_count(len(self.messages))
-
-                # ── Build message list with hot context injected ──
-                # Hot context (todos, notifications, inbox) is assembled as a
-                # temporary injection — NEVER appended to self.messages — so
-                # the persisted history stays clean and prefix-cache-friendly.
-                hot_text = self._get_dynamic_hot_context(
-                    rounds_without_todo=rounds_without_todo,
-                )
-                if hot_text:
-                    msgs_for_llm = list(self.messages)  # shallow copy
-                    if msgs_for_llm and msgs_for_llm[-1].role == 'user':
-                        last = msgs_for_llm[-1]
-                        msgs_for_llm[-1] = Message(
-                            role='user',
-                            content=last.content + "\n\n" + hot_text,
-                        )
-                    else:
-                        msgs_for_llm.append(
-                            Message(role='user', content=hot_text)
-                        )
-                else:
-                    msgs_for_llm = self.messages
 
                 # ── LLM call with system prompt ──
                 response = provider.create_message(
@@ -1606,6 +1755,21 @@ class MiniClaudeAgent:
                 parsed = self._parse_response(provider, response)
                 content = parsed.get('content', '')
                 tool_calls = parsed.get('tool_calls', [])
+                finish_reason = parsed.get('finish_reason')
+                self.last_metrics["turns"] = iteration + 1
+
+                # A truncated response may contain incomplete text or tool
+                # calls. Never publish or execute either as a complete turn.
+                if finish_reason in {'length', 'max_tokens', 'limit'}:
+                    self._record_provider_usage(
+                        parsed.get('usage', {}),
+                        estimated_prompt_tokens=estimated_prompt_tokens,
+                        source="main",
+                    )
+                    self.trace.record_provider_finish_reason(finish_reason)
+                    self.trace.end_task("FAILED", "PROVIDER_OUTPUT_LIMIT")
+                    return "错误: 模型输出达到上限，本轮回复可能不完整，任务未完成。"
+                self.trace.record_provider_finish_reason(finish_reason)
 
                 if content and tool_calls:
                     logger.info("LLM_NOTE[%s]: %s", iteration + 1, content)
@@ -1623,11 +1787,14 @@ class MiniClaudeAgent:
 
                 # ── Accumulate benchmark metrics ──
                 usage = parsed.get('usage', {})
-                self.last_metrics["total_tokens"] += usage.get('total_tokens', 0)
-                self.last_metrics["turns"] = iteration + 1
-
-                # ── Trace: token usage ──
-                self.trace.record_tokens(usage.get('total_tokens', 0))
+                self._record_provider_usage(
+                    usage,
+                    estimated_prompt_tokens=estimated_prompt_tokens,
+                    source="main",
+                )
+                if not tool_calls and not content.strip():
+                    self.trace.end_task("FAILED", "EMPTY_PROVIDER_RESPONSE")
+                    return "错误: 模型未返回可见回复或工具调用，任务未完成。"
 
                 if not tool_calls:
                     self.messages.append(Message(role='assistant', content=content))

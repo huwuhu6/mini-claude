@@ -131,8 +131,29 @@ class TurnTrace:
     finished_at: float = 0.0
     message_count: int = 0
     tool_calls_count: int = 0
+    estimated_prompt_tokens: int = 0
+    actual_prompt_tokens: int = 0
+    main_prompt_tokens: int = 0
+    main_cached_tokens: int = 0
+    main_uncached_prompt_tokens: int = 0
+    main_cache_hit_rate: float = 0.0
+    prompt_tokens: int = 0
+    completion_tokens: int = 0
+    reasoning_tokens: int = 0
+    main_reasoning_tokens: int = 0
+    summary_reasoning_tokens: int = 0
+    cached_tokens: int = 0
+    uncached_prompt_tokens: int = 0
+    cache_hit_rate: float = 0.0
+    summary_prompt_tokens: int = 0
+    summary_completion_tokens: int = 0
+    summary_total_tokens: int = 0
+    summary_cached_tokens: int = 0
+    summary_uncached_prompt_tokens: int = 0
+    summary_cache_hit_rate: float = 0.0
     token_usage: int = 0
     assistant_content: str = ""
+    provider_finish_reason: str = ""
     compression_triggered: bool = False
     reflection_triggered: bool = False
     completion_guard_triggered: bool = False
@@ -145,8 +166,29 @@ class TurnTrace:
             'finished_at': round(self.finished_at, 3),
             'message_count': self.message_count,
             'tool_calls_count': self.tool_calls_count,
+            'estimated_prompt_tokens': self.estimated_prompt_tokens,
+            'actual_prompt_tokens': self.actual_prompt_tokens,
+            'main_prompt_tokens': self.main_prompt_tokens,
+            'main_cached_tokens': self.main_cached_tokens,
+            'main_uncached_prompt_tokens': self.main_uncached_prompt_tokens,
+            'main_cache_hit_rate': self.main_cache_hit_rate,
+            'prompt_tokens': self.prompt_tokens,
+            'completion_tokens': self.completion_tokens,
+            'reasoning_tokens': self.reasoning_tokens,
+            'main_reasoning_tokens': self.main_reasoning_tokens,
+            'summary_reasoning_tokens': self.summary_reasoning_tokens,
+            'cached_tokens': self.cached_tokens,
+            'uncached_prompt_tokens': self.uncached_prompt_tokens,
+            'cache_hit_rate': self.cache_hit_rate,
+            'summary_prompt_tokens': self.summary_prompt_tokens,
+            'summary_completion_tokens': self.summary_completion_tokens,
+            'summary_total_tokens': self.summary_total_tokens,
+            'summary_cached_tokens': self.summary_cached_tokens,
+            'summary_uncached_prompt_tokens': self.summary_uncached_prompt_tokens,
+            'summary_cache_hit_rate': self.summary_cache_hit_rate,
             'token_usage': self.token_usage,
             'assistant_content': self.assistant_content,
+            'provider_finish_reason': self.provider_finish_reason,
             'compression_triggered': self.compression_triggered,
             'reflection_triggered': self.reflection_triggered,
             'completion_guard_triggered': self.completion_guard_triggered,
@@ -162,6 +204,26 @@ class TaskTrace:
     finished_at: float = 0.0
     total_turns: int = 0
     total_tool_calls: int = 0
+    estimated_prompt_tokens: int = 0
+    actual_prompt_tokens: int = 0
+    main_prompt_tokens: int = 0
+    main_cached_tokens: int = 0
+    main_uncached_prompt_tokens: int = 0
+    main_cache_hit_rate: float = 0.0
+    prompt_tokens: int = 0
+    completion_tokens: int = 0
+    reasoning_tokens: int = 0
+    main_reasoning_tokens: int = 0
+    summary_reasoning_tokens: int = 0
+    cached_tokens: int = 0
+    uncached_prompt_tokens: int = 0
+    cache_hit_rate: float = 0.0
+    summary_prompt_tokens: int = 0
+    summary_completion_tokens: int = 0
+    summary_total_tokens: int = 0
+    summary_cached_tokens: int = 0
+    summary_uncached_prompt_tokens: int = 0
+    summary_cache_hit_rate: float = 0.0
     total_tokens: int = 0
     compression_count: int = 0
     rollback_count: int = 0
@@ -194,6 +256,26 @@ class TaskTrace:
             'finished_at': round(self.finished_at, 3),
             'total_turns': self.total_turns,
             'total_tool_calls': self.total_tool_calls,
+            'estimated_prompt_tokens': self.estimated_prompt_tokens,
+            'actual_prompt_tokens': self.actual_prompt_tokens,
+            'main_prompt_tokens': self.main_prompt_tokens,
+            'main_cached_tokens': self.main_cached_tokens,
+            'main_uncached_prompt_tokens': self.main_uncached_prompt_tokens,
+            'main_cache_hit_rate': self.main_cache_hit_rate,
+            'prompt_tokens': self.prompt_tokens,
+            'completion_tokens': self.completion_tokens,
+            'reasoning_tokens': self.reasoning_tokens,
+            'main_reasoning_tokens': self.main_reasoning_tokens,
+            'summary_reasoning_tokens': self.summary_reasoning_tokens,
+            'cached_tokens': self.cached_tokens,
+            'uncached_prompt_tokens': self.uncached_prompt_tokens,
+            'cache_hit_rate': self.cache_hit_rate,
+            'summary_prompt_tokens': self.summary_prompt_tokens,
+            'summary_completion_tokens': self.summary_completion_tokens,
+            'summary_total_tokens': self.summary_total_tokens,
+            'summary_cached_tokens': self.summary_cached_tokens,
+            'summary_uncached_prompt_tokens': self.summary_uncached_prompt_tokens,
+            'summary_cache_hit_rate': self.summary_cache_hit_rate,
             'total_tokens': self.total_tokens,
             'compression_count': self.compression_count,
             'rollback_count': self.rollback_count,

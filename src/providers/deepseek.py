@@ -212,38 +212,107 @@ class DeepseekProvider(LLMProvider):
         Returns:
             Parsed response dictionary
         """
-        try:
-            message = response.choices[0].message
-            content = message.content or ""
+        missing = object()
 
-            parsed = {
-                'content': content,
-                'tool_calls': [],
-                'usage': {
-                    'prompt_tokens': response.usage.prompt_tokens,
-                    'completion_tokens': response.usage.completion_tokens,
-                    'total_tokens': response.usage.total_tokens
-                }
-            }
+        def field(value: Any, name: str, default: Any = missing) -> Any:
+            if isinstance(value, dict):
+                return value.get(name, default)
+            return getattr(value, name, default)
 
-            # Parse tool calls if present
-            if hasattr(message, 'tool_calls') and message.tool_calls:
-                for tool_call in message.tool_calls:
-                    parsed['tool_calls'].append({
-                        'id': tool_call.id,
-                        'type': tool_call.type,
-                        'function': {
-                            'name': tool_call.function.name,
-                            'arguments': tool_call.function.arguments
-                        }
-                    })
+        choices = field(response, 'choices')
+        if not isinstance(choices, (list, tuple)) or not choices:
+            raise ValueError("OpenAI-compatible response 缺少有效 choices")
 
-            return parsed
+        message = field(choices[0], 'message')
+        if message is missing or message is None:
+            raise ValueError("OpenAI-compatible response 缺少有效 message")
+        finish_reason = field(choices[0], 'finish_reason', None)
+        if finish_reason is not None and not isinstance(finish_reason, str):
+            raise ValueError("Provider finish_reason 必须是字符串或 null")
 
-        except Exception as e:
-            logger.error(f"解析 Deepseek 响应时出错: {e}")
-            return {
-                'content': '',
-                'tool_calls': [],
-                'usage': {}
-            }
+        raw_content = field(message, 'content')
+        raw_tool_calls = field(message, 'tool_calls')
+        reasoning_content = field(message, 'reasoning_content', None)
+        if raw_content is missing and raw_tool_calls is missing and reasoning_content is None:
+            raise ValueError("Provider message 不是有效的消息对象")
+
+        content = '' if raw_content is missing else raw_content
+        if content is None:
+            content = ''
+        if not isinstance(content, str):
+            raise ValueError("Provider message.content 必须是字符串或 null")
+
+        if raw_tool_calls is missing:
+            raw_tool_calls = None
+        if raw_tool_calls is None:
+            raw_tool_calls = []
+        if finish_reason in {'length', 'max_tokens', 'limit'}:
+            # The provider may cut a tool call before its fields are complete.
+            # The runtime will reject this response using finish_reason.
+            raw_tool_calls = []
+        if not isinstance(raw_tool_calls, (list, tuple)):
+            raise ValueError("Provider message.tool_calls 必须是数组")
+
+        tool_calls = []
+        for index, tool_call in enumerate(raw_tool_calls):
+            if tool_call is None:
+                raise ValueError(f"Provider tool_call[{index}] 为空")
+            call_id = field(tool_call, 'id')
+            if not isinstance(call_id, str) or not call_id.strip():
+                raise ValueError(f"Provider tool_call[{index}] 缺少有效 id")
+
+            function = field(tool_call, 'function')
+            if function is missing or function is None:
+                raise ValueError(f"Provider tool_call[{index}] 缺少 function")
+            name = field(function, 'name')
+            arguments = field(function, 'arguments')
+            if not isinstance(name, str) or not name.strip():
+                raise ValueError(f"Provider tool_call[{index}] 缺少有效 function.name")
+            if not isinstance(arguments, str):
+                raise ValueError(
+                    f"Provider tool_call[{index}].function.arguments 必须是字符串"
+                )
+
+            call_type = field(tool_call, 'type', 'function')
+            if not isinstance(call_type, str) or not call_type.strip():
+                raise ValueError(f"Provider tool_call[{index}] type 无效")
+            tool_calls.append({
+                'id': call_id,
+                'type': call_type,
+                'function': {'name': name, 'arguments': arguments},
+            })
+
+        # Usage is observability metadata.  A semantically valid response is
+        # still usable when a compatible provider omits it.
+        usage = field(response, 'usage', None)
+
+        def usage_value(name: str) -> int:
+            value = field(usage, name, 0) if usage is not None else 0
+            return value if isinstance(value, int) and value >= 0 else 0
+
+        prompt_details = field(usage, 'prompt_tokens_details', None)
+        completion_details = field(usage, 'completion_tokens_details', None)
+
+        def cached_usage_value() -> int:
+            value = field(prompt_details, 'cached_tokens', 0)
+            return value if isinstance(value, int) and value >= 0 else 0
+
+        prompt_tokens = usage_value('prompt_tokens')
+        cached_tokens = min(cached_usage_value(), prompt_tokens)
+        reasoning_tokens = field(completion_details, 'reasoning_tokens', 0)
+        if not isinstance(reasoning_tokens, int) or reasoning_tokens < 0:
+            reasoning_tokens = 0
+
+        return {
+            'content': content,
+            'tool_calls': tool_calls,
+            'finish_reason': finish_reason,
+            'reasoning_content_chars': len(reasoning_content) if isinstance(reasoning_content, str) else 0,
+            'usage': {
+                'prompt_tokens': prompt_tokens,
+                'completion_tokens': usage_value('completion_tokens'),
+                'total_tokens': usage_value('total_tokens'),
+                'cached_tokens': cached_tokens,
+                'reasoning_tokens': reasoning_tokens,
+            },
+        }

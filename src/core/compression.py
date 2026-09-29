@@ -7,6 +7,7 @@ import logging
 import json
 import time
 import uuid
+import re
 from pathlib import Path
 from dataclasses import dataclass, field
 from typing import List, Optional, Dict, Any
@@ -14,16 +15,21 @@ from typing import List, Optional, Dict, Any
 from providers.base import Message
 
 logger = logging.getLogger(__name__)
+SUMMARY_MAX_OUTPUT_TOKENS = 600
 
-# Try to use tiktoken for accurate token counting; fallback to rough estimate
+# cl100k_base is only an estimate for the active DeepSeek model.  Provider
+# reported usage remains the source of truth after a request completes.
 _TIKTOKEN_AVAILABLE = False
 _ENCODING = None
 try:
     import tiktoken
     _ENCODING = tiktoken.get_encoding("cl100k_base")
     _TIKTOKEN_AVAILABLE = True
-except ImportError:
-    logger.info("tiktoken 未安装，将使用粗略估算（1 token ≈ 4 字符）")
+except Exception as exc:
+    logger.info(
+        "tiktoken 不可用，将使用粗略 estimated token 估算（1 token ≈ 4 字符）: %s",
+        exc,
+    )
 
 
 @dataclass
@@ -56,17 +62,26 @@ class Compressor:
 
     def __init__(self, config: Optional[Dict[str, Any]] = None):
         cfg = config or {}
-        self.token_threshold = cfg.get('token_threshold', 100000)
-        self.max_transcripts = cfg.get('max_transcripts', 100)
-        self.microcompact_threshold = cfg.get('microcompact_threshold', 3)
+        self.context_window_tokens = int(cfg.get('context_window_tokens', 1_000_000))
+        self.microcompact_token_threshold = int(
+            cfg.get('microcompact_token_threshold', 250_000)
+        )
+        self.full_compression_token_threshold = int(
+            cfg.get('full_compression_token_threshold', 500_000)
+        )
+        self._validate_thresholds()
+        self.max_transcripts = max(0, int(cfg.get('max_transcripts', 100)))
         self._transcripts: Dict[str, CompressedTranscript] = {}
         self._transcript_dir: Optional[Path] = None
         self._provider: Any = None  # LLMProvider for real summarization
+        self._last_summary_usage: Optional[Dict[str, int]] = None
 
         transcript_dir = cfg.get('transcript_dir', '')
         if transcript_dir:
             self._transcript_dir = Path(transcript_dir)
             self._transcript_dir.mkdir(parents=True, exist_ok=True)
+            self._load_persisted_transcripts()
+            self._prune_old_transcripts()
 
     def set_provider(self, provider: Any) -> None:
         """Inject an LLM provider for AI-powered summarization.
@@ -80,34 +95,152 @@ class Compressor:
     # ── Token Estimation ──────────────────────────────────────
 
     def estimate_tokens(self, messages: List[Message]) -> int:
-        """Accurate token count using tiktoken (cl100k_base). Falls back to 1 token ≈ 4 characters."""
+        """Return an estimated token count for persisted messages.
+
+        ``cl100k_base`` is not the DeepSeek tokenizer, so this value must not
+        be presented as an exact/provider-reported count.
+        """
         if _TIKTOKEN_AVAILABLE and _ENCODING is not None:
             total = 0
             for msg in messages:
-                # Encode the content text
                 total += len(_ENCODING.encode(msg.content or ""))
+                total += len(_ENCODING.encode(self._message_metadata_text(msg)))
                 # Add overhead for message role formatting (~4 tokens per message)
                 total += 4
             return total
         # Fallback: rough estimate
-        total_chars = sum(len(m.content or "") for m in messages)
+        total_chars = sum(
+            len(m.content or "") + len(self._message_metadata_text(m))
+            for m in messages
+        )
         return total_chars // 4
 
+    def estimate_prompt_tokens(
+        self,
+        messages: List[Message],
+        system_prompt: str = "",
+        tools: Optional[List[Any]] = None,
+    ) -> int:
+        """Estimate the complete OpenAI-compatible prompt sent to a provider.
+
+        ``messages`` must be the exact request message list, including any
+        temporary hot-context injection.  It is therefore counted once here,
+        while system and tool definitions are added as their separate request
+        components.
+        """
+        total = self.estimate_tokens(messages)
+        if system_prompt:
+            total += self.estimate_tokens_for_text(system_prompt)
+        if tools:
+            total += self.estimate_tokens_for_text(self._stable_json(tools))
+        return total
+
+    @staticmethod
+    def _stable_json(value: Any) -> str:
+        """Serialize tool definitions deterministically for estimation."""
+        try:
+            return json.dumps(
+                value,
+                ensure_ascii=False,
+                sort_keys=True,
+                separators=(',', ':'),
+                default=lambda obj: vars(obj),
+            )
+        except (TypeError, ValueError):
+            return str(value)
+
+    @staticmethod
+    def _message_metadata_text(message: Message) -> str:
+        """Serialize persisted message fields that are not part of ``content``."""
+        metadata: Dict[str, Any] = {}
+        if message.name:
+            metadata['name'] = message.name
+        if message.tool_calls:
+            metadata['tool_calls'] = message.tool_calls
+        if message.tool_call_id:
+            metadata['tool_call_id'] = message.tool_call_id
+        if not metadata:
+            return ""
+        try:
+            return json.dumps(metadata, ensure_ascii=False, sort_keys=True, default=str)
+        except (TypeError, ValueError):
+            return str(metadata)
+
     def estimate_tokens_for_text(self, text: str) -> int:
-        """Accurate token count for a single text string."""
+        """Return an estimated token count for a text string."""
         if _TIKTOKEN_AVAILABLE and _ENCODING is not None:
             return len(_ENCODING.encode(text or ""))
         return len(text or "") // 4
 
     # ── Compression Decision ──────────────────────────────────
 
-    def should_compress(self, messages: List[Message]) -> bool:
-        """Check if messages exceed the token threshold."""
-        return self.estimate_tokens(messages) > self.token_threshold
+    def _validate_thresholds(self) -> None:
+        if self.context_window_tokens <= 0:
+            raise ValueError("compression.context_window_tokens must be positive")
+        if self.microcompact_token_threshold <= 0:
+            raise ValueError("compression.microcompact_token_threshold must be positive")
+        if self.full_compression_token_threshold <= 0:
+            raise ValueError("compression.full_compression_token_threshold must be positive")
+        if self.microcompact_token_threshold >= self.full_compression_token_threshold:
+            raise ValueError(
+                "compression.microcompact_token_threshold must be less than "
+                "full_compression_token_threshold"
+            )
+        if self.full_compression_token_threshold > self.context_window_tokens:
+            raise ValueError(
+                "compression.full_compression_token_threshold must not exceed "
+                "context_window_tokens"
+            )
 
-    def should_microcompact(self, messages: List[Message]) -> bool:
-        """Check if rapid growth suggests micro-compaction."""
-        return self.estimate_tokens(messages) > self.token_threshold * 0.7
+    def should_compress(
+        self,
+        messages: List[Message],
+        estimated_prompt_tokens: Optional[int] = None,
+    ) -> bool:
+        """Check whether estimated prompt usage reaches the Full threshold."""
+        estimate = (
+            self.estimate_tokens(messages)
+            if estimated_prompt_tokens is None else estimated_prompt_tokens
+        )
+        return estimate >= self.full_compression_token_threshold
+
+    def should_microcompact(
+        self,
+        messages: List[Message],
+        estimated_prompt_tokens: Optional[int] = None,
+    ) -> bool:
+        """Check whether estimated prompt usage reaches the Micro threshold."""
+        estimate = (
+            self.estimate_tokens(messages)
+            if estimated_prompt_tokens is None else estimated_prompt_tokens
+        )
+        return (
+            estimate >= self.microcompact_token_threshold
+            and self._has_microcompact_candidates(messages)
+        )
+
+    def _has_microcompact_candidates(self, messages: List[Message]) -> bool:
+        """Return whether micro-compaction can make a meaningful change."""
+        if len(messages) < 10:
+            return False
+
+        protect_start = max(len(messages) - 6, 2)
+        todo_count = 0
+        for i, msg in enumerate(messages):
+            if i < 2 or i >= protect_start or msg.role != 'tool':
+                continue
+
+            tool_name = self._infer_tool_name(messages, i)
+            if tool_name in ('bash', 'search_code', 'count_occurrences'):
+                if len(msg.content or '') > 300:
+                    return True
+            elif tool_name == 'TodoWrite':
+                todo_count += 1
+            elif tool_name in ('read_file', 'edit_file'):
+                if len(msg.content or '') > 5000:
+                    return True
+
+        return todo_count > 1
 
     def has_microcompact_work(self, messages: List[Message]) -> bool:
         """Avoid warning the model when every eligible result is already compact."""
@@ -162,10 +295,20 @@ class Compressor:
 
             # ── Tier 1：重型标准输出工具 ──
             if tool_name in ('bash', 'search_code', 'count_occurrences'):
-                if len(msg.content) > 300:
+                if len(msg.content or '') > 300:
+                    status = self._infer_tool_execution_status(msg.content)
+                    if status is True:
+                        status_text = "Execution completed; output details were omitted."
+                    elif status is False:
+                        status_text = "Execution failed; output details were omitted."
+                    else:
+                        status_text = (
+                            "Execution status was not encoded in this message; "
+                            "output details were omitted."
+                        )
                     msg.content = (
-                        "[System: Command output truncated to save context window. "
-                        "Execution was recorded as successful.]"
+                        "[System: Tool output truncated to save context window. "
+                        f"{status_text}]"
                     )
                 continue
 
@@ -175,7 +318,7 @@ class Compressor:
                 continue
 
             # ── Tier 3：核心资产（read_file / edit_file） ──
-            if tool_name in ('read_file', 'edit_file') and len(msg.content) > 5000:
+            if tool_name in ('read_file', 'edit_file') and len(msg.content or '') > 5000:
                 head = msg.content[:500]
                 tail = msg.content[-500:]
                 msg.content = (
@@ -190,6 +333,18 @@ class Compressor:
             messages[idx].content = "[System: State superseded by newer TodoWrite.]"
 
         return messages
+
+    @staticmethod
+    def _infer_tool_execution_status(content: str) -> Optional[bool]:
+        """Read only explicit exit-code facts; never infer status from tool name."""
+        first_line = (content or '').splitlines()[0] if content else ''
+        match = re.match(
+            r'^\[(?:Command executed with exit code|Exit Code:)\s*(-?\d+)\]',
+            first_line,
+        )
+        if not match:
+            return None
+        return int(match.group(1)) == 0
 
     @staticmethod
     def _infer_tool_name(messages: List[Message], tool_idx: int) -> str:
@@ -224,28 +379,32 @@ class Compressor:
         token_estimate = self.estimate_tokens(messages)
         message_count = len(messages)
 
-        # Keep first 2 (system + intro) and last 15 messages
-        head = messages[:2]
-        tail = list(messages[-15:])
+        # Keep first 2 (system + intro) and last 15 messages, but never split
+        # an assistant(tool_calls) -> tool result segment at the tail boundary.
+        tail_start = max(2, len(messages) - 15)
+        if tail_start < len(messages) and messages[tail_start].role == 'tool':
+            while tail_start > 2 and messages[tail_start - 1].role == 'tool':
+                tail_start -= 1
+            if (
+                tail_start > 2
+                and messages[tail_start - 1].role == 'assistant'
+                and messages[tail_start - 1].tool_calls
+            ):
+                tail_start -= 1
 
-        # Extend tail to include any tool messages that belong to a
-        # tool_calls assistant message at the start of the tail window.
-        # Only adds messages NOT already in tail to avoid duplicates.
-        tail_set = set(id(m) for m in tail)
-        for i, msg in enumerate(tail):
-            if msg.role == 'assistant' and msg.tool_calls:
-                tool_call_ids = {tc.get('id', '') for tc in msg.tool_calls}
-                idx = len(messages) - 15 + i + 1
-                while idx < len(messages) and messages[idx].role == 'tool':
-                    if messages[idx].tool_call_id in tool_call_ids and id(messages[idx]) not in tail_set:
-                        tail.append(messages[idx])
-                        tail_set.add(id(messages[idx]))
-                    idx += 1
-                break
+        head = messages[:2]
+        tail = list(messages[tail_start:])
 
         # Summarize the middle
-        middle = messages[2:-15]
+        middle = messages[2:tail_start]
+        if not middle:
+            # A summary without a source segment would expand the history and
+            # create a false compression event on every subsequent turn.
+            return messages
         summary = self._generate_summary(middle)
+        if not isinstance(summary, str) or not summary.strip():
+            logger.warning("Full Compression 未生成可用摘要，保留原始消息")
+            return messages
 
         # Create a compressed transcript record
         transcript = CompressedTranscript(
@@ -254,8 +413,6 @@ class Compressor:
             message_count=message_count,
             original_token_estimate=token_estimate,
         )
-
-        self._save_transcript(transcript)
 
         # Build compressed message list
         compressed = list(head)
@@ -269,6 +426,11 @@ class Compressor:
         cleaned = self._clean_tool_chains(compressed)
         # Final sanitize pass: guarantee tool_calls↔tool absolute closure
         cleaned = self.sanitize_openai_messages(cleaned)
+
+        # Commit only after the candidate has been built and sanitized.  A
+        # failed summary must not destroy source history or create a false
+        # successful transcript.
+        self._save_transcript(transcript)
 
         logger.info(
             f"已压缩 {message_count} 条消息（{token_estimate} tokens）-> "
@@ -350,7 +512,8 @@ class Compressor:
         for msg in messages:
             if msg.role == 'assistant' and msg.tool_calls:
                 for tc in msg.tool_calls:
-                    from_assistant.add(tc.get('id', ''))
+                    if isinstance(tc, dict) and tc.get('id'):
+                        from_assistant.add(tc['id'])
             elif msg.role == 'tool' and msg.tool_call_id:
                 from_tool.add(msg.tool_call_id)
 
@@ -364,7 +527,10 @@ class Compressor:
                     valid_ids.discard(msg.tool_call_id)
                     cleaned.append(msg)
             elif msg.role == 'assistant' and msg.tool_calls:
-                valid = [tc for tc in msg.tool_calls if tc.get('id', '') in valid_ids]
+                valid = [
+                    tc for tc in msg.tool_calls
+                    if isinstance(tc, dict) and tc.get('id', '') in valid_ids
+                ]
                 if valid:
                     new = copy.deepcopy(msg)
                     new.tool_calls = valid
@@ -378,17 +544,21 @@ class Compressor:
 
     # ── Summarization ──────────────────────────────────────────
 
-    def _generate_summary(self, messages: List[Message]) -> str:
+    def _generate_summary(self, messages: List[Message]) -> Optional[str]:
         """Generate a high-level summary preserving only what's needed for continuity.
 
-        Delegates to an LLM when available; falls back to statistical summary.
+        Delegates to an LLM when available.  Statistical summarization is an
+        intentional fallback only when no provider is configured; provider
+        failures return ``None`` so Full Compression can fail closed.
         """
         # ── Primary: LLM-powered summary ──────────────────────
         if self._provider:
+            self._last_summary_usage = None
             try:
                 return self._llm_summarize(messages)
             except Exception as e:
-                logger.warning(f"LLM 总结失败，回退到统计摘要: {e}")
+                logger.warning(f"LLM 总结失败，Full Compression fail-closed: {e}")
+                return None
 
         # ── Fallback: statistical summary ─────────────────────
         return self._statistical_summary(messages)
@@ -396,49 +566,83 @@ class Compressor:
     def _llm_summarize(self, messages: List[Message]) -> str:
         """Call the LLM to produce a high-level intent summary.
 
-        The summarization request is intentionally small (max 600 output
-        tokens, no tools) so it cannot trigger recursive compression or
-        runaway token usage.
+        The summarization request has no tools and a bounded output.  The
+        complete middle is passed to the provider; if it cannot fit the
+        configured context window, the request fails closed instead of
+        silently dropping an arbitrary prefix or suffix.
         """
-        # Build a compact text representation of the messages to compress
+        # Preserve the complete middle, including tool-call metadata.  This is
+        # deliberately not a lossy per-message or tail-only representation.
         lines: List[str] = []
         for m in messages:
             role = m.role
-            content = (m.content or "")[:2000]  # per-message cap
-            lines.append(f"[{role}]: {content}")
+            metadata = self._message_metadata_text(m)
+            suffix = f"\n[metadata]: {metadata}" if metadata else ""
+            lines.append(f"[{role}]: {m.content or ''}{suffix}")
         conv_text = "\n".join(lines)
 
-        # Keep the prompt under ~12K chars to stay within safe bounds
-        if len(conv_text) > 12000:
-            conv_text = conv_text[-12000:]
+        prompt = (
+            "Summarize the high-level intent and current progress of "
+            "this conversation. Do not attempt to summarize code blocks, "
+            "file contents, or exact IDs. Focus entirely on what has been "
+            "accomplished so far and what the immediate next blocked step "
+            "is. Keep it concise.\n\n"
+        )
 
         summary_msgs = [
             Message(
                 role="user",
-                content=(
-                    "Summarize the high-level intent and current progress of "
-                    "this conversation. Do not attempt to summarize code blocks, "
-                    "file contents, or exact IDs. Focus entirely on what has been "
-                    "accomplished so far and what the immediate next blocked step "
-                    "is. Keep it concise.\n\n"
-                    f"{conv_text}"
-                ),
+                content=prompt + conv_text,
             )
         ]
 
+        summary_estimate = self.estimate_tokens(summary_msgs)
+        if summary_estimate + SUMMARY_MAX_OUTPUT_TOKENS > self.context_window_tokens:
+            raise ValueError(
+                "summary input plus output reserve exceeds configured context window; "
+                "Full Compression preserved the original history"
+            )
+
         response = self._provider.create_message(
             summary_msgs,
-            max_tokens=600,
+            max_tokens=SUMMARY_MAX_OUTPUT_TOKENS,
             temperature=0.3,
         )
         parsed = self._provider.parse_response(response)
-        summary = parsed.get("content", "") or "(summary unavailable)"
+        summary = parsed.get("content", "") if isinstance(parsed, dict) else ""
+        raw_usage = parsed.get("usage", {}) if isinstance(parsed, dict) else {}
+        self._last_summary_usage = self._normalize_usage(raw_usage)
+        if not isinstance(summary, str) or not summary.strip():
+            raise ValueError("LLM summary response has no usable content")
 
         logger.debug(
             f"LLM 总结完成: {len(conv_text)} chars input → "
             f"{len(summary)} chars summary"
         )
         return summary.strip()
+
+    @staticmethod
+    def _normalize_usage(usage: Any) -> Dict[str, int]:
+        """Normalize optional provider usage without making it look exact."""
+        if not isinstance(usage, dict):
+            usage = {}
+
+        def non_negative_int(name: str) -> int:
+            value = usage.get(name, 0)
+            return value if isinstance(value, int) and value >= 0 else 0
+
+        return {
+            'prompt_tokens': non_negative_int('prompt_tokens'),
+            'completion_tokens': non_negative_int('completion_tokens'),
+            'total_tokens': non_negative_int('total_tokens'),
+            'cached_tokens': non_negative_int('cached_tokens'),
+        }
+
+    def consume_last_summary_usage(self) -> Optional[Dict[str, int]]:
+        """Return and clear usage from the most recent LLM summary request."""
+        usage = self._last_summary_usage
+        self._last_summary_usage = None
+        return dict(usage) if usage is not None else None
 
     def _statistical_summary(self, messages: List[Message]) -> str:
         """Lightweight summary from message counts and keywords."""
@@ -467,8 +671,86 @@ class Compressor:
 
     # ── Transcript Management ─────────────────────────────────
 
-    def _save_transcript(self, transcript: CompressedTranscript) -> None:
-        self._transcripts[transcript.id] = transcript
+    def _load_persisted_transcripts(self) -> None:
+        """Load valid transcript files so retention survives process restarts."""
+        if not self._transcript_dir or not self._transcript_dir.exists():
+            return
+
+        candidates: Dict[str, List[CompressedTranscript]] = {}
+        for path in self._transcript_dir.glob("transcript_*.json"):
+            try:
+                with path.open('r', encoding='utf-8') as f:
+                    data = json.load(f)
+                if not isinstance(data, dict):
+                    raise ValueError("transcript JSON must be an object")
+
+                transcript_id = str(data.get('id') or "").strip()
+                summary = data.get('summary')
+                if not transcript_id or not isinstance(summary, str):
+                    raise ValueError("transcript metadata is incomplete")
+
+                transcript = CompressedTranscript(
+                    id=transcript_id,
+                    summary=summary,
+                    message_count=int(data.get('message_count', 0)),
+                    original_token_estimate=int(data.get('original_token_estimate', 0)),
+                    created_at=float(data.get('created_at', path.stat().st_mtime)),
+                    store_path=str(path),
+                )
+                filename_id = path.name[len("transcript_"):-len(".json")]
+                if filename_id != transcript.id:
+                    logger.warning(
+                        "Transcript 文件名 ID 与内容 ID 不一致: %s -> %s",
+                        path,
+                        transcript.id,
+                    )
+                candidates.setdefault(transcript.id, []).append(transcript)
+            except (OSError, TypeError, ValueError, json.JSONDecodeError) as exc:
+                logger.warning("跳过无效 Transcript %s: %s", path, exc)
+
+        for transcript_id, entries in candidates.items():
+            # If duplicate artifacts claim one ID, retain the newest valid
+            # record (path name is a deterministic tie-breaker) and remove
+            # the other managed artifacts.  They must not silently become
+            # unmanaged files after the in-memory dict collapses the ID.
+            canonical = max(
+                entries,
+                key=lambda item: (item.created_at, item.store_path or ""),
+            )
+            self._transcripts[transcript_id] = canonical
+            for duplicate in entries:
+                if duplicate is canonical or not duplicate.store_path:
+                    continue
+                try:
+                    Path(duplicate.store_path).unlink()
+                except OSError as exc:
+                    logger.warning(
+                        "删除重复 Transcript %s 失败，已从索引排除: %s",
+                        duplicate.store_path,
+                        exc,
+                    )
+
+    def _prune_old_transcripts(self) -> None:
+        """Apply retention to both in-memory and persisted transcripts."""
+        transcripts = sorted(
+            self._transcripts.values(),
+            key=lambda transcript: transcript.created_at,
+        )
+        while len(transcripts) > self.max_transcripts:
+            old = transcripts.pop(0)
+            if old.store_path:
+                try:
+                    Path(old.store_path).unlink()
+                except OSError as exc:
+                    # Keep the index aligned with the durable record when
+                    # deletion fails; silently dropping it would make a
+                    # later process rediscover the same retained artifact.
+                    logger.warning("删除旧 Transcript %s 失败: %s", old.store_path, exc)
+                    continue
+            self._transcripts.pop(old.id, None)
+
+    def _save_transcript(self, transcript: CompressedTranscript) -> bool:
+        """Persist a transcript before publishing it in the in-memory index."""
         if self._transcript_dir:
             path = self._transcript_dir / f"transcript_{transcript.id}.json"
             transcript.store_path = str(path)
@@ -478,18 +760,11 @@ class Compressor:
                     json.dump(transcript.to_dict(), f, indent=2)
             except Exception as e:
                 logger.error(f"保存对话记录失败: {e}")
+                return False
 
-        # Prune old transcripts
-        ids = sorted(self._transcripts.keys(),
-                     key=lambda i: self._transcripts[i].created_at)
-        while len(ids) > self.max_transcripts:
-            old_id = ids.pop(0)
-            old = self._transcripts.pop(old_id, None)
-            if old and old.store_path:
-                try:
-                    Path(old.store_path).unlink()
-                except OSError:
-                    pass
+        self._transcripts[transcript.id] = transcript
+        self._prune_old_transcripts()
+        return True
 
     def get_transcripts(self) -> List[CompressedTranscript]:
         return sorted(self._transcripts.values(),
@@ -498,6 +773,8 @@ class Compressor:
     def get_compression_stats(self) -> Dict[str, Any]:
         return {
             'total_transcripts': len(self._transcripts),
-            'token_threshold': self.token_threshold,
+            'context_window_tokens': self.context_window_tokens,
+            'microcompact_token_threshold': self.microcompact_token_threshold,
+            'full_compression_token_threshold': self.full_compression_token_threshold,
             'max_transcripts': self.max_transcripts,
         }

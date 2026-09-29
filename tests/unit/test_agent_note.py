@@ -70,18 +70,24 @@ def _check_microcompression(data_root):
     agent.feature_manager = SimpleNamespace(is_enabled=lambda name: True)
     agent.messages = _tool_history()
     measured = Compressor().estimate_tokens(agent.messages)
-    agent.compressor = Compressor({"token_threshold": int(measured / 0.8)})
+    agent.compressor = Compressor({
+        "microcompact_token_threshold": max(1, measured - 1),
+        "full_compression_token_threshold": measured * 2,
+    })
     agent._compression_notice_pending = False
     agent.todo = SimpleNamespace(has_open_items=lambda: False)
     agent._drain_background_notifications = lambda: None
     agent._check_inbox = lambda: None
 
+    hot_before_check = agent._get_dynamic_hot_context()
     assert not agent._check_auto_compress()
     assert "重要诊断 0" in agent.messages[2].content
-    assert "update_agent_note" in agent._get_dynamic_hot_context()
+    assert "update_agent_note" in agent._sync_compression_warning(hot_before_check)
 
     assert agent._handle_update_agent_note("用户约束：JDK 21\n已验证：重要诊断 0").success
+    hot_before_compression = agent._get_dynamic_hot_context()
     assert agent._check_auto_compress()
+    assert "compression-warning" not in agent._sync_compression_warning(hot_before_compression)
     assert "重要诊断 0" not in agent.messages[2].content
     assert "JDK 21" in agent._get_dynamic_hot_context()
     assert not agent._check_auto_compress()
@@ -97,7 +103,10 @@ def _check_full_compression(data_root):
     agent = MiniClaudeAgent.__new__(MiniClaudeAgent)
     agent.agent_note = AgentNote(data_root)
     agent.feature_manager = SimpleNamespace(is_enabled=lambda name: True)
-    agent.compressor = Compressor({"token_threshold": 1000})
+    agent.compressor = Compressor({
+        "microcompact_token_threshold": 1,
+        "full_compression_token_threshold": 2,
+    })
     agent.messages = _tool_history(10)
     agent._compression_notice_pending = False
 
