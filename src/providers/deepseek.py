@@ -4,7 +4,7 @@ import os
 import re
 from urllib.parse import urlparse
 from typing import List, Dict, Any, Optional
-from openai import OpenAI
+from openai import APITimeoutError, OpenAI
 
 from .base import LLMProvider, Message, ToolDefinition
 
@@ -27,7 +27,7 @@ class DeepseekProvider(LLMProvider):
             api_key=api_key,
             base_url=base_url,
             timeout=self.timeout,
-            max_retries=0,
+            max_retries=1,
         )
         logger.info(f"{self.provider_name} 提供者已初始化，模型: {self.model}")
 
@@ -129,7 +129,10 @@ class DeepseekProvider(LLMProvider):
         status = getattr(error, "status_code", None)
         if status is not None:
             category = "HTTP_STATUS"
-        elif any("timeout" in item["message"].lower() for item in chain):
+        elif isinstance(error, APITimeoutError) or any(
+            "timeout" in item["type"].lower() or "timed out" in item["message"].lower()
+            for item in chain
+        ):
             category = "TIMEOUT"
         elif any("connect" in item["type"].lower() or "connection" in item["message"].lower() for item in chain):
             category = "CONNECTION"

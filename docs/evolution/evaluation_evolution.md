@@ -678,3 +678,79 @@ v8 首次捕获到具体运行时异常：`Invalid \\escape: line 1 column 22`�
 
 基线的失败不应污染下一轮。验证器从原始 Trace 中解析本用例 `run_background` 返回的 Popen PID，在完成端口
 判定后只终止该 PID 的进程树。它不扫描端口，也不终止不属于该 fixture 的其他进程。
+
+## 2026-09-26：Harbor 公开评测接入
+
+Commit: `8034061`, `4a754f4`
+Commit Description: `feat(eval): 增加非交互 Agent 单次执行入口`；`feat(eval): 接入 Harbor 自定义 Agent 适配器`
+
+### Description
+
+原有 CLI 面向交互式 REPL，而内部 Evaluation Runner 直接管理 Agent 生命周期。为了接入公开 Benchmark，新增一个显式绑定 workspace 的单次执行入口，复用现有 Agent、ProviderManager、WorkspaceAuthority 和 Trace；Harbor 适配器只负责把当前源码构建为 wheel、送入任务容器、传入任务指令并运行该入口。任务是否成功仍由 Harbor verifier 判定。适配器不包含 Terminal-Bench 任务语义，未来可由相同入口调用其他 Harbor dataset。
+
+### Result / Evidence
+
+Harbor 固定为 `0.23.0`。headless/adapter 确定性测试 `7 passed`；受影响的 CLI、RuntimeContext、Agent、Trace、Evaluation 回归 `110 passed`；本地 wheel 检查确认包含 headless 模块和 console entry。
+
+Terminal-Bench 2.0 Oracle 仅尝试了 1 个 task：`terminal-bench/make-mips-interpreter`。Harbor 下载了任务，但 Docker 从配置的 USTC registry mirror 拉取 `alexgshaw/make-mips-interpreter:20251031` 时返回 EOF，容器未启动，verifier 未执行。因此尚无有效 Oracle reward，也未运行 MiniClaude 的真实 Provider smoke。Windows GBK 控制台随后在输出错误堆栈时发生编码异常；它不是任务失败的根因。
+
+### Decision / Limitation
+
+本阶段仅提交并推送可确定性验证的 feature branch。正式集成前须恢复 Docker 镜像拉取并通过 Oracle 与 MiniClaude 单任务 smoke。当前结果不能证明 Harbor 端到端接入已成功，更不能说明 MiniClaude 的 Terminal-Bench 能力。原生 Trace 中的部分文件重读指标在此基线尚不存在，不能当作已采集指标。
+
+### 同日环境复核
+
+Docker daemon 版本 `29.2.0` 一直正常运行。Host 的 Clash `127.0.0.1:7890` 可连，Docker Hub 经代理返回正常的 HTTP 401 认证挑战；USTC mirror 经代理访问仍中断。将同一镜像以明确的 `registry-1.docker.io` 地址拉取后，本地加上任务预期镜像名，不修改全局 Docker 设置。重跑同一个 `terminal-bench/make-mips-interpreter` Oracle task：1 trial、0 exception、reward `1.0`，耗时约 1 分 45 秒。前述“Oracle 未通过”结论因此只适用于首次网络失败的 trial，Harbor/Docker/verifier 链路已由后一次结果证明可用。
+
+MiniClaude 真实 smoke 在启动前被自动审批拦截：已有的对外发送授权只覆盖旧的 `task_036` qualification，未覆盖这次 Terminal-Bench 指令及容器工作区发送到 DashScope。未发起 Provider 请求，也没有 MiniClaude trial/reward。获得该具体数据范围的授权前不运行 MiniClaude 或 3-task smoke，也不将 feature branch 合并进基线分支。
+
+## 2026-09-27：Harbor 单任务真实 smoke
+
+Commit: `4a754f4`
+Commit Description: `feat(eval): 接入 Harbor 自定义 Agent 适配器`
+
+### Description
+
+获得对 `terminal-bench/make-mips-interpreter` 的明确授权后，仅运行一次 MiniClaude smoke。Harbor 宿主进程需要将仓库根目录加入 `PYTHONPATH` 才能导入位于 `benchmark/` 的适配器；首次命令在创建 trial 前因未设置该路径失败，没有发送 Provider 请求。修正启动环境后，同一任务完成了一个 trial，未修改 Agent、适配器、任务或生产配置。
+
+### Result / Evidence
+
+Harbor 安装了 MiniClaude wheel，在容器 `/app` 启动 headless Agent，执行 verifier 并保存原生 Trace。运行过程中完成 3 次 DashScope 响应、6 次工具调用（5 次 `bash`、1 次 `list_files`），累计 Provider 报告 prompt `13,527`、completion `512`、total `14,039` tokens。第 4 次模型请求在现有 20 秒请求超时后终止；Agent `final_status=FAILED`，Harbor 0 exception、reward `0.0`，trial 约 2 分 7 秒。Verifier 未通过，但运行未能完成，不能据此判断模型在该任务上的正常完成能力。Harbor 未提供美元成本，不能从 token 数推称已知费用。结果和 trace 保存在被 Git 忽略的 `benchmark/harbor/jobs/mini-claude-smoke/`。
+
+### Decision / Limitation
+
+这次验证了 adapter/容器/workspace/工具/verifier/trace 链路，但未验证 Agent 正常结束的端到端流程。按单任务止损要求，不追加试验，不运行 3-task smoke，不因任务 reward 调整 Agent。由于真实任务因 Provider 超时而失败，暂不合并至 `refactor/context-baseline-modernization`；下一步需要单独授权并解决请求超时或网络稳定性，随后再按既定门槛复核。
+
+## 2026-09-27：Provider 超时修复与 Harbor 单任务复核
+
+Commit: `6c87d1e`
+Commit Description: `fix(provider): 延长请求超时并重试瞬时失败`
+
+### Description
+
+前次单任务 smoke 的异常链是 `APITimeoutError → ReadTimeout`。生产配置将每次模型请求限制为 20 秒，OpenAI-compatible 客户端又显式关闭重试，因此一次读取响应超时就让整个 Agent 任务进入 `FAILED`。诊断分类只匹配异常消息中的 `timeout`，未识别 `Request timed out.`，还将超时误报为普通 `PROVIDER_ERROR`。本次将默认等待设为 60 秒，允许客户端对暂时性失败最多重试一次，并修正超时分类；没有改变 Agent Loop、Benchmark Case 或 verifier。
+
+### Result / Evidence
+
+Provider/Context 相关测试 `19 passed`；扩展至 Headless、Harbor、CLI、RuntimeContext 等回归 `146 passed, 1 skipped`，`git diff --check` 通过。按授权仅重跑同一个 `terminal-bench/make-mips-interpreter` 的一个 trial：Harbor 0 exception、reward `0.0`，总耗时约 2 分 44 秒。MiniClaude 在 `/app` 执行了 17 轮、27 次工具调用，Provider 报告 prompt `168,126`、completion `4,195`、total `172,321` tokens（其中 cached `147,456`）。没有 Provider/runtime 异常；最终状态为 `CIRCUIT_BROKEN`，原因是 Agent 自身的 repeated-intent loop guard 在 replan 后作出 `HARD_STOP`。Verifier 未通过。Trace 和 verifier 结果保存在被 Git 忽略的 `benchmark/harbor/jobs/mini-claude-smoke-retry/`。
+
+### Decision / Limitation
+
+第二次任务从指令传入、容器工具执行到 Agent 自身的受控终止、Harbor verifier 与 Trace 导出均走完，没有适配器或环境异常，因而满足集成链路验收；`CIRCUIT_BROKEN` 不是任务成功，不能将 reward 0 解释成 Harbor 故障，也不能据此声称 Agent Benchmark 能力达标。按既定范围不追加 trial、不修改 Anti-Loop 或任务以追求通过率。默认 60 秒和一次重试只是可靠性修复，尚未通过批量实验证明最优。
+
+## 2026-09-29：Harbor 接入主线
+
+Commit: `PENDING`
+Commit Description: `feat(eval): 将 Harbor 单任务运行能力接入主线`
+
+### Description
+
+`main` 已吸收 Context Foundation、Agent Note 和 Provider 输出截断处理，但仍缺少 Harbor 适配器。为测量当前主线，单次 Terminal-Bench 试跑不得不临时补入 Harbor 桥接入口。本阶段将独立的 headless 入口、Harbor 适配器、使用说明和测试移回 `main`；同时带回旧分支已经验证的 60 秒默认请求超时、一次 SDK 重试与超时诊断分类。较旧分支中的 Agent Loop、压缩和 Trace 实现不覆盖主线。
+
+### Result / Evidence
+
+整合前的当前 `main` 曾以临时桥接入口运行 `terminal-bench/make-mips-interpreter` 一次：Harbor 无异常、reward 0.0，Agent 第 10 次模型请求因 20 秒超时结束；前 9 次均为工具调用，未遇到 `finish_reason=length`。估算输入 64,122、Provider 实报输入 67,315 tokens，压缩次数为 0。原始结果保存在 `sandbox/terminal_bench_runs/main-context-mips-20260929-1/`。本阶段的 Harbor、headless、Provider 与主线单元/相关集成测试共 169 项通过；按 Harbor 实际构建方式生成 wheel，并确认其中包含 headless 模块与 console entry。没有对新的 60 秒配置追加付费 Provider 试跑。
+
+### Decision / Limitation
+
+Harbor 分支的桥接与超时修复是通用能力，可以进入主线；旧分支整树合并会覆盖主线后续修复，因此选择性移植。20 秒超时造成的 trial 不能用于判断 `max_tokens=8000` 是否是主要瓶颈。60 秒与一次重试仍只是起始配置，后续应结合完整 Trace 与重复 trial 验证可靠性和成本。

@@ -18,6 +18,7 @@ dependencies = [
 
 [project.scripts]
 mini-claude = "cli.entrypoint:main"
+mini-claude-headless = "agent.headless:main"
 
 [tool.setuptools.packages.find]
 where = ["src"]
