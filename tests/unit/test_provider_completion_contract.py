@@ -8,6 +8,7 @@ import pytest
 
 from agent.mini_claude_agent import MiniClaudeAgent
 from core.tracing.manager import TraceManager
+from core.tools.base_tools import ToolResult
 from models.config import ConfigManager
 from providers.base import Message
 from providers.deepseek import DeepseekProvider
@@ -88,6 +89,141 @@ def test_output_limit_does_not_commit_partial_assistant_or_execute_tools(
     assert trace["final_status"] == "FAILED"
     assert trace["total_tool_calls"] == 0
     assert messages == []
+
+
+def _run_response_sequence(tmp_path, responses, *, model="deepseek-v4-flash-0731"):
+    workspace = tmp_path / "workspace"
+    workspace.mkdir()
+    data_root = tmp_path / "runtime"
+    agent = MiniClaudeAgent(
+        workspace_root=workspace,
+        workspace_confirmed=True,
+        runtime_data_root=data_root,
+    )
+    provider = DeepseekProvider({"model": model, "api_key": "local-test"})
+    requests = []
+
+    def create_message(*args, **kwargs):
+        requests.append(kwargs)
+        return responses.pop(0)
+
+    provider.create_message = create_message
+    agent.provider_manager = SimpleNamespace(get_primary_provider=lambda: provider)
+    agent._execute_tool = lambda *args, **kwargs: pytest.fail("truncated tool call executed")
+    try:
+        result = agent.chat("Complete the task")
+        trace_path = next((data_root / "traces").glob("task_*.json"))
+        trace = json.loads(trace_path.read_text(encoding="utf-8"))
+        return result, trace, requests
+    finally:
+        agent.shutdown()
+
+
+def test_default_deepseek_retries_output_limit_once_with_low_reasoning(tmp_path):
+    result, trace, requests = _run_response_sequence(tmp_path, [
+        _response("", "length", completion_tokens=16384),
+        _response("done", "stop", completion_tokens=120),
+    ])
+
+    assert result == "done"
+    assert len(requests) == 2
+    assert "reasoning_effort" not in requests[0]
+    assert requests[1]["reasoning_effort"] == "low"
+    assert "恢复说明" in requests[1]["system"]
+    assert trace["final_status"] == "SUCCESS"
+    assert trace["prompt_tokens"] == 200
+    assert trace["completion_tokens"] == 16504
+    assert trace["turns"][0]["output_limit_retry_count"] == 1
+    assert trace["turns"][0]["output_limit_retry_reasoning_effort"] == "low"
+    assert trace["turns"][0]["provider_finish_reason"] == "stop"
+
+
+def test_output_limit_retry_is_bounded_and_never_executes_truncated_tool_calls(tmp_path):
+    partial_tool_call = [{"id": "call-1", "type": "function", "function": {
+        "name": "bash", "arguments": '{"command":"echo partial',
+    }}]
+    result, trace, requests = _run_response_sequence(tmp_path, [
+        _response("", "length", partial_tool_call, completion_tokens=16384),
+        _response("", "length", partial_tool_call, completion_tokens=16384),
+    ])
+
+    assert "输出达到上限" in result
+    assert len(requests) == 2
+    assert trace["final_status"] == "FAILED"
+    assert trace["terminal_reason"] == "PROVIDER_OUTPUT_LIMIT"
+    assert trace["total_tool_calls"] == 0
+    assert trace["completion_tokens"] == 32768
+    assert trace["turns"][0]["output_limit_retry_count"] == 1
+
+
+def test_explicit_reasoning_effort_disables_automatic_effort_downgrade(tmp_path):
+    workspace = tmp_path / "workspace"
+    workspace.mkdir()
+    runtime = tmp_path / "runtime"
+    agent = MiniClaudeAgent(
+        workspace_root=workspace, workspace_confirmed=True, runtime_data_root=runtime,
+    )
+    agent.config.llm.reasoning_effort = "high"
+    provider = DeepseekProvider({
+        "model": "deepseek-v4-flash-0731", "api_key": "local-test",
+    })
+    requests = []
+    provider.create_message = lambda *args, **kwargs: (
+        requests.append(kwargs) or _response("", "length", completion_tokens=16384)
+    )
+    agent.provider_manager = SimpleNamespace(get_primary_provider=lambda: provider)
+    try:
+        result = agent.chat("Complete the task")
+        trace_path = next((runtime / "traces").glob("task_*.json"))
+        trace = json.loads(trace_path.read_text(encoding="utf-8"))
+    finally:
+        agent.shutdown()
+
+    assert "输出达到上限" in result
+    assert len(requests) == 1
+    assert trace["final_status"] == "FAILED"
+    assert "output_limit_retry_count" not in trace["turns"][0]
+
+
+def test_failed_read_file_result_keeps_structured_failure_in_trace(tmp_path):
+    workspace = tmp_path / "workspace"
+    workspace.mkdir()
+    runtime = tmp_path / "runtime"
+    agent = MiniClaudeAgent(
+        workspace_root=workspace, workspace_confirmed=True, runtime_data_root=runtime,
+    )
+    missing = agent._handle_read_file("missing.js")
+    assert isinstance(missing, ToolResult)
+    assert missing.success is False
+    assert missing.execution_success is False
+
+    provider = DeepseekProvider({"model": "test", "api_key": "local-test"})
+    responses = [
+        _response("", "tool_calls", [{
+            "id": "call-read", "type": "function",
+            "function": {"name": "read_file", "arguments": '{"path":"missing.js"}'},
+        }]),
+        _response("done", "stop"),
+    ]
+    def create_message(*args, **kwargs):
+        return responses.pop(0) if responses else _response("done", "stop")
+
+    provider.create_message = create_message
+    agent.provider_manager = SimpleNamespace(get_primary_provider=lambda: provider)
+    try:
+        agent.chat("Inspect the missing file")
+        trace_path = next((runtime / "traces").glob("task_*.json"))
+        trace = json.loads(trace_path.read_text(encoding="utf-8"))
+    finally:
+        agent.shutdown()
+
+    read_event = next(
+        tool for turn in trace["turns"] for tool in turn["tools"]
+        if tool["tool_name"] == "read_file"
+    )
+    assert read_event["result_preview"].startswith("Error: File not found:")
+    assert read_event["success"] is False
+    assert trace["read_file_count"] == 0
 
 
 def test_output_limit_does_not_publish_partial_assistant_note(tmp_path):

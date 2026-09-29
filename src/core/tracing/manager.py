@@ -506,6 +506,12 @@ class TraceManager:
         if self.current_turn and reason:
             self.current_turn.provider_finish_reason = reason
 
+    def record_output_limit_retry(self, reasoning_effort: str) -> None:
+        """Record one bounded retry after an output-token cutoff."""
+        if self.current_turn:
+            self.current_turn.output_limit_retry_count += 1
+            self.current_turn.output_limit_retry_reasoning_effort = reasoning_effort
+
     def record_reasoning_content_chars(self, length: int | None) -> None:
         """Record whether reasoning text was returned, without saving its contents."""
         if self.current_turn and isinstance(length, int) and not isinstance(length, bool):

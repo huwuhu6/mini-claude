@@ -165,6 +165,8 @@ class TurnTrace:
     token_usage: int = 0
     assistant_content: str = ""
     provider_finish_reason: str = ""
+    output_limit_retry_count: int = 0
+    output_limit_retry_reasoning_effort: str = ""
     reasoning_content_chars: Optional[int] = None
     main_reasoning_tokens: Optional[int] = None
     summary_reasoning_tokens: Optional[int] = None
@@ -214,6 +216,9 @@ class TurnTrace:
         }
         if self.provider_finish_reason:
             data['provider_finish_reason'] = self.provider_finish_reason
+        if self.output_limit_retry_count:
+            data['output_limit_retry_count'] = self.output_limit_retry_count
+            data['output_limit_retry_reasoning_effort'] = self.output_limit_retry_reasoning_effort
         if self.reasoning_content_chars is not None:
             data['reasoning_content_chars'] = self.reasoning_content_chars
         if self.main_reasoning_tokens is not None:

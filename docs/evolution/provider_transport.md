@@ -41,3 +41,22 @@ Commit Description: `fix(runtime): 收敛循环拦截并提升 Provider 与工�
 ### Decision / Limitation
 
 `finish_reason=length` 继续 fail-closed，不自动重放一次已返回且已计费的请求；部分正文和部分工具调用都不能当作有效执行计划。截断时只保留 Trace 诊断，不再把可能不完整的正文发布为 `assistant_note`。实跑说明增加输出预算只是把失败推迟到另一轮；更大的单次预算可能进一步增加长推理耗时与费用，但不能自动解决“反复准备写文件却没有交付”的任务行为。后续应将输出预算可靠性和任务执行能力分开研究，不为这一个 Case 继续盲目加大预算。
+
+## 2026-09-29：为默认推理强度下的输出截断增加一次恢复机会
+
+Commit: `PENDING`
+Commit Description: `fix(runtime): 修复工具结果状态与 Provider 截断恢复`
+
+### Description
+
+后续同 Case 的 Memory ON 试跑在第 34 轮再次耗尽 16384 个 completion tokens，全部是 reasoning tokens。百炼当前文档说明 `deepseek-v4-flash-0731` 默认 `reasoning_effort=high`，支持 `low`，推理与可见输出共享模型输出上限。仅把 `finish_reason=length` 标为失败可以避免假成功，却没有给一次过度推理的请求修正机会。
+
+本阶段只对 DashScope 的 DeepSeek V4 请求在没有显式配置 reasoning effort 时增加一次恢复调用：不把第一份被截断响应写入对话、不执行其中任何工具调用，以相同消息重试并指定 `reasoning_effort=low`，提示模型尽快给出完整下一步动作或简短终答。重试仍然被截断就按 `PROVIDER_OUTPUT_LIMIT` 失败。两次 Provider usage 分别累计，Trace 标记恢复次数和 effort。显式配置的推理强度以及其他 Provider/model 不会被自动改写。
+
+### Result / Evidence
+
+确定性回归覆盖一次低推理恢复后成功、再次截断后停止、截断工具调用从未执行、显式 reasoning effort 不被覆盖，以及两次 usage 均计入 Trace。完整 unit/integration：362 passed、2 deselected；两个 deselected 是已确认的 Evaluation oracle hash 旧失败；`git diff --check` 通过。此次代码修改后没有再次请求真实 Provider。
+
+### Decision / Limitation
+
+这为默认高推理设置提供一次有界的恢复机会，最坏会多产生一次 Provider 请求和费用；它不保证第二次一定成功，也不在同一截断文本上盲目续写或重放工具调用。实际能否降低当前任务的 `PROVIDER_OUTPUT_LIMIT` 发生率，需要之后获授权的同 Case 验证，并检查最终是否形成完整工具动作；当前只有 deterministic evidence。

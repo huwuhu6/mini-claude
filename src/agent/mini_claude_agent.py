@@ -1095,9 +1095,10 @@ class MiniClaudeAgent:
         healthy = bool(health_checks) and all(item.get("healthy") is True for item in health_checks)
         return json.dumps({"healthy": healthy, "checks": checks}, ensure_ascii=False)
 
-    def _handle_read_file(self, path: str, start_line: int = None, end_line: int = None) -> str:
-        result = self.tools.read_file(path, start_line, end_line)
-        return result.content
+    def _handle_read_file(self, path: str, start_line: int = None, end_line: int = None) -> ToolResult:
+        # Preserve structured success/failure so the dispatcher and Trace do not
+        # have to infer a failed read from localized error text.
+        return self.tools.read_file(path, start_line, end_line)
 
     def _handle_write_file(self, path: str, content: str) -> str:
         result = self.tools.write_file(path, content)
@@ -1375,7 +1376,7 @@ class MiniClaudeAgent:
         result_text = result
         if not result_text:
             return False
-        if result_text.startswith("错误:"):
+        if result_text.startswith(("错误:", "Error:")):
             return True
         # File tools return localized Harness failures after the dispatcher
         # unwraps ToolResult.content.
@@ -1885,13 +1886,49 @@ class MiniClaudeAgent:
                     temperature=self.config.llm.temperature,
                 )
                 parsed = self._parse_response(provider, response)
+                self._record_main_provider_response(
+                    parsed, estimated_prompt_tokens=estimated_prompt_tokens,
+                )
+                finish_reason = parsed.get('finish_reason')
+
+                # DashScope's DeepSeek V4 defaults to high reasoning effort.
+                # On an implicit-default length cutoff, retry once with the
+                # documented low effort. The first response is never committed
+                # and none of its possibly truncated tool calls are executed.
+                can_retry_output_limit = (
+                    finish_reason in {"length", "max_tokens"}
+                    and self.config.llm.reasoning_effort is None
+                    and self.config.llm.provider.lower() == "dashscope"
+                    and str(getattr(provider, "model", "")).lower().startswith("deepseek-v4")
+                )
+                if can_retry_output_limit:
+                    self.trace.record_output_limit_retry("low")
+                    retry_system = (
+                        self.system_prompt
+                        + "\n\n恢复说明：上一响应耗尽了输出 Token 预算。请降低推理篇幅，直接给出一个完整的下一步工具调用或简短最终答复；"
+                        "如果需要写入大量内容，请拆分为多个较小的工具调用。"
+                    )
+                    retry_estimated_prompt_tokens = self.compressor.estimate_prompt_tokens(
+                        msgs_for_llm,
+                        system_prompt=retry_system,
+                        tools=tools,
+                    )
+                    response = provider.create_message(
+                        msgs_for_llm,
+                        tool_defs,
+                        system=retry_system,
+                        max_tokens=self.config.llm.max_tokens,
+                        temperature=self.config.llm.temperature,
+                        reasoning_effort="low",
+                    )
+                    parsed = self._parse_response(provider, response)
+                    self._record_main_provider_response(
+                        parsed, estimated_prompt_tokens=retry_estimated_prompt_tokens,
+                    )
+
                 content = parsed.get('content', '')
                 tool_calls = parsed.get('tool_calls', [])
                 finish_reason = parsed.get('finish_reason')
-                self.trace.record_provider_finish_reason(finish_reason)
-                self.trace.record_reasoning_content_chars(
-                    parsed.get('reasoning_content_chars')
-                )
 
                 logger.info(
                     "LLM_TURN_RESULT: iteration=%s tool_calls=%s",
@@ -1902,13 +1939,6 @@ class MiniClaudeAgent:
                 # ── Trace: record assistant content ──
                 self.trace.record_assistant_content(content)
 
-                # ── Accumulate benchmark metrics ──
-                usage = parsed.get('usage', {})
-                self._record_provider_usage(
-                    usage,
-                    estimated_prompt_tokens=estimated_prompt_tokens,
-                    source="main",
-                )
                 self.last_metrics["turns"] = iteration + 1
 
                 if finish_reason in {"length", "max_tokens"}:
@@ -2497,6 +2527,24 @@ class MiniClaudeAgent:
         if hasattr(provider, 'parse_response'):
             return provider.parse_response(response)
         return {'content': str(response), 'tool_calls': [], 'usage': {}}
+
+    def _record_main_provider_response(
+        self,
+        parsed: Dict[str, Any],
+        *,
+        estimated_prompt_tokens: int,
+    ) -> None:
+        """Record one actual main-provider attempt, including bounded retries."""
+        self.trace.record_provider_finish_reason(parsed.get('finish_reason'))
+        self.trace.record_reasoning_content_chars(
+            parsed.get('reasoning_content_chars')
+        )
+        self.trace.record_assistant_content(parsed.get('content', ''))
+        self._record_provider_usage(
+            parsed.get('usage', {}),
+            estimated_prompt_tokens=estimated_prompt_tokens,
+            source="main",
+        )
 
     # ═══════════════════════════════════════════════════════════
     # Console Command Handlers
