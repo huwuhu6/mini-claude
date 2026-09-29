@@ -109,6 +109,28 @@ class Compressor:
         """Check if rapid growth suggests micro-compaction."""
         return self.estimate_tokens(messages) > self.token_threshold * 0.7
 
+    def has_microcompact_work(self, messages: List[Message]) -> bool:
+        """Avoid warning the model when every eligible result is already compact."""
+        if len(messages) < 10:
+            return False
+        protect_start = max(len(messages) - 6, 2)
+        old_todos = 0
+        for index in range(2, protect_start):
+            msg = messages[index]
+            if msg.role != "tool":
+                continue
+            name = self._infer_tool_name(messages, index)
+            if name in ("bash", "search_code", "count_occurrences"):
+                if len(msg.content) > 300:
+                    return True
+            elif name == "TodoWrite":
+                if msg.content != "[System: State superseded by newer TodoWrite.]":
+                    old_todos += 1
+            elif name in ("read_file", "edit_file"):
+                if len(msg.content) > 5000 and "[System: Middle content omitted during micro-compaction]" not in msg.content:
+                    return True
+        return old_todos > 1
+
     # ── Compression Actions ───────────────────────────────────
 
     def microcompact(self, messages: List[Message]) -> List[Message]:

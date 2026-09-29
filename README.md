@@ -36,6 +36,7 @@ mini-claude [path] [-y|--yes]
 - `LoopController`、`LoopGuard`：对重复工具调用和异常循环进行限制
 - `Failure Intelligence`：对失败进行分类，记录策略指纹，并决定是否升级或终止
 - `Compressor`：对长对话进行上下文压缩
+- Agent 工作笔记：自动压缩前提醒 Agent 保存关键约束和结论；笔记存于运行数据区，每轮临时注入当前会话
 - `TraceManager`：把任务、轮次和工具调用写入 `.traces/`
 
 ### 扩展能力
@@ -226,7 +227,8 @@ D:\02_study\code\mini-claude-project-data\<project-name>-<short-hash>\
 ├── tasks/          持久化任务
 ├── team/           队友状态
 ├── inbox/          队友消息
-└── transcripts/    上下文压缩摘要
+├── transcripts/    上下文压缩摘要
+└── notes/          会话级 Agent 工作笔记
 ```
 
 评测结果仍归档在 `sandbox/eval_results/`。仓库中残留的 `.tasks/`、`.team/`、`.traces/` 和 `logs/` 是历史运行产物，新代码不会继续写入它们。

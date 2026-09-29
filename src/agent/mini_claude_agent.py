@@ -39,6 +39,7 @@ from core.background import BackgroundProcessor, BackgroundTaskStatus
 from core.subagent import SubAgentManager, SubAgentType, SubAgentResult
 from core.console import ConsoleCommandSystem, Command
 from core.compression import Compressor
+from core.agent_note import AgentNote
 from core.loop_guard import canonicalize_args
 from core.loop_controller import (
     AttemptHistory, AttemptStatus, CommandNormalizer, RuntimeDecision,
@@ -132,6 +133,8 @@ class MiniClaudeAgent:
         self.data_paths = RuntimeDataPaths.for_workspace(
             self.workdir, data_root=runtime_data_root
         )
+        self.agent_note = AgentNote(self.data_paths.root)
+        self._compression_notice_pending = False
         self.session_recorder = SessionRecorder(self.data_paths.sessions)
 
         self._setup_logging()
@@ -169,6 +172,7 @@ class MiniClaudeAgent:
             "read_file": self._handle_read_file,
             "write_file": self._handle_write_file,
             "edit_file": self._handle_edit_file,
+            "update_agent_note": self._handle_update_agent_note,
             "load_skill": self._handle_load_skill_dispatch,
             "task": self._handle_task,
             "TodoWrite": self._handle_todo_write,
@@ -336,6 +340,7 @@ class MiniClaudeAgent:
         ))
         # Register tool→feature mapping for feature-aware tool filtering
         self.feature_manager.register_tool_for_feature('load_skill', 'skills')
+        self.feature_manager.register_tool_for_feature('update_agent_note', 'compression')
         self.feature_manager.register_tool_for_feature('run_background', 'background')
         for tool_name in (
             'get_background_status', 'get_background_logs',
@@ -622,14 +627,6 @@ class MiniClaudeAgent:
     def _run_with_tasks(self, user_input: str, require_tool_call: bool = False) -> str:
         """Execution with task management."""
         self.messages.append(Message(role='user', content=user_input))
-
-        # Check for compression
-        if self.feature_manager.is_enabled('compression'):
-            if self.compressor.should_compress(self.messages):
-                self.messages = self.compressor.compress(self.messages)
-            elif self.compressor.should_microcompact(self.messages):
-                self.messages = self.compressor.microcompact(self.messages)
-
         return self._llm_tool_cycle(require_tool_call=require_tool_call)
 
     def _get_llm_tools(self) -> List[Dict[str, Any]]:
@@ -772,6 +769,17 @@ class MiniClaudeAgent:
                         },
                     },
                     'required': ['path', 'edits'],
+                },
+            },
+            {
+                'name': 'update_agent_note',
+                'description': '覆盖当前会话的简短工作笔记。记录用户明确约束、已验证的发现和待验证的假设；及时删去过期结论。笔记每轮都会提供给你，压缩前请保存会丢失的关键信息。',
+                'input_schema': {
+                    'type': 'object',
+                    'properties': {
+                        'content': {'type': 'string', 'description': '完整 Markdown 笔记，最多 6000 字符；空字符串表示清空。'},
+                    },
+                    'required': ['content'],
                 },
             },
             {
@@ -1094,6 +1102,14 @@ class MiniClaudeAgent:
         result = self.tools.edit_file(path, edits)
         return result.content
 
+    def _handle_update_agent_note(self, content: str) -> ToolResult:
+        if len(content) > AgentNote.MAX_CHARS:
+            return ToolResult(
+                f"错误: 笔记超过 {AgentNote.MAX_CHARS} 字符上限，请精简后重试。",
+                success=False,
+            )
+        return ToolResult(self.agent_note.replace(content))
+
     def _handle_add_workdir(self, path: str) -> str:
         return self.tools.add_allowed_path(path)
 
@@ -1388,6 +1404,13 @@ class MiniClaudeAgent:
             True if compression (full or micro) was actually triggered.
         """
         if self.feature_manager.is_enabled('compression'):
+            if not self._compression_notice_pending:
+                if ((len(self.messages) >= 4 and self.compressor.should_compress(self.messages))
+                        or (self.compressor.should_microcompact(self.messages)
+                            and self.compressor.has_microcompact_work(self.messages))):
+                    self._compression_notice_pending = True
+                return False
+            self._compression_notice_pending = False
             if self.compressor.should_compress(self.messages):
                 logger.info("触发自动压缩")
                 self.messages = self.compressor.compress(self.messages)
@@ -1451,7 +1474,20 @@ class MiniClaudeAgent:
         """
         parts = []
 
-        # 1. Todo status snapshot
+        # Current session note and a one-turn warning before history changes.
+        note_text = self.agent_note.read()
+        if note_text:
+            parts.append(f"<agent-note>\n{note_text}\n</agent-note>")
+
+        if self._compression_notice_pending:
+            parts.append(
+                "<compression-warning>下一次模型调用前将压缩较早的对话和工具输出。"
+                "请现在检查尚需保留的用户约束、关键结论及其证据，必要时调用 "
+                "update_agent_note 更新完整笔记；没有新信息时直接继续任务。"
+                "不要把未验证的推测写成事实。</compression-warning>"
+            )
+
+        # Todo status snapshot
         if self.todo.has_open_items():
             todo_text = self.todo.render()
             parts.append(f"<todo-status>\n{todo_text}\n</todo-status>")
