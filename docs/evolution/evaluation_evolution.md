@@ -740,7 +740,7 @@ Provider/Context 相关测试 `19 passed`；扩展至 Headless、Harbor、CLI、
 
 ## 2026-09-29：Harbor 接入主线
 
-Commit: `PENDING`
+Commit: `066c364`
 Commit Description: `feat(eval): 将 Harbor 单任务运行能力接入主线`
 
 ### Description
