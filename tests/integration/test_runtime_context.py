@@ -209,7 +209,7 @@ def test_long_bash_output_is_saved_and_can_be_read_in_windows():
         workspace = Path(temp_dir)
         script = workspace / "emit_output.py"
         script.write_text(
-            "for index in range(1, 66):\n"
+            "for index in range(1, 202):\n"
             "    print(f'log line {index}')\n",
             encoding="utf-8",
         )
@@ -219,13 +219,17 @@ def test_long_bash_output_is_saved_and_can_be_read_in_windows():
 
         assert result.success
         assert "Output is too long" in result.content
-        assert "Total 65 lines" in result.content
+        assert "Total 201 lines" in result.content
         assert "log line 1" in result.content
-        assert "log line 65" in result.content
+        assert "log line 201" in result.content
         saved_path = next((workspace / ".agent" / "logs").glob("cmd_*.log"))
         saved_content = saved_path.read_text(encoding="utf-8")
-        assert len(saved_content.splitlines()) == 65
-        assert saved_content.endswith("log line 65")
+        assert len(saved_content.splitlines()) == 201
+        assert saved_content.endswith("log line 201")
+        assert result.output_visibility["truncated"] is True
+        assert result.output_visibility["original_lines"] == 201
+        assert result.output_visibility["selected_line_ranges"] == [[1, 10], [182, 201]]
+        assert result.output_visibility["saved_path"] == f".agent/logs/{saved_path.name}"
         window = tools.read_file(f".agent/logs/{saved_path.name}", 31, 35)
         assert window.success
         assert "log line 31" in window.content
@@ -250,6 +254,31 @@ def test_short_tool_output_is_returned_unchanged():
         tools = BaseTools(Path(temp_dir))
         content = "[Exit Code: 0]\nsmall output"
         assert tools.format_tool_output(content) == content
+
+
+def test_trace_records_tool_output_visibility_and_request_config():
+    visibility = {
+        "truncated": True,
+        "original_lines": 201,
+        "original_chars": 5000,
+        "visible_chars": 1000,
+        "selected_line_ranges": [[1, 10], [182, 201]],
+        "saved_path": ".agent/logs/cmd_test.log",
+    }
+    manager = TraceManager()
+    manager.start_task(request_config={
+        "provider": "deepseek", "model": "deepseek-v4-flash-0731", "max_tokens": 8000,
+    })
+    manager.start_turn(0)
+    manager.record_tool_call(
+        tool_name="bash", args_hash="safe-test-command", success=True,
+        output_visibility=visibility,
+    )
+    manager._close_turn()
+
+    trace = manager.current_task.to_dict()
+    assert trace["request_config"]["max_tokens"] == 8000
+    assert trace["turns"][0]["tools"][0]["output_visibility"] == visibility
 
 
 def test_trace_keeps_head_and_tail_for_fileized_output():

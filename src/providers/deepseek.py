@@ -21,6 +21,7 @@ class DeepseekProvider(LLMProvider):
         self.base_url = base_url
         self.timeout = float(config.get('timeout', config.get('timeout_ms', 60000) / 1000.0))
         self.provider_name = str(config.get('provider_name', 'deepseek'))
+        self.stream = bool(config.get('stream', False))
         self.last_error_diagnostic: Dict[str, Any] = {}
 
         self.client = OpenAI(
@@ -73,7 +74,7 @@ class DeepseekProvider(LLMProvider):
                 'messages': formatted_messages,
                 'max_tokens': self.max_tokens,
                 'temperature': self.temperature,
-                'stream': False
+                'stream': self.stream,
             }
 
             # Add tools if provided
@@ -92,9 +93,13 @@ class DeepseekProvider(LLMProvider):
 
             # Add any additional parameters
             params.update(kwargs)
+            if params['stream']:
+                params.setdefault('stream_options', {'include_usage': True})
 
             # Make the API call
             response = self.client.chat.completions.create(**params)
+            if params['stream']:
+                response = self._collect_stream(response)
 
             logger.debug("已收到 Deepseek API 响应")
             return response
@@ -106,6 +111,103 @@ class DeepseekProvider(LLMProvider):
                 json.dumps(self.last_error_diagnostic, ensure_ascii=False, sort_keys=True),
             )
             raise
+
+    @staticmethod
+    def _collect_stream(stream: Any) -> Dict[str, Any]:
+        """Assemble a complete provider stream before exposing tool calls."""
+        content: list[str] = []
+        reasoning: list[str] = []
+        calls: dict[int, dict[str, Any]] = {}
+        finish_reason = None
+        usage = None
+
+        def field(value: Any, name: str, default: Any = None) -> Any:
+            return value.get(name, default) if isinstance(value, dict) else getattr(value, name, default)
+
+        try:
+            for chunk in stream:
+                chunk_usage = field(chunk, 'usage')
+                if chunk_usage is not None:
+                    usage = chunk_usage
+                choices = field(chunk, 'choices', [])
+                if not choices:
+                    continue  # Usage may arrive in a final choice-less chunk.
+                if len(choices) != 1:
+                    raise ValueError('流式 Provider 响应包含非单一 choice')
+                choice = choices[0]
+                delta = field(choice, 'delta')
+                if delta is None:
+                    raise ValueError('流式 Provider 响应缺少 delta')
+                if finish_reason is not None:
+                    raise ValueError('流式 Provider 响应在完成后仍有内容')
+
+                for key, target in (('content', content), ('reasoning_content', reasoning)):
+                    part = field(delta, key)
+                    if part is not None:
+                        if not isinstance(part, str):
+                            raise ValueError(f'流式 Provider {key} 分片无效')
+                        target.append(part)
+
+                for call in field(delta, 'tool_calls', None) or []:
+                    index = field(call, 'index')
+                    if not isinstance(index, int) or isinstance(index, bool) or index < 0:
+                        raise ValueError('流式 Provider tool_call 缺少有效 index')
+                    assembled = calls.setdefault(index, {
+                        'id': None,
+                        'type': 'function',
+                        'function': {'name': '', 'arguments': ''},
+                    })
+                    call_id = field(call, 'id')
+                    if call_id is not None:
+                        if not isinstance(call_id, str):
+                            raise ValueError('流式 Provider tool_call id 分片无效')
+                        if call_id:
+                            previous_id = assembled['id'] or ''
+                            # Some endpoints repeat a complete ID; others split it.
+                            if call_id != previous_id:
+                                assembled['id'] = previous_id + call_id
+
+                    call_type = field(call, 'type')
+                    if call_type is not None:
+                        if call_type != 'function':
+                            raise ValueError('流式 Provider tool_call type 无效')
+                        assembled['type'] = call_type
+
+                    function = field(call, 'function')
+                    if function is not None:
+                        for key in ('name', 'arguments'):
+                            part = field(function, key)
+                            if part is not None:
+                                if not isinstance(part, str):
+                                    raise ValueError(f'流式 Provider function.{key} 分片无效')
+                                assembled['function'][key] += part
+
+                reason = field(choice, 'finish_reason')
+                if reason is not None:
+                    finish_reason = reason
+        finally:
+            close = getattr(stream, 'close', None)
+            if callable(close):
+                close()
+
+        if finish_reason is None:
+            raise ValueError('流式 Provider 响应未正常结束，已丢弃不完整内容')
+        ids = [call['id'] for call in calls.values()]
+        if any(not isinstance(call_id, str) or not call_id for call_id in ids):
+            raise ValueError('流式 Provider tool_call 缺少 id')
+        if len(ids) != len(set(ids)):
+            raise ValueError('流式 Provider tool_call 存在重复 id')
+
+        message: Dict[str, Any] = {
+            'content': ''.join(content),
+            'tool_calls': [calls[index] for index in sorted(calls)],
+        }
+        if reasoning:
+            message['reasoning_content'] = ''.join(reasoning)
+        return {
+            'choices': [{'message': message, 'finish_reason': finish_reason}],
+            'usage': usage,
+        }
 
     def _diagnose_error(self, error: BaseException) -> Dict[str, Any]:
         """Return a secret-free, structured transport diagnostic."""
@@ -236,6 +338,9 @@ class DeepseekProvider(LLMProvider):
         raw_content = field(message, 'content')
         raw_tool_calls = field(message, 'tool_calls')
         reasoning_content = field(message, 'reasoning_content', None)
+        reasoning_content_chars = (
+            len(reasoning_content) if isinstance(reasoning_content, str) else None
+        )
         if raw_content is missing and raw_tool_calls is missing and reasoning_content is None:
             raise ValueError("Provider message 不是有效的消息对象")
 
@@ -310,7 +415,7 @@ class DeepseekProvider(LLMProvider):
             'content': content,
             'tool_calls': tool_calls,
             'finish_reason': finish_reason,
-            'reasoning_content_chars': len(reasoning_content) if isinstance(reasoning_content, str) else 0,
+            'reasoning_content_chars': reasoning_content_chars,
             'usage': {
                 'prompt_tokens': prompt_tokens,
                 'completion_tokens': usage_value('completion_tokens'),

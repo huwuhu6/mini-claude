@@ -142,3 +142,22 @@ D:\02_study\code\mini-claude-project-data\<project-name>-<short-hash>\
 - 更方便的 JSONL 查询和统计工具。
 
 下一步如果继续优化会话系统，建议先增加一个很小的 JSONL 查询命令，例如按 `round_id`、`call_id` 和失败状态过滤，而不是立即设计完整的日志平台。
+
+## 2026-09-29：请求与工具执行的诊断摘要
+
+Commit: `PENDING`
+Commit Description: `feat(trace): 记录请求配置与工具输出可见性`
+
+### Description
+
+仅有工具结果正文无法判断 Agent 是否看到了完整输出，还是只拿到了截断预览。本阶段把输出是否截断、原始与可见字符数、保留的行范围和安全的相对日志路径附加到工具 Trace 与会话事件。Task Trace 同时记录 Provider、模型、`max_tokens`、温度和流式开关；工具执行时长写入治理事件。新增 `--debug flow` 视图概括模型请求、工具结果和截断情况，不展示工具输出或路径内容。
+
+模型请求事件改名为 `model_request_started`，旧的 `thinking` 事件仍可读取。输出长度阈值从 40 行/2000 字符放宽到既有 `read_file` 硬上限 200 行/4000 字符，减少中等大小源码窗口被不必要文件化的问题。模型工具说明会告知长输出保存位置及分段读取方式。
+
+### Result / Evidence
+
+Trace 序列化、flow 摘要、输出可见性、循环治理和流式 Provider 相关确定性测试共 101 passed，8 个依赖 pytest 临时目录或 Agent 端到端临时 workspace 的用例未运行。Windows 沙箱限制了 pytest 临时目录的扫描与清理；涉及临时目录的完整工具集成测试未能在本轮全部通过，不能据此报告全量集成套件通过。没有运行 Provider Benchmark。
+
+### Decision / Limitation
+
+保存路径只作为诊断元数据记录，flow 视图不显示具体路径或输出正文。200 行/4000 字符是可见性阈值，不代表 Provider 的 Token 预算。真实任务中的重复读取或 Token 变化仍需后续 Trace 验证。

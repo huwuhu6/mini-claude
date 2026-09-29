@@ -144,3 +144,7 @@ Commit Description: `fix(context): 合并请求预算观测并阻止截断响应
 ### Decision / Limitation
 
 沿用静态 250K/500K 基线，并保留 `max_tokens=8000`，直到真实 Trace 和 Benchmark 能支持调整。请求前估算仍使用近似 tokenizer；Provider usage 用于观测，不直接驱动压缩。完整请求估算在压缩后会重新计算，但目前没有针对实际 Context Window 余量的硬性 invariant。Harbor 适配器与独立 Provider 重试策略留在各自分支，本阶段不随上下文核心修复一起并入。
+
+### 工具输出可见性补充（2026-09-29）
+
+主线现将 bash 输出的截断状态、原始/可见字符数、展示行范围和相对日志路径写入 Trace。只有超过 200 行或 4000 字符的结果才自动文件化，普通的中等源码窗口会完整返回。新增 flow 调试视图可以显示预览比例，但不显示日志路径和正文。该变化只解决“模型实际看到了多少工具输出”的可观测性与过早文件化；真实 Token 节省和读取行为仍需要运行 Trace 验证。

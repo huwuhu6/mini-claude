@@ -18,6 +18,7 @@ class LLMConfig:
     api_key: str = ""
     base_url: str = ""
     timeout_ms: int = 60000
+    stream: bool = True
 
 
 @dataclass

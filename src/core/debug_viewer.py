@@ -35,6 +35,35 @@ class DebugViewer:
         if not events:
             return "没有找到会话记录。"
 
+        if mode == "flow":
+            # Keep this summary useful without displaying potentially sensitive payloads.
+            lines = [f"会话：{events[0].get('session_id', '-')}" ]
+            counts = {"执行": 0, "失败": 0, "拦截": 0}
+            for event in events:
+                kind = event.get("type")
+                turn = event.get("turn")
+                prefix = f"第 {turn} 轮" if turn is not None else ""
+                if kind in {"model_request_started", "thinking"}:
+                    lines.append(f"{prefix} 模型请求".strip())
+                elif kind == "tool_result":
+                    status = "拦截" if event.get("blocked") else "执行" if event.get("success") else "失败"
+                    counts[status] += 1
+                    visibility = event.get("output_visibility") or {}
+                    suffix = ""
+                    if visibility.get("truncated"):
+                        suffix = (
+                            f"（输出仅预览 {visibility.get('visible_chars', '?')}/"
+                            f"{visibility.get('original_chars', '?')} 字符）"
+                        )
+                    lines.append(f"  {event.get('tool', 'tool')}：{status}{suffix}")
+                elif kind == "runtime_error":
+                    lines.append("运行错误（详情见原始记录）")
+                elif kind == "final":
+                    status = event.get("status", "-")
+                    lines.append("响应已返回（非任务成功判定）" if status == "RESPONSE" else f"结束：{status}")
+            lines.insert(1, "工具结果：执行 {执行} / 失败 {失败} / 拦截 {拦截}".format(**counts))
+            return "\n".join(lines)
+
         if mode == "errors":
             events = [
                 event for event in events
@@ -53,8 +82,10 @@ class DebugViewer:
                 lines.append(f"{time_text} [{event.get('level')}] {event.get('logger')}: {event.get('message')}")
             elif event_type == "user_input":
                 lines.append(f"{time_text} 你：{event.get('content', '')}")
-            elif event_type == "thinking":
-                lines.append(f"{time_text} 分析：第 {event.get('turn')} 轮")
+            elif event_type in {"model_request_started", "thinking"}:
+                lines.append(f"{time_text} 模型请求：第 {event.get('turn')} 轮")
+            elif event_type == "assistant_note":
+                lines.append(f"{time_text} 模型说明：{event.get('content', '')}")
             elif event_type == "tool_call":
                 lines.append(f"{time_text} 工具：{event.get('tool')} {event.get('args', '')}")
             elif event_type == "tool_result":

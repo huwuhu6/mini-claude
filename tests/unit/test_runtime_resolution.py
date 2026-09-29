@@ -75,6 +75,29 @@ def test_positive_keywords_are_not_resolution_evidence():
         assert event.verification_improved is False, text
 
 
+def test_runtime_observer_preserves_duration_and_separates_observation_from_progress():
+    from core.loop_controller import RuntimePolicyAdapter
+
+    observer = RuntimePolicyAdapter(RuntimePolicy(AttemptHistory()))
+    first = observer.observe(
+        turn=1, tool_name="read_file", intent_key="read:first",
+        args_fingerprint="first", result_text="first content",
+        workspace_before={}, workspace_after={}, duration_ms=12.5,
+    )
+    second = observer.observe(
+        turn=2, tool_name="read_file", intent_key="read:second",
+        args_fingerprint="second", result_text="different content",
+        workspace_before={}, workspace_after={}, duration_ms=37.25,
+    )
+
+    assert first.event.duration_ms == 12.5
+    assert second.event.duration_ms == 37.25
+    assert second.observation_changed is True
+    assert second.progress_detected is False
+    assert second.progress_reason == ()
+    assert second.recovery_stage.value == "OBSERVING"
+
+
 def test_health_resolution_requires_probe_scoped_structured_observation():
     bad = ObservationNormalizer.normalize(
         "health_check", {}, ToolResult(

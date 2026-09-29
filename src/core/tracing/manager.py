@@ -66,7 +66,8 @@ class TraceManager:
                     workspace_root: str = "",
                     workspace_confirmed: bool = False,
                     require_tool_call: bool = False,
-                    environment: Optional[Dict[str, Any]] = None) -> str:
+                    environment: Optional[Dict[str, Any]] = None,
+                    request_config: Optional[Dict[str, Any]] = None) -> str:
         """Begin a new task-level trace.  Returns task_id."""
         tid = task_id or str(uuid.uuid4())[:8]
         self.current_task = TaskTrace(
@@ -76,6 +77,7 @@ class TraceManager:
             workspace_confirmed=workspace_confirmed,
             require_tool_call=require_tool_call,
             environment=dict(environment or {}),
+            request_config=dict(request_config or {}),
         )
         self.current_turn = None
         logger.debug(f"Trace: task started [{tid}]")
@@ -165,6 +167,7 @@ class TraceManager:
         loop_guard_blocked: bool = False,
         error_message: str = "",
         result_preview: str = "",
+        output_visibility: Optional[dict] = None,
         started_at: Optional[float] = None,
         finished_at: Optional[float] = None,
         execution_success: Optional[bool] = None,
@@ -237,6 +240,7 @@ class TraceManager:
             guard_reason=guard_reason,
             error_message=error_message[:200],
             result_preview=_trace_result_preview(result_preview),
+            output_visibility=dict(output_visibility or {}),
             failure_category=failure_category,
             recoverability=recoverability,
             strategy_fingerprint=strategy_fingerprint,
@@ -339,6 +343,17 @@ class TraceManager:
     def record_provider_finish_reason(self, reason: Optional[str]) -> None:
         if self.current_turn:
             self.current_turn.provider_finish_reason = reason or ""
+
+    def record_provider_stream(self, enabled: bool) -> None:
+        """Record the transport mode requested for the current provider call."""
+        if self.current_turn:
+            self.current_turn.provider_stream = bool(enabled)
+
+    def record_reasoning_content_chars(self, length: Optional[int]) -> None:
+        """Record reasoning payload size without persisting its contents."""
+        if (self.current_turn and isinstance(length, int)
+                and not isinstance(length, bool)):
+            self.current_turn.reasoning_content_chars = max(length, 0)
 
     def record_provider_usage(
         self,
