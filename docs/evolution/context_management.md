@@ -128,7 +128,7 @@ Commit Description: `feat: 压缩前提醒 Agent 保存关键工作记忆`
 
 ## 2026-09-29
 
-Commit: `PENDING`
+Commit: `c682808`
 Commit Description: `fix(context): 合并请求预算观测并阻止截断响应误报完成`
 
 ### Description
