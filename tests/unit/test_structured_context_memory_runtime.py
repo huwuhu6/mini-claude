@@ -65,10 +65,16 @@ def test_memory_feature_defaults_on_and_registers_in_feature_manager():
     assert agent.feature_manager.is_enabled("memory") is True
 
 
-def test_default_yaml_enables_memory():
+def test_default_yaml_enables_memory_and_reserves_multi_agent_features():
     config = ConfigManager(ROOT / "configs" / "default.yaml").get_config()
 
+    feature_defaults = FeaturesConfig()
+
+    assert feature_defaults.tasks is False
+    assert feature_defaults.team is False
     assert config.features.memory is True
+    assert config.features.tasks is False
+    assert config.features.team is False
 
 
 def test_successful_read_records_actual_range_and_bounded_observation(workspace):

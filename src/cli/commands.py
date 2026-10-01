@@ -98,10 +98,8 @@ def _config(agent: Any, _args: list[str], _context: dict[str, Any]) -> str:
     features = agent.feature_manager
     lines.append(
         f"  功能: subagent={features.is_enabled('subagent')}, "
-        f"tasks={features.is_enabled('tasks')}, "
         f"compression={features.is_enabled('compression')}, "
         f"background={features.is_enabled('background')}, "
-        f"team={features.is_enabled('team')}, "
         f"skills={features.is_enabled('skills')}"
     )
     return '\n'.join(lines)

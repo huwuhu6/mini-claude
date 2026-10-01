@@ -10,7 +10,7 @@ from core.runtime_context.preflight import PreflightResult
 
 def _build_prompt(*, skills_enabled=True):
     features = FeatureManager()
-    features.register_feature(FeatureDefinition("tasks", enabled=True))
+    features.register_feature(FeatureDefinition("memory", enabled=True))
     features.register_feature(FeatureDefinition("background", enabled=False))
     features.register_feature(FeatureDefinition("skills", enabled=skills_enabled))
     preflight = PreflightResult(
@@ -44,7 +44,7 @@ def test_prompt_contract_has_clear_blocks_and_current_runtime_facts():
     skills = prompt.index("<skills>")
     assert identity < environment < policy < skills
     assert prompt.count("/workspace/project") == 1
-    assert "Enabled features: tasks, skills." in prompt
+    assert "Enabled features: memory, skills." in prompt
     assert "Platform: Windows." in prompt
     assert "Network at startup: OFFLINE" in prompt
     assert "time-bounded evidence" in prompt
@@ -59,7 +59,7 @@ def test_disabled_skills_are_not_injected_into_prompt():
     prompt, _preflight = _build_prompt(skills_enabled=False)
     assert "<skills>" not in prompt
     assert "pdf: inspect and create PDFs" not in prompt
-    assert "Enabled features: tasks." in prompt
+    assert "Enabled features: memory." in prompt
 
 
 def test_prompt_does_not_name_background_tool_when_feature_is_disabled():

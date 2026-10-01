@@ -30,10 +30,12 @@ llm:
 # Feature Configuration
 features:
   subagent: true
-  tasks: true
+  # features.tasks/team are reserved/dormant multi-agent infrastructure;
+  # neither is an active runtime feature.
+  tasks: false
   compression: true
   background: true
-  team: true
+  team: false
   skills: true
   memory: true
 
