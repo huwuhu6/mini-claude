@@ -27,8 +27,8 @@ Commit Description: `feat(provider): 启用流式响应并记录传输模式`
 
 ## 2026-10-01：将 Provider bootstrap 从 Agent 中抽离
 
-Commit: `PENDING`
-Commit Description: `refactor: 从 Agent 抽离 Provider bootstrap`
+Commit: `741c442`
+Commit Description: `refactor: extract provider bootstrap from agent runtime`
 
 ### Description
 
