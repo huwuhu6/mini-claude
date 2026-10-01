@@ -67,7 +67,7 @@ from core.runtime_context import (
 )
 from core.runtime_context.observation import ObservationNormalizer
 from core.runtime_context.command_policy import CommandPolicy
-from cli.authority import WorkspaceAuthority
+from core.runtime_context.workspace_authority import WorkspaceAuthority
 from skills import SkillLoader
 
 logger = logging.getLogger(__name__)
