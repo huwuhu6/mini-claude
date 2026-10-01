@@ -164,7 +164,7 @@ def _features(agent: Any, args: list[str], _context: dict[str, Any]) -> str:
             count = agent.skill_loader.refresh()
             if count:
                 logger.info("已加载 %s 个技能模块", count)
-        agent._load_system_prompt()
+        agent.refresh_system_prompt()
         return f"功能 '{name}' 已{action}。"
     return "用法: /features [enable|disable <名称>]"
 

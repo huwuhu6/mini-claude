@@ -207,3 +207,26 @@ Commit Description: `feat(context): 默认开启结构化近期文件记忆`
 ### Decision / Limitation
 
 将该功能在 main 默认启用，保留 `features.memory: false` 作为可关闭选项。实现只从显式文件工具记录路径和有限文本观察；不会从 `bash` 命令推断最近文件，也不会自动注入整份文件内容。下一步如需评估记忆本身的因果效果，需要匹配的 memory-off/on 对照；本轮只运行一次，没有追加 trial。
+
+## 2026-10-01：抽离并收敛静态 System Prompt
+
+Commit: `PENDING`
+Commit Description: `refactor: 抽离静态 System Prompt 构造并精简规则`
+
+### Description
+
+此前 System Prompt 的内容由 `MiniClaudeAgent._load_system_prompt()` 拼接，平台指导另由 `_get_platform_prompt()` 提供。Identity、Preflight 环境、Shell 使用建议、Planning、Implementation、Verification 和 Skills 混在同一段长文本里；平台提示与 Tool description / `CommandPolicy` 也有重复。`PreflightResult.to_context()` 还混入了回答语言指令。
+
+本阶段新增纯函数模块 `src/core/prompt_builder.py`，以 Agent 身份、workspace、当前启用功能、`PreflightResult`、平台和技能索引为输入，构造 `<identity>`、`<environment>`、`<execution_policy>`、可选 `<skills>` 四个稳定区块。Agent 只保留公开的 `refresh_system_prompt()` 生命周期方法；CLI 的 `/features` 调用该方法。回答语言策略移入 identity，Preflight 的启动事实由 Builder 按字段读取。Windows 规则缩短为 shell 类型、易碎 inline quoting、平台适配工具偏好和 Runtime Policy 拒绝反馈；行为、安全细节继续由工具描述或 Runtime 负责。
+
+动态 hot context 和 `_build_request_messages()` 没有改动，当前轮状态仍只临时追加到最后一条 user message，不写入持久对话历史。
+
+### Result / Evidence
+
+在同一组代表性输入（默认配置、当前工作区、Windows、ONLINE 启动快照、Python 3.14.3 和一个技能索引）下，用现有 `Compressor.estimate_tokens_for_text()` 估算：旧 Prompt 5,788 字符 / 1,231 tokens，新 Prompt 2,174 字符 / 438 tokens，分别减少约 62.4% / 64.4%。这是静态 Prompt 的近似值，不包含 tools schema 或消息上下文。
+
+Prompt、CLI、Agent Note、结构化记忆和 Context Reliability 确定性测试合计 `38 passed, 2 deselected`；两个被排除项需要 pytest `tmp_path`，当前 Windows 临时目录权限拒绝访问。Runtime Context 中不依赖临时目录的 EnvironmentBlocker 和 Windows shell wrapper 用例 `2 passed`。`git diff --check` 通过；没有运行真实 Provider 或 Benchmark。
+
+### Decision / Limitation
+
+本次保留了条件化的实现/验证原则，删除历史重复章节和固定验证命令示例；没有引入新的“立即写代码”压力。Prompt 的措辞、平台建议和规则密度发生变化，预期模型行为仍应由后续匹配的真实任务或 Benchmark 验证；本阶段没有付费试跑，因此不对行为改善作结论。

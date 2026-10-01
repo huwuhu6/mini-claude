@@ -53,8 +53,7 @@ class PreflightResult:
             f"- Workspace Root: {self.workspace_root} "
             f"(Read-Write: {'Enabled' if self.workspace_read_write else 'Unavailable'})\n"
             "[Execution Constraint]\n"
-            f"{constraint}\n"
-            "Answer in the same language as the user prompt."
+            f"{constraint}"
         )
 
 

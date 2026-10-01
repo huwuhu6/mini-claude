@@ -104,7 +104,7 @@ def test_features_enable_skills_refreshes_and_updates_prompt():
         skill = loader.descriptions() if features.is_enabled("skills") else ""
         agent.system_prompt = f"Enabled features: {enabled}\n{skill}"
 
-    agent._load_system_prompt = refresh_prompt
+    agent.refresh_system_prompt = refresh_prompt
     console = create_agent_console(agent)
 
     assert "已enable" in console.execute("/features enable skills")
@@ -140,7 +140,7 @@ def test_config_reports_runtime_feature_states():
         features.register_feature(FeatureDefinition(name, enabled=enabled))
     agent = _config_agent(features)
     agent.skill_loader = SimpleNamespace(refresh=lambda: 0)
-    agent._load_system_prompt = lambda: None
+    agent.refresh_system_prompt = lambda: None
     console = create_agent_console(agent)
 
     result = console.execute("/config")
@@ -178,8 +178,8 @@ def test_enabling_skills_refreshes_removed_files_and_prompt():
             description = loader.descriptions() if features.is_enabled("skills") else ""
             agent.system_prompt = description
 
-        agent._load_system_prompt = refresh_prompt
-        agent._load_system_prompt()
+        agent.refresh_system_prompt = refresh_prompt
+        agent.refresh_system_prompt()
         assert "stale-skill" in agent.system_prompt
 
         skill_path.unlink()

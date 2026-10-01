@@ -47,6 +47,7 @@ from core.teammate_manager import TeammateManager, TeammateConfig
 from core.background import BackgroundProcessor, BackgroundTaskStatus
 from core.subagent import SubAgentManager, SubAgentType, SubAgentResult
 from core.compression import Compressor
+from core.prompt_builder import build_system_prompt
 from core.agent_note import AgentNote
 from core.context_memory import StructuredContextMemory
 from core.loop_guard import canonicalize_args
@@ -267,7 +268,7 @@ class MiniClaudeAgent:
         self.background.start()
 
         # Load system prompt
-        self._load_system_prompt()
+        self.refresh_system_prompt()
 
     def _setup_logging(self):
         """Configure logging based on config."""
@@ -388,143 +389,20 @@ class MiniClaudeAgent:
                 logger.warning(f"创建提供者 '{llm.provider}' 失败: {e}")
                 logger.info("正在无提供者模式下运行（功能受限）")
 
-    def _get_platform_prompt(self) -> str:
-        """Return a platform-specific command constraints block.
-
-        Uses sys.platform at runtime so the agent gets accurate guidance
-        about which shell commands are available vs forbidden on the
-        current OS. Replaces the old hardcoded Windows-only block.
-        """
-        plat = sys.platform
-
-        if plat == "win32":
-            return (
-                "CRITICAL RULES FOR CURRENT ENVIRONMENT (Windows CMD, despite the tool name `bash`):\n"
-                "1. NO INLINE SCRIPTS: Never use `python -c \"...\"` or `node -e \"...\"` "
-                "in the shell tool — CMD cannot handle nested quotes and newlines reliably.\n"
-                "2. SCRIPT WORKFLOW: If you need to run complex logic or multi-line code, "
-                "you MUST first use `write_file` to save the code to a temporary file, "
-                "and then run it with `python script.py` through the shell tool.\n"
-                "3. SEARCH_CODE is preferred for workspace content search because it is path-safe, "
-                "but ordinary platform search commands remain available when they are useful.\n"
-                "4. LONG-RUNNING SERVICES: Use `run_background` for Redis, Spring Boot, dev servers, "
-                "watchers, or any command that intentionally keeps running. It returns immediately; "
-                "then use `bash` to verify readiness. Do not add Linux-only daemon flags on Windows.\n"
-                "5. WINDOWS SHELL: Do not use `cd /d`; use the session cwd and relative paths. "
-                "Windows command chaining with `&`, and redirections such as `2>&1` and `2>nul`, "
-                "are allowed. Do not leave a standalone trailing `&` for background execution.\n"
-                "6. POWERSHELL: Read-only commands such as `Get-ChildItem`, `Get-Content`, "
-                "`Test-Path`, and `Select-String` are allowed when useful. Do not use encoded "
-                "commands or `Invoke-Expression`; prefer file tools for edits.\n"
-                "7. PREFER native Windows commands when available and avoid destructive "
-                "or remote pipe-to-shell commands.\n"
-            )
-        elif plat == "linux":
-            return (
-                "CRITICAL RULES FOR CURRENT ENVIRONMENT (Linux bash):\n"
-                "1. NATIVE COMMANDS: grep, find, ls, cat, mv, cp, rm, ps, kill, chmod, "
-                "curl, wget are all available.\n"
-                "2. FORBIDDEN COMMANDS (Windows CMD only): dir, type, findstr, del, "
-                "copy, cd /d, D: drive paths, 2>nul, chcp, if exist.\n"
-                "3. USE SEARCH_CODE FOR FILE SEARCHING instead of complex grep pipelines "
-                "— it is more reliable and path-safe.\n"
-                "4. Prefer Python scripts over complex shell pipelines for multi-step logic.\n"
-            )
-        elif plat == "darwin":
-            return (
-                "CRITICAL RULES FOR CURRENT ENVIRONMENT (macOS zsh):\n"
-                "1. NOTE: macOS ships BSD tools — some GNU flags may not work "
-                "(e.g., `grep -P`, `find -name` syntax differs).\n"
-                "2. FORBIDDEN COMMANDS (Windows CMD only): dir, type, findstr, del, "
-                "copy, cd /d, D: drive paths, 2>nul, chcp, if exist.\n"
-                "3. USE SEARCH_CODE FOR FILE SEARCHING instead of grep/find.\n"
-                "4. Prefer Python scripts over complex shell pipelines.\n"
-            )
-        else:
-            return (
-                f"CRITICAL RULES FOR CURRENT ENVIRONMENT ({plat}):\n"
-                "1. USE SEARCH_CODE FOR FILE SEARCHING instead of shell grep/find.\n"
-                "2. Prefer Python scripts over complex shell pipelines.\n"
-            )
-
-    def _load_system_prompt(self):
-        """Load or generate the system prompt.v
-
-        Ordering (cold-zone first → warm guidance later):
-          1. Identity, features, workdir
-          2. CRITICAL RULES (promoted — right after identity for cache stability)
-          3. VERIFICATION STRATEGY
-          4. Skills description (after critical behavior rules)
-        """
-        features = self.feature_manager.get_enabled_features()
-        skills_text = ""
-        if self.feature_manager.is_enabled('skills') and hasattr(self, 'skill_loader'):
-            desc = self.skill_loader.descriptions()
-            if desc:
-                skills_text = f"\nAvailable skill modules (use load_skill to access):\n{desc}"
-        self.system_prompt = (
-        # ── Layer 1: Identity ──────────────────────────────────
-        f"You are {self.config.agent.name} v{self.config.agent.version}, "
-        f"an AI assistant with tools and team capabilities.\n"
-        f"Enabled features: {', '.join(features) if features else 'base'}.\n"
-        f"Working directory: {self.workdir}\n"
-        "You can use tools to read/write files, run commands, and manage tasks.\n"
-        "\n"
-        f"{self.preflight.to_context()}\n\n"
-        # ── Layer 2: Critical rules (promoted — before skills) ─
-    ) + self._get_platform_prompt() + "\n" + (
-        # ── Layer 3: Planning rule ───────────────────────────────
-        "PLANNING RULE:"
-        " Do not assume runtime testing is required."
-        "For structural refactors (rename, import updates, signature changes, API migration, code cleanup), plan only the edits and the minimal static verification required."
-        "Do not plan runtime execution or integration testing in the initial plan unless the task explicitly requires behavioral validation.\n"
-        "IMPLEMENTATION STRATEGY:\n"
-        "For bug fixes, new features, and other behavioral tasks, do not wait to eliminate every uncertainty before making progress.\n"
-        "Inspect enough context to identify relevant interfaces, constraints, and a plausible implementation path, then prefer the smallest useful, verifiable implementation.\n"
-        "Treat implementation and runtime feedback as part of investigation: implement, verify, and use concrete failures to decide what to inspect next.\n"
-        "Before more exploration, ask: Does the missing information block the next implementation step? If not, proceed. Do not postpone implementation merely because more potentially useful details could still be investigated; continue investigating when a real blocker remains.\n"
-        # ── Layer 4: Verification strategy ─────────────────────
-        "VERIFICATION STRATEGY (MUST FOLLOW):\n"
-        "\n"
-        "1. CATEGORIZE THE TASK:\n"
-        "   - Purely structural changes (rename, import cleanup, dead code removal, "
-        "signature migration): these require only static verification.\n"
-        "   - Logic changes, bug fixes, new features: may need runtime verification.\n"
-        "\n"
-        "2. FOR STRUCTURAL CHANGES, USE STATIC VERIFICATION ONLY:\n"
-        "   Use language-native tools for syntax validation. On Windows, write a small "
-        "temporary Python checker with `write_file`, then run `python checker.py`; never use "
-        "`python -c`. On Unix, `python -c` is allowed. Other examples: ``javac File.java`` / "
-        "``npx tsc --noEmit`` / ``go vet`` / ``cargo check``.\n"
-        "   - Use `count_occurrences` only when an exact count or absence of a pattern matters; "
-        "otherwise prefer `search_code`, `read_file`, or the most direct verification.\n"
-        "   - Once you have enough reliable evidence that the task is complete, stop; do not "
-        "run verification mechanically just because a tool is available.\n"
-        "\n"
-        "3. RUNTIME VERIFICATION:\n"
-        "   For behavioral changes, bug fixes, and new features, use focused runtime verification when feasible. "
-        "Prefer testing an early implementation and learning from concrete failures over exhaustively investigating "
-        "every possible dependency in advance.\n"
-        "   For purely structural changes, runtime execution is usually unnecessary. Use focused static verification instead.\n"
-        "   Keep runtime checks focused, and keep any temporary files small and self-contained.\n"
-        "\n"
-        "4. SUCCESS DEFINITION FOR STRUCTURAL TASKS:\n"
-        "   - All requested files modified correctly.\n"
-        "   - The relevant search or verification evidence is sufficient.\n"
-        "   - No further steps required.\n"
-        "\n"
-        "5. ONE-SHOT VERIFICATION SCRIPTS (IF NEEDED): If your task is purely "
-        "structural (e.g., renaming variables, modifying parameters) and "
-        "the relevant search or verification evidence is sufficient, you should generally "
-        "stop. If you still need to confirm correctness, you may write a small "
-        "one-shot script using the project's own tooling (e.g., `pytest`, `cargo test`, "
-        "`go test`, `npm test`). Clean up such scripts after use. Do not write "
-        "elaborate multi-file verification harnesses for trivial renames.\n"
-        "\n"
-        # ── Layer 5: Skills (after critical rules) ─────────────
-        f"{skills_text}"
-        "\n"
-    )
+    def refresh_system_prompt(self) -> None:
+        """Rebuild the stable system prompt from current runtime state."""
+        skill_descriptions = ""
+        if self.feature_manager.is_enabled("skills") and hasattr(self, "skill_loader"):
+            skill_descriptions = self.skill_loader.descriptions()
+        self.system_prompt = build_system_prompt(
+            agent_name=self.config.agent.name,
+            agent_version=self.config.agent.version,
+            workspace=str(self.workdir),
+            enabled_features=self.feature_manager.get_enabled_features(),
+            preflight=self.preflight,
+            platform=sys.platform,
+            skill_descriptions=skill_descriptions,
+        )
 
     # ═══════════════════════════════════════════════════════════
     # Main Agent Loop
