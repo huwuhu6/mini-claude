@@ -2,7 +2,7 @@
 
 ## 2026-10-01
 
-Commit: `PENDING`
+Commit: `677c925`
 Commit Description: `refactor: 将 CLI 命令职责从 Agent Runtime 剥离`
 
 ### Description
