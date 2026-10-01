@@ -11,7 +11,7 @@ from typing import Optional, List, TYPE_CHECKING, Any, Dict
 from dataclasses import dataclass, field
 
 from core.runtime_context.command_policy import CommandPolicy
-from cli.authority import WorkspaceAuthority
+from core.runtime_context.workspace_authority import WorkspaceAuthority
 
 if TYPE_CHECKING:
     from core.runtime_context.shell_session import ShellSession
