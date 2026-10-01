@@ -33,6 +33,7 @@ from providers.base import Message, ToolDefinition as ProviderToolDef
 from providers.manager import ProviderManager
 
 from core.tools.base_tools import BaseTools, ToolResult, READ_FILE_MAX_LINES
+from core.tools.registry import ToolRegistry, ToolSpec
 from core.features import FeatureManager, FeatureDefinition, FeatureDependency
 from core.messaging import MessageBus, Message as BusMessage, MessagePriority
 from core.teammate_manager import TeammateManager, TeammateConfig
@@ -162,26 +163,8 @@ class MiniClaudeAgent:
         )
         self.command_policy = CommandPolicy()
 
-        # Tool dispatcher — dict-based routing bound once at init (s_full.py TOOL_HANDLERS pattern)
-        self.tool_dispatcher = {
-            "bash": self._handle_bash,
-            "run_background": self._handle_run_background,
-            "get_background_status": self._handle_get_background_status,
-            "get_background_logs": self._handle_get_background_logs,
-            "stop_background": self._handle_stop_background,
-            "health_check": self._handle_health_check,
-            "read_file": self._handle_read_file,
-            "write_file": self._handle_write_file,
-            "edit_file": self._handle_edit_file,
-            "update_agent_note": self._handle_update_agent_note,
-            "load_skill": self._handle_load_skill_dispatch,
-            "task": self._handle_task,
-            "TodoWrite": self._handle_todo_write,
-            "search_code": self._handle_search_code,
-            "count_occurrences": self._handle_count_occurrences,
-            # "syntax_check": self._handle_syntax_check,  # removed — use language-native tools
-            "list_files": self._handle_list_files,
-        }
+        self.tool_registry = ToolRegistry()
+        self._register_tools()
 
         # In-memory todo tracker (s_full.py s03 Nag system)
         self.todo = TodoManager()
@@ -632,8 +615,8 @@ class MiniClaudeAgent:
         self.messages.append(Message(role='user', content=user_input))
         return self._llm_tool_cycle(require_tool_call=require_tool_call)
 
-    def _get_llm_tools(self) -> List[Dict[str, Any]]:
-        """Get tool definitions filtered by feature flags."""
+    def _register_tools(self) -> None:
+        """Register each exposed tool schema together with its existing handler."""
         _platform_label = {
             'win32': 'Windows (CMD)',
             'linux': 'Linux (bash)',
@@ -643,6 +626,7 @@ class MiniClaudeAgent:
         all_tools = [
             {
                 'name': 'bash',
+                'handler': self._handle_bash,
                 'description': (
                     f'Run a shell command. Platform: {_platform_label}. '
                     'Large output is saved under .agent/logs and only a preview is returned; '
@@ -658,6 +642,7 @@ class MiniClaudeAgent:
             },
             {
                 'name': 'run_background',
+                'handler': self._handle_run_background,
                 'description': (
                     f'Run a long-lived command asynchronously on {_platform_label}. '
                     'Use this for servers and development watchers that intentionally keep running '
@@ -683,6 +668,7 @@ class MiniClaudeAgent:
             },
             {
                 'name': 'get_background_status',
+                'handler': self._handle_get_background_status,
                 'description': '查询后台任务的状态、PID、启动时间、工作目录和退出码。',
                 'input_schema': {
                     'type': 'object',
@@ -694,6 +680,7 @@ class MiniClaudeAgent:
             },
             {
                 'name': 'get_background_logs',
+                'handler': self._handle_get_background_logs,
                 'description': '读取后台任务最近的 stdout/stderr 行，不会把完整日志一次性放入上下文。',
                 'input_schema': {
                     'type': 'object',
@@ -706,6 +693,7 @@ class MiniClaudeAgent:
             },
             {
                 'name': 'stop_background',
+                'handler': self._handle_stop_background,
                 'description': '显式停止一个正在运行的后台任务。Agent 退出时不会自动调用此工具。',
                 'input_schema': {
                     'type': 'object',
@@ -717,6 +705,7 @@ class MiniClaudeAgent:
             },
             {
                 'name': 'health_check',
+                'handler': self._handle_health_check,
                 'description': '按本机端口或 HTTP URL 检查服务是否可用，可附带后台任务 ID。',
                 'input_schema': {
                     'type': 'object',
@@ -731,6 +720,7 @@ class MiniClaudeAgent:
             },
             {
                 'name': 'read_file',
+                'handler': self._handle_read_file,
                 'description': f'按行读取文件，默认最多返回 {READ_FILE_MAX_LINES} 行；start_line/end_line 为 1-based 窗口，超过行数或字符/字节硬上限会截断。长文件请使用后续窗口继续读取。',
                 'input_schema': {
                     'type': 'object',
@@ -744,6 +734,7 @@ class MiniClaudeAgent:
             },
             {
                 'name': 'write_file',
+                'handler': self._handle_write_file,
                 'description': 'Write content to a file.',
                 'input_schema': {
                     'type': 'object',
@@ -756,6 +747,7 @@ class MiniClaudeAgent:
             },
             {
                 'name': 'edit_file',
+                'handler': self._handle_edit_file,
                 'description': "Apply precise text replacements to an existing file. CRITICAL RULE: Keep replacements focused on the affected function body or block (usually under 20 lines). Avoid copying entire large classes. Think of this as a unified diff. If your search/replace blocks are overly large, the system will actively REJECT the edit. For new files or full overwrites, use write_file instead.",
                 'input_schema': {
                     'type': 'object',
@@ -780,6 +772,7 @@ class MiniClaudeAgent:
             },
             {
                 'name': 'update_agent_note',
+                'handler': self._handle_update_agent_note,
                 'description': '覆盖当前会话的简短工作笔记。记录用户明确约束、已验证的发现和待验证的假设；及时删去过期结论。笔记每轮都会提供给你，压缩前请保存会丢失的关键信息。',
                 'input_schema': {
                     'type': 'object',
@@ -791,6 +784,7 @@ class MiniClaudeAgent:
             },
             {
                 'name': 'load_skill',
+                'handler': self._handle_load_skill_dispatch,
                 'description': 'Load specialized knowledge or instructions from a named skill module. Use this when you need domain-specific guidance.',
                 'input_schema': {
                     'type': 'object',
@@ -802,6 +796,7 @@ class MiniClaudeAgent:
             },
             {
                 'name': 'task',
+                'handler': self._handle_task,
                 'description': 'Spawn an isolated subagent for exploration, research, or delegated work. The subagent runs independently with its own tool loop and returns a final summary.',
                 'input_schema': {
                     'type': 'object',
@@ -818,6 +813,7 @@ class MiniClaudeAgent:
             },
             {
                 'name': 'search_code',
+                'handler': self._handle_search_code,
                 'description': '在指定文件或目录中搜索正则表达式模式。跨平台纯 Python 实现，自动忽略 .git/__pycache__/node_modules 等目录。优先使用此工具进行代码搜索，而不是编写 Python 脚本或调用 grep/findstr。',
                 'input_schema': {
                     'type': 'object',
@@ -858,6 +854,7 @@ class MiniClaudeAgent:
             },
             {
                 'name': 'count_occurrences',
+                'handler': self._handle_count_occurrences,
                 'description': '统计正则表达式模式在多个文件中的出现次数。返回每个 pattern 的总匹配数和文件级分布。比 search_code 更轻量，适合验证 rename/refactor 的完成度。',
                 'input_schema': {
                     'type': 'object',
@@ -897,6 +894,7 @@ class MiniClaudeAgent:
             # },
             {
                 'name': 'list_files',
+                'handler': self._handle_list_files,
                 'description': '列出目录中的文件和子目录（支持深度控制和忽略规则）。不可用于读取文件内容，只用于浏览项目结构。',
                 'input_schema': {
                     'type': 'object',
@@ -966,9 +964,22 @@ class MiniClaudeAgent:
             # },
         ]
 
-        return self.feature_manager.filter_tools(all_tools)
+        for tool in all_tools:
+            self.tool_registry.register(ToolSpec(
+                name=tool['name'],
+                description=tool['description'],
+                input_schema=tool['input_schema'],
+                handler=tool['handler'],
+            ))
 
-    # ── Tool Handler Methods (bound once in __init__.tool_dispatcher) ──
+    def _get_llm_tools(self) -> List[Dict[str, Any]]:
+        """Get registered tool definitions filtered by feature flags."""
+        if not hasattr(self, 'tool_registry'):
+            self.tool_registry = ToolRegistry()
+            self._register_tools()
+        return self.feature_manager.filter_tools(self.tool_registry.definitions())
+
+    # ── Tool Handler Methods (bound in ToolRegistry) ──
 
     def _handle_bash(self, command: str) -> ToolResult:
         # Windows `start` launches another process/window but can still keep
@@ -1307,12 +1318,11 @@ class MiniClaudeAgent:
         return ToolResult(content=f"{header}\n{skill.content}\n</skill>")
 
     def _execute_tool(self, name: str, args: Dict[str, Any]) -> Any:
-        """Execute tool via pre-bound dispatch dict (s_full.py TOOL_HANDLERS pattern)."""
-        handler = self.tool_dispatcher.get(name)
-        if not handler:
+        """Execute a registered tool while preserving legacy error formatting."""
+        if not self.tool_registry.has_handler(name):
             return f"错误: 未知工具 '{name}'"
         try:
-            return handler(**args)
+            return self.tool_registry.execute(name, args)
         except TypeError as e:
             logger.error(f"工具 '{name}' 参数错误: {e}")
             return f"错误: 工具 '{name}' 参数无效。详情: {str(e)}"
