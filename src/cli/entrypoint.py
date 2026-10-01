@@ -14,6 +14,8 @@ if str(_src) not in sys.path:
 
 from agent.mini_claude_agent import MiniClaudeAgent
 from cli.confirmation import confirm_workspace
+from cli.commands import create_agent_console, execute_agent_command
+from cli.console import ConsoleCommandSystem
 from cli.ui import TerminalUI, confirm_exit
 from core.debug_viewer import DebugViewer
 from core.runtime_data import RuntimeDataPaths
@@ -50,8 +52,19 @@ def _read_multiline(ui: TerminalUI, read_line=input) -> str:
         lines.append(line)
 
 
+def _dispatch_input(
+    agent: MiniClaudeAgent,
+    console: ConsoleCommandSystem,
+    user_input: str,
+) -> str:
+    if user_input.startswith('/'):
+        return execute_agent_command(console, agent, user_input)
+    return agent.chat(user_input)
+
+
 def _run_repl(agent: MiniClaudeAgent) -> None:
     ui = TerminalUI()
+    console = create_agent_console(agent)
     agent.set_ui_event_handler(ui.handle_event)
     print(f"\n{ui._paint(agent.config.agent.name, ui._BLUE)} v{agent.config.agent.version}")
     print(ui._paint("输入 exit 退出，输入 /help 查看命令。\n", ui._DIM))
@@ -80,7 +93,7 @@ def _run_repl(agent: MiniClaudeAgent) -> None:
                 print("再见。")
                 break
 
-            response = agent.chat(user_input)
+            response = _dispatch_input(agent, console, user_input)
             if response:
                 ui.print_answer(response)
         except KeyboardInterrupt:

@@ -1,5 +1,5 @@
 """
-Console Command System - REPL command interface for the agent.
+Generic CLI command parser and registry.
 """
 from __future__ import annotations
 import logging
@@ -51,10 +51,6 @@ class ConsoleCommandSystem:
             'exit', 'Exit the application', self._cmd_exit,
             aliases=['quit'], category='general'
         ))
-        self.register(Command(
-            'clear', 'Clear conversation history', self._cmd_clear,
-            category='general'
-        ))
 
     def register(self, cmd: Command) -> None:
         self._commands[cmd.name] = cmd
@@ -76,7 +72,11 @@ class ConsoleCommandSystem:
 
     def execute(self, text: str, context: Optional[Dict[str, Any]] = None) -> str:
         """Parse and execute a command. Returns response text."""
-        parsed = self.parse(text)
+        try:
+            parsed = self.parse(text)
+        except ValueError as e:
+            logger.warning("命令解析失败: %s", e)
+            return f"命令解析失败: {e}"
         if not parsed:
             return ""  # not a command
 
@@ -130,10 +130,6 @@ class ConsoleCommandSystem:
 
     def _cmd_exit(self, args: List[str], ctx: Dict[str, Any]) -> str:
         raise SystemExit("User requested exit")
-
-    def _cmd_clear(self, args: List[str], ctx: Dict[str, Any]) -> str:
-        # Clear is handled by the caller (they manage the conversation history)
-        return "对话历史已清除。"
 
     def _find_similar(self, name: str) -> Optional[str]:
         """Find a similar command name using simple edit distance."""

@@ -428,7 +428,7 @@ def test_subagent_system():
 def test_console_commands():
     _test_section("Console Commands")
 
-    from core.console import ConsoleCommandSystem, Command
+    from cli.console import ConsoleCommandSystem, Command
 
     cc = ConsoleCommandSystem()
 
@@ -610,23 +610,26 @@ def test_agent_integration():
     _test_result("spawn teammate", teammate is not None)
 
     # Console commands
-    status = agent._cmd_status([], {})
+    from cli.commands import create_agent_console
+    console = create_agent_console(agent)
+
+    status = console.execute("/status")
     _test_result("status command", "mini-claude" in status.lower())
 
-    tasks_output = agent._cmd_tasks([], {})
+    tasks_output = console.execute("/tasks")
     _test_result("tasks command", "Integration Test Task" in tasks_output)
 
-    team_output = agent._cmd_team([], {})
+    team_output = console.execute("/team")
     _test_result("team command", "TestBot" in team_output)
 
-    features_output = agent._cmd_features([], {})
+    features_output = console.execute("/features")
     _test_result("features command", "bash" in features_output)
 
-    config_output = agent._cmd_config([], {})
+    config_output = console.execute("/config")
     _test_result("config command", "mini-claude" in config_output)
 
     # Inbox
-    inbox_output = agent._cmd_inbox([], {})
+    inbox_output = console.execute("/inbox")
     _test_result("inbox command", "空" in inbox_output or "empty" in inbox_output.lower() or not inbox_output)
 
     agent.shutdown()

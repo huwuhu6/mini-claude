@@ -26,8 +26,8 @@ if _src_path not in sys.path:
     sys.path.insert(0, _src_path)
 
 from models.config import ConfigManager, Config
-from models.task import Task, TaskManager, TaskStatus
-from models.teammate import Teammate, TeammateStatus, TeammateRole
+from models.task import Task, TaskManager
+from models.teammate import Teammate, TeammateRole
 from models.todo import TodoManager
 
 from providers.base import Message, ToolDefinition as ProviderToolDef
@@ -46,7 +46,6 @@ from core.messaging import MessageBus, Message as BusMessage, MessagePriority
 from core.teammate_manager import TeammateManager, TeammateConfig
 from core.background import BackgroundProcessor, BackgroundTaskStatus
 from core.subagent import SubAgentManager, SubAgentType, SubAgentResult
-from core.console import ConsoleCommandSystem, Command
 from core.compression import Compressor
 from core.agent_note import AgentNote
 from core.context_memory import StructuredContextMemory
@@ -109,7 +108,6 @@ class MiniClaudeAgent:
     - Background processing
     - SubAgents
     - Skills
-    - Console commands
     - Context compression
     """
 
@@ -222,10 +220,6 @@ class MiniClaudeAgent:
             names = self.skill_loader.discover()
             if names:
                 logger.info(f"已加载 {len(names)} 个技能模块: {', '.join(names)}")
-
-        # Console commands
-        self.console = ConsoleCommandSystem()
-        self._register_commands()
 
         # Compression
         compression_config = {
@@ -531,54 +525,6 @@ class MiniClaudeAgent:
         f"{skills_text}"
         "\n"
     )
-
-    def _register_commands(self):
-        """Register console commands."""
-        self.console.register(Command(
-            'status', 'Show system status', self._cmd_status, category='system'
-        ))
-        self.console.register(Command(
-            'stats', 'Show performance statistics', self._cmd_stats, category='system'
-        ))
-        self.console.register(Command(
-            'config', 'Show current configuration', self._cmd_config, category='system'
-        ))
-        self.console.register(Command(
-            'tasks', 'List all tasks', self._cmd_tasks,
-            args_help='[status]', aliases=['task'], category='tasks'
-        ))
-        self.console.register(Command(
-            'team', 'List all teammates', self._cmd_team,
-            args_help='[status]', category='team'
-        ))
-        self.console.register(Command(
-            'inbox', 'Read messages from inbox', self._cmd_inbox, category='team'
-        ))
-        self.console.register(Command(
-            'features', 'List feature flags and status', self._cmd_features,
-            args_help='[enable/disable] [name]', category='system'
-        ))
-        self.console.register(Command(
-            'compact', 'Manually compress conversation', self._cmd_compact, category='general'
-        ))
-        self.console.register(Command(
-            'providers', 'Show provider information', self._cmd_providers, category='system'
-        ))
-        self.console.register(Command(
-            'add_workdir', 'Add a directory to path validation whitelist',
-            self._cmd_add_workdir,
-            args_help='<path>', aliases=['addpath'], category='system'
-        ))
-        self.console.register(Command(
-            'whitelist', 'List all paths in the validation whitelist',
-            self._cmd_whitelist,
-            aliases=['workdirs'], category='system'
-        ))
-        self.console.register(Command(
-            'skills', 'List all available skill modules',
-            self._cmd_skills,
-            args_help='[name]', aliases=['skill'], category='system'
-        ))
 
     # ═══════════════════════════════════════════════════════════
     # Main Agent Loop
@@ -2476,173 +2422,14 @@ class MiniClaudeAgent:
         return {'content': str(response), 'tool_calls': [], 'usage': {}}
 
     # ═══════════════════════════════════════════════════════════
-    # Console Command Handlers
-    # ═══════════════════════════════════════════════════════════
-
-    def _cmd_status(self, args: List[str], ctx: Dict[str, Any]) -> str:
-        lines = [f"=== {self.config.agent.name} v{self.config.agent.version} ==="]
-        # Provider status
-        for name, available in self.provider_manager.check_health().items():
-            lines.append(f"  提供者 [{name}]: {'正常' if available else '失败'}")
-        # Conversation stats
-        lines.append(f"  消息数: {len(self.messages)}")
-        lines.append(f"  估计 tokens: {self.compressor.estimate_tokens(self.messages)}")
-        # Tasks
-        task_counts = self.task_manager.count()
-        lines.append(f"  任务数: {sum(task_counts.values())} 个")
-        # Teammates
-        team_stats = self.team_manager.get_stats()
-        lines.append(f"  队友数: {team_stats['total']} 活跃")
-        # Features
-        enabled = self.feature_manager.get_enabled_features()
-        lines.append(f"  已启用功能: {len(enabled)}/{len(self.feature_manager.list_features())}")
-        return '\n'.join(lines)
-
-    def _cmd_stats(self, args: List[str], ctx: Dict[str, Any]) -> str:
-        lines = ["=== 统计信息 ==="]
-        lines.append(f"对话: {len(self.messages)} 条消息")
-        lines.append(f"  估计 tokens: {self.compressor.estimate_tokens(self.messages)}")
-        task_counts = self.task_manager.count()
-        lines.append(f"任务: {task_counts}")
-        lines.append(f"队友: {self.team_manager.get_stats()}")
-        lines.append(f"后台: {self.background.get_stats()}")
-        lines.append(f"总线: {self.message_bus.get_stats()}")
-        return '\n'.join(lines)
-
-    def _cmd_config(self, args: List[str], ctx: Dict[str, Any]) -> str:
-        lines = ["=== 配置信息 ==="]
-        lines.append(f"  代理: {self.config.agent.name} ({self.config.agent.version})")
-        lines.append(f"  LLM: {self.config.llm.provider} / {self.config.llm.model}")
-        lines.append(f"  最大 tokens: {self.config.llm.max_tokens}")
-        lines.append(f"  温度: {self.config.llm.temperature}")
-        lines.append(f"  功能: subagent={self.config.features.subagent}, "
-                      f"tasks={self.config.features.tasks}, "
-                      f"compression={self.config.features.compression}, "
-                      f"background={self.config.features.background}, "
-                      f"team={self.config.features.team}, "
-                      f"skills={self.config.features.skills}")
-        return '\n'.join(lines)
-
-    def _cmd_tasks(self, args: List[str], ctx: Dict[str, Any]) -> str:
-        status_filter = TaskStatus(args[0]) if args else None
-        tasks = self.task_manager.list(status=status_filter)
-        if not tasks:
-            return "没有找到任务。"
-        # Sort by priority then creation
-        tasks.sort(key=lambda t: (-t.priority, t.created_at))
-        return '\n'.join(t.to_short_string() for t in tasks)
-
-    def _cmd_team(self, args: List[str], ctx: Dict[str, Any]) -> str:
-        status_filter = None
-        if args:
-            try:
-                status_filter = TeammateStatus(args[0])
-            except ValueError:
-                return f"未知状态: {args[0]}。可用值: idle, working, busy, error, shutdown"
-        teammates = self.team_manager.list(status=status_filter)
-        if not teammates:
-            return "没有队友。"
-        return '\n'.join(t.to_short_string() for t in teammates)
-
-    def _cmd_inbox(self, args: List[str], ctx: Dict[str, Any]) -> str:
-        messages = self.message_bus.read_inbox(self.config.agent.name)
-        if not messages:
-            return "收件箱为空。"
-        lines = []
-        for m in messages:
-            lines.append(f"[{m.sender}] ({m.msg_type.value}): {m.content[:200]}")
-        return '\n'.join(lines)
-
-    def _cmd_features(self, args: List[str], ctx: Dict[str, Any]) -> str:
-        if not args:
-            lines = ["=== 功能列表 ==="]
-            for feat in self.feature_manager.list_features():
-                status = '开' if self.feature_manager.is_enabled(feat.name) else '关'
-                lines.append(f"  {feat.name:20s} [{status:3s}]  {feat.description}")
-            return '\n'.join(lines)
-
-        action = args[0]
-        if action in ('enable', 'disable') and len(args) >= 2:
-            name = args[1]
-            if action == 'enable':
-                ok = self.feature_manager.enable(name)
-            else:
-                ok = self.feature_manager.disable(name)
-            if ok:
-                return f"功能 '{name}' 已{action}。"
-            return f"无法{action}功能 '{name}'。"
-        return "用法: /features [enable|disable <名称>]"
-
-    def _cmd_compact(self, args: List[str], ctx: Dict[str, Any]) -> str:
-        if len(self.messages) < 4:
-            return "消息数量不足以进行压缩（至少需要 4 条）。"
-        old_count = len(self.messages)
-        old_tokens = self.compressor.estimate_tokens(self.messages)
-        self.messages = self.compressor.compress(self.messages)
-        new_tokens = self.compressor.estimate_tokens(self.messages)
-        return (
-            f"已压缩: {old_count} -> {len(self.messages)} 条消息 "
-            f"({old_tokens} -> {new_tokens} 估计 tokens)"
-        )
-
-    def _cmd_providers(self, args: List[str], ctx: Dict[str, Any]) -> str:
-        lines = ["=== 提供者 ==="]
-        info = self.provider_manager.get_provider_info()
-        if not info:
-            return "未配置任何提供者。"
-        for name, p in info.items():
-            status = '正常' if p['available'] else '失败'
-            lines.append(f"  {name}: {p['type']} ({p['model']}) [{status}]")
-        return '\n'.join(lines)
-
-    def _cmd_add_workdir(self, args: List[str], ctx: Dict[str, Any]) -> str:
-        """Add a directory to the path validation whitelist."""
-        if not args:
-            return "用法: /add_workdir <路径>\n添加工作目录到路径校验白名单"
-        return self.tools.add_allowed_path(args[0])
-
-    def _cmd_whitelist(self, args: List[str], ctx: Dict[str, Any]) -> str:
-        """List all paths in the validation whitelist."""
-        return self.tools.list_allowed_paths()
-
-    def _cmd_skills(self, args: List[str], ctx: Dict[str, Any]) -> str:
-        """List or load skill modules."""
-        if not self.feature_manager.is_enabled('skills'):
-            return "技能系统未启用。通过 /features enable skills 启用。"
-        if not args:
-            all_skills = self.skill_loader.get_all()
-            if not all_skills:
-                return "没有可用的技能模块。请在 skills/ 目录中创建 SKILL.md 文件。"
-            lines = ["=== 技能模块 ==="]
-            for s in sorted(all_skills, key=lambda x: x.name):
-                desc = s.description or '(无描述)'
-                cat = f"[{s.category}]" if s.category else ""
-                lines.append(f"  {s.name:20s} {cat:12s} {desc}")
-            return '\n'.join(lines)
-        # Load specific skill
-        name = args[0]
-        content = self.skill_loader.get_skill_content(name)
-        if content is None:
-            available = ', '.join(s.name for s in self.skill_loader.get_all()) or '(无)'
-            return f"未找到技能: {name}\n可用: {available}"
-        return f"=== {name} ===\n{content}"
-
-    # ═══════════════════════════════════════════════════════════
     # High-Level API
     # ═══════════════════════════════════════════════════════════
 
     def chat(self, message: str, require_tool_call: bool = False) -> str:
-        """Simple chat interface (auto-detects console commands)."""
+        """Submit a user instruction to the Agent Runtime."""
         self.session_recorder.start_round()
         logger.info("USER_INPUT: %s", message)
         self.session_recorder.record("user_input", content=message)
-        # Check for console command
-        if message.startswith('/'):
-            result = self.console.execute(message, {'agent': self})
-            logger.info("COMMAND_RESULT: command=%s result=%s", message, result)
-            self.session_recorder.record("command_result", command=message, result=result)
-            return result
-
         result = self.run(message, require_tool_call=require_tool_call)
         logger.info("AGENT_RESPONSE: %s", result)
         # A final model response only means the conversation turn ended; the
@@ -2711,87 +2498,3 @@ class MiniClaudeAgent:
         self.team_manager.shutdown_all()
         self._running = False
         logger.info("关闭完成。")
-
-    def print_status(self):
-        """Print current system status to stdout."""
-        print(self._cmd_status([], {}))
-
-
-def main():
-    """Main entry point for the agent CLI."""
-    import argparse
-
-    parser = argparse.ArgumentParser(description='Mini Claude 代理')
-    parser.add_argument('--config', type=str, help='配置文件路径')
-    parser.add_argument('--one-shot', type=str, help='运行单次查询后退出')
-    parser.add_argument('--demo', action='store_true', help='运行演示模式')
-    args = parser.parse_args()
-
-    config_path = Path(args.config) if args.config else None
-    agent = MiniClaudeAgent(config_path=config_path)
-
-    if args.one_shot:
-        print(agent.chat(args.one_shot))
-        agent.shutdown()
-        return
-
-    if args.demo:
-        _run_demo(agent)
-        agent.shutdown()
-        return
-
-    # Interactive mode
-    print(f"\n=== {agent.config.agent.name} v{agent.config.agent.version} ===")
-    print("输入 'exit' 或 '/exit' 退出，'/help' 查看命令\n")
-
-    agent.print_status()
-
-    while True:
-        try:
-            user_input = input("\n你: ").strip()
-            if not user_input:
-                continue
-            if user_input.lower() in ('exit', 'quit'):
-                print("再见！")
-                break
-
-            response = agent.chat(user_input)
-            if response:
-                print(f"\n代理: {response}")
-
-        except (KeyboardInterrupt, EOFError):
-            print("\n\n再见！")
-            break
-        except SystemExit:
-            break
-        except Exception as e:
-            print(f"\n错误: {e}")
-            logger.exception("主循环出错")
-
-    agent.shutdown()
-
-
-def _run_demo(agent: MiniClaudeAgent):
-    """Run a demonstration of agent capabilities."""
-    print("\n=== Mini Claude 代理演示 ===\n")
-
-    # Show status
-    agent.print_status()
-
-    # Demo conversation
-    queries = [
-        "你好，你启用了哪些功能？",
-        "创建一个名为 hello_agent.txt 的文件，内容为 '来自 Mini Claude 代理的问候！'",
-        "读取 hello_agent.txt 文件",
-        "创建一个名为 '测试任务' 的任务，优先级为 2",
-    ]
-
-    for q in queries:
-        print(f"\n你: {q}")
-        print(f"代理: {agent.chat(q)}")
-
-    print("\n=== 演示结束 ===")
-
-
-if __name__ == "__main__":
-    main()

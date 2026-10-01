@@ -135,7 +135,7 @@ python -m cli.entrypoint . --yes
 
 CLI 使用可编辑的多行输入框：Enter 换行，`Alt+Enter` 提交整段内容；也可以使用 `Esc` 后再按 Enter 提交。粘贴多行文本后可以继续移动光标和修改，不会按第一行提前发送。若没有安装 `prompt-toolkit`，才使用 `/paste` 加 `/end` 的兼容模式。
 
-具体命令以 `src/core/console.py` 和运行时 `/help` 输出为准。
+具体命令以 `src/cli/console.py`、`src/cli/commands.py` 和运行时 `/help` 输出为准。
 
 ## 测试与评测
 
