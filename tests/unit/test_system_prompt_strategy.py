@@ -62,6 +62,13 @@ def test_disabled_skills_are_not_injected_into_prompt():
     assert "Enabled features: tasks." in prompt
 
 
+def test_prompt_does_not_name_background_tool_when_feature_is_disabled():
+    prompt, _preflight = _build_prompt()
+    assert "run_background" not in prompt
+    assert "purpose-built file and search tools" in prompt
+    assert "shell workarounds" in prompt
+
+
 @pytest.mark.parametrize(
     ("platform", "expected"),
     [("win32", "Windows CMD"), ("linux", "Linux bash"), ("darwin", "macOS")],
@@ -76,7 +83,8 @@ def test_windows_guidance_keeps_only_high_value_shell_advice():
     assert "complex multiline" in guidance
     assert "fragile inline quoting" in guidance
     assert "script file" in guidance
-    assert "search_code" in guidance and "read_file" in guidance
+    assert "purpose-built file and search tools" in guidance
+    assert "shell workarounds" in guidance
     assert "runtime policy" in guidance
     assert "invoke-expression" not in guidance
     assert "trailing &" not in guidance

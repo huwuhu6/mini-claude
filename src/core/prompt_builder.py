@@ -30,8 +30,8 @@ def build_platform_guidance(platform: str) -> str:
         shell_guidance = f"Use commands appropriate for the {_platform_name(platform)} environment."
 
     return (
-        f"{shell_guidance} Prefer purpose-built tools such as search_code, read_file, "
-        "edit_file, or run_background when they fit the task. Unsafe or unsupported shell "
+        f"{shell_guidance} Prefer available purpose-built file and search tools over "
+        "complex shell workarounds when they fit the task. Unsafe or unsupported shell "
         "forms may be rejected by runtime policy; adapt to tool feedback."
     )
 
