@@ -1,6 +1,6 @@
 ## 2026-10-01：统一 MainAgent 与 SubAgent 的共享工具定义
 
-Commit: `PENDING`
+Commit: `330e11d`
 Commit Description: `refactor(tools): 统一主代理与子代理工具定义`
 
 ### Description
