@@ -27,3 +27,4 @@ def test_system_prompt_prioritizes_small_implementation_and_focused_feedback():
     assert "use focused runtime verification when feasible" in prompt
     assert "For purely structural changes, runtime execution is usually unnecessary" in prompt
     assert "RUNTIME VERIFICATION IS ALLOWED ONLY WHEN" not in prompt
+    assert "TodoWrite" not in prompt

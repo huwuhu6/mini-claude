@@ -1,5 +1,7 @@
 
-## 2026-09-29 当前现场
+## 2026-10-01 当前现场
+
+- Tool 层第二阶段将 MainAgent 与 SubAgent 共有的 `bash`、`read_file`、`write_file`、`edit_file` schema 收敛到 `src/core/tools/definitions.py`；SubAgent 使用独立 `ToolRegistry`，EXPLORE 只读，GENERAL/PLAN/REVIEW 保持四个基础工具且没有 `task`。TodoWrite 仍 dormant，提示词已移除对未暴露工具的调用指引。相关单测 16 项、SubAgent 集成测试 1 项、LoopController 测试 35 项通过；完整 `test_all_modules.py` 中若干用例受 Windows 临时目录 / 外部数据目录权限影响。详见 `docs/evolution/tool_registry.md`。
 
 - 已将上下文与工具输出核心修复移入 `main`：完整请求预算估算、显式 1M/250K/500K 配置、Provider usage 与缓存命中 Trace、压缩事务和有界工具输出。
 - Agent Note 继续每轮临时注入；自动压缩先提醒再执行。整合时修复了提醒状态与本轮动态上下文不同步的问题。

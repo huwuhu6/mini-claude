@@ -33,8 +33,14 @@ from models.todo import TodoManager
 from providers.base import Message, ToolDefinition as ProviderToolDef
 from providers.manager import ProviderManager
 
-from core.tools.base_tools import BaseTools, ToolResult, READ_FILE_MAX_LINES
+from core.tools.base_tools import BaseTools, ToolResult
 from core.tools.registry import ToolRegistry, ToolSpec
+from core.tools.definitions import (
+    bash_spec,
+    edit_file_spec,
+    read_file_spec,
+    write_file_spec,
+)
 from core.features import FeatureManager, FeatureDefinition, FeatureDependency
 from core.messaging import MessageBus, Message as BusMessage, MessagePriority
 from core.teammate_manager import TeammateManager, TeammateConfig
@@ -454,8 +460,7 @@ class MiniClaudeAgent:
           1. Identity, features, workdir
           2. CRITICAL RULES (promoted — right after identity for cache stability)
           3. VERIFICATION STRATEGY
-          4. Skills description (after rules — not before, to avoid lost-in-the-middle)
-          5. TodoWrite soft constraint (replaces the old mandatory punch-clock)
+          4. Skills description (after critical behavior rules)
         """
         features = self.feature_manager.get_enabled_features()
         skills_text = ""
@@ -525,11 +530,6 @@ class MiniClaudeAgent:
         # ── Layer 5: Skills (after critical rules) ─────────────
         f"{skills_text}"
         "\n"
-        # ── Layer 6: TodoWrite soft constraint ─────────────────
-        "TASK TRACKING WITH TodoWrite:\n"
-        "Use `TodoWrite` ONLY for high-level planning of complex, multi-step tasks. "
-        "For simple structural refactors, file edits, or localized fixes, execute "
-        "the tool directly. Do not meticulously punch-clock every minor action.\n"
     )
 
     def _register_commands(self):
@@ -640,22 +640,14 @@ class MiniClaudeAgent:
         }.get(sys.platform, sys.platform)
 
         all_tools = [
-            {
-                'name': 'bash',
-                'handler': self._handle_bash,
-                'description': (
+            bash_spec(
+                self._handle_bash,
+                description=(
                     f'Run a shell command. Platform: {_platform_label}. '
                     'Large output is saved under .agent/logs and only a preview is returned; '
                     'use read_file with line ranges on that path for omitted content.'
                 ),
-                'input_schema': {
-                    'type': 'object',
-                    'properties': {
-                        'command': {'type': 'string', 'description': 'The command to run'},
-                    },
-                    'required': ['command'],
-                },
-            },
+            ),
             {
                 'name': 'run_background',
                 'handler': self._handle_run_background,
@@ -734,58 +726,9 @@ class MiniClaudeAgent:
                     'required': [],
                 },
             },
-            {
-                'name': 'read_file',
-                'handler': self._handle_read_file,
-                'description': f'按行读取文件，默认最多返回 {READ_FILE_MAX_LINES} 行；start_line/end_line 为 1-based 窗口，超过行数或字符/字节硬上限会截断。长文件请使用后续窗口继续读取。',
-                'input_schema': {
-                    'type': 'object',
-                    'properties': {
-                        'path': {'type': 'string', 'description': '文件路径'},
-                        'start_line': {'type': 'integer', 'description': '起始行号（包含），从 1 开始。不传则从头读取'},
-                        'end_line': {'type': 'integer', 'description': '结束行号（包含）；仍受后端硬上限约束，超出会截断'},
-                    },
-                    'required': ['path'],
-                },
-            },
-            {
-                'name': 'write_file',
-                'handler': self._handle_write_file,
-                'description': 'Write content to a file.',
-                'input_schema': {
-                    'type': 'object',
-                    'properties': {
-                        'path': {'type': 'string', 'description': 'Path to the file'},
-                        'content': {'type': 'string', 'description': 'Content to write'},
-                    },
-                    'required': ['path', 'content'],
-                },
-            },
-            {
-                'name': 'edit_file',
-                'handler': self._handle_edit_file,
-                'description': "Apply precise text replacements to an existing file. CRITICAL RULE: Keep replacements focused on the affected function body or block (usually under 20 lines). Avoid copying entire large classes. Think of this as a unified diff. If your search/replace blocks are overly large, the system will actively REJECT the edit. For new files or full overwrites, use write_file instead.",
-                'input_schema': {
-                    'type': 'object',
-                    'properties': {
-                        'path': {'type': 'string', 'description': 'Path to the file (must exist)'},
-                        'edits': {
-                            'type': 'array',
-                            'items': {
-                                'type': 'object',
-                                'properties': {
-                                    'search': {'type': 'string', 'description': 'Exact text fragment to find in the existing file. Must be non-empty and appear exactly once — for new files or full overwrites use write_file. Max 2000 characters. Do NOT copy entire large classes.'},
-                                    'replace': {'type': 'string', 'description': 'Replacement text'},
-                                    'approx_line_start': {'type': 'integer', 'description': '可选的预估行号（1-based）。提供此值时，搜索范围将锁定在 ±50 行的局部窗口内。适合大文件中存在多处相似代码块时，辅助后端精准定位，避免全局 count>1 拦截。'},
-                                },
-                                'required': ['search', 'replace'],
-                            },
-                            'description': 'Array of search/replace pairs. Applied in order, atomically. If ANY search fails, ALL edits roll back.',
-                        },
-                    },
-                    'required': ['path', 'edits'],
-                },
-            },
+            read_file_spec(self._handle_read_file),
+            write_file_spec(self._handle_write_file),
+            edit_file_spec(self._handle_edit_file),
             {
                 'name': 'update_agent_note',
                 'handler': self._handle_update_agent_note,
@@ -981,6 +924,9 @@ class MiniClaudeAgent:
         ]
 
         for tool in all_tools:
+            if isinstance(tool, ToolSpec):
+                self.tool_registry.register(tool)
+                continue
             self.tool_registry.register(ToolSpec(
                 name=tool['name'],
                 description=tool['description'],

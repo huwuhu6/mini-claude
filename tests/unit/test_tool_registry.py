@@ -1,5 +1,8 @@
 import sys
+import shutil
+import uuid
 from pathlib import Path
+from types import SimpleNamespace
 
 import pytest
 
@@ -8,8 +11,21 @@ if str(SRC) not in sys.path:
     sys.path.insert(0, str(SRC))
 
 from agent.mini_claude_agent import MiniClaudeAgent
+from core.features import FeatureDefinition, FeatureManager
+from core.subagent import SubAgent, SubAgentType
+from core.tools.base_tools import BaseTools, ToolResult
 from core.tools.registry import ToolRegistry, ToolSpec
 from providers.base import ToolDefinition as ProviderToolDef
+
+
+@pytest.fixture
+def workspace():
+    path = Path.cwd() / f"test-subagent-tools-{uuid.uuid4().hex}"
+    path.mkdir()
+    try:
+        yield path
+    finally:
+        shutil.rmtree(path)
 
 
 MAIN_AGENT_TOOL_NAMES = [
@@ -31,15 +47,12 @@ MAIN_AGENT_TOOL_NAMES = [
 ]
 
 
-def _agent_without_initialization():
+def _agent_without_initialization(feature_manager=None):
     agent = object.__new__(MiniClaudeAgent)
-    agent.feature_manager = type(
-        "FeatureManagerStub",
-        (),
-        {
-            "filter_tools": staticmethod(lambda tools: tools),
-            "is_enabled": staticmethod(lambda _name: True),
-        },
+    agent.feature_manager = feature_manager or type(
+        "FeatureManagerStub", (),
+        {"filter_tools": staticmethod(lambda tools: tools),
+         "is_enabled": staticmethod(lambda _name: True)},
     )()
     agent.tool_registry = ToolRegistry()
     agent._register_tools()
@@ -108,3 +121,132 @@ def test_read_file_dispatches_through_registry():
     result = agent.tool_registry.execute("read_file", {"path": "sample.py"})
 
     assert result == "sample.py"
+
+
+def _definitions_by_name(registry):
+    return {tool["name"]: tool for tool in registry.definitions()}
+
+
+def test_shared_main_and_subagent_tools_have_identical_schemas(workspace):
+    main = _agent_without_initialization()
+    subagent = SubAgent(SubAgentType.GENERAL, workdir=workspace)
+    main_defs = _definitions_by_name(main.tool_registry)
+    sub_defs = _definitions_by_name(subagent.tool_registry)
+
+    for name in ("bash", "read_file", "write_file", "edit_file"):
+        assert main_defs[name]["input_schema"] == sub_defs[name]["input_schema"]
+
+
+def test_subagent_types_keep_their_existing_tool_sets_and_never_get_task(workspace):
+    expected_general = ["bash", "read_file", "write_file", "edit_file"]
+    general = SubAgent(SubAgentType.GENERAL, workdir=workspace)
+    plan = SubAgent(SubAgentType.PLAN, workdir=workspace)
+    review = SubAgent(SubAgentType.REVIEW, workdir=workspace)
+    explore = SubAgent(SubAgentType.EXPLORE, workdir=workspace)
+
+    assert [t["name"] for t in general.tool_registry.definitions()] == expected_general
+    assert [t["name"] for t in plan.tool_registry.definitions()] == expected_general
+    assert [t["name"] for t in review.tool_registry.definitions()] == expected_general
+    assert [t["name"] for t in explore.tool_registry.definitions()] == ["read_file"]
+    for subagent in (general, plan, review, explore):
+        assert not subagent.tool_registry.has_handler("task")
+
+
+def test_main_and_subagents_have_independent_registries(workspace):
+    main = _agent_without_initialization()
+    general = SubAgent(SubAgentType.GENERAL, workdir=workspace)
+    explore = SubAgent(SubAgentType.EXPLORE, workdir=workspace)
+
+    assert main.tool_registry is not general.tool_registry
+    assert general.tool_registry is not explore.tool_registry
+    general.tool_registry.register(ToolSpec("subagent_only", "", {}, lambda: "ok"))
+    assert not main.tool_registry.has_handler("subagent_only")
+    assert not explore.tool_registry.has_handler("subagent_only")
+
+
+def test_subagent_read_file_dispatch_uses_schema_parameters(workspace, monkeypatch):
+    received = {}
+
+    def read_file(self, path, start_line=None, end_line=None):
+        received.update(path=path, start_line=start_line, end_line=end_line)
+        return ToolResult("read")
+
+    monkeypatch.setattr(BaseTools, "read_file", read_file)
+    subagent = SubAgent(SubAgentType.EXPLORE, workdir=workspace)
+    definition = _definitions_by_name(subagent.tool_registry)["read_file"]
+
+    assert set(definition["input_schema"]["properties"]) == {
+        "path", "start_line", "end_line",
+    }
+    assert "limit" not in definition["input_schema"]["properties"]
+    assert subagent.execute_tool(
+        "read_file", {"path": "sample.py", "start_line": 3, "end_line": 8},
+    ) == "read"
+    assert received == {"path": "sample.py", "start_line": 3, "end_line": 8}
+
+
+def test_subagent_edit_file_dispatch_uses_schema_parameters(workspace, monkeypatch):
+    received = {}
+
+    def edit_file(self, path, edits):
+        received.update(path=path, edits=edits)
+        return ToolResult("edited")
+
+    monkeypatch.setattr(BaseTools, "edit_file", edit_file)
+    subagent = SubAgent(SubAgentType.GENERAL, workdir=workspace)
+    definition = _definitions_by_name(subagent.tool_registry)["edit_file"]
+    edits = [{"search": "before", "replace": "after"}]
+
+    assert set(definition["input_schema"]["properties"]) == {"path", "edits"}
+    assert subagent.execute_tool("edit_file", {"path": "sample.py", "edits": edits}) == "edited"
+    assert received == {"path": "sample.py", "edits": edits}
+
+
+def test_subagent_unknown_tool_keeps_legacy_result(workspace):
+    subagent = SubAgent(SubAgentType.GENERAL, workdir=workspace)
+
+    assert subagent.execute_tool("unknown_tool", {}) == "Unknown tool: unknown_tool"
+
+
+def test_subagent_run_sends_registry_definitions_to_provider(workspace):
+    class RecordingProvider:
+        model = "test-model"
+
+        def create_message(self, _messages, tools):
+            self.tools = tools
+            return SimpleNamespace(
+                choices=[SimpleNamespace(
+                    message=SimpleNamespace(content="done", tool_calls=[]),
+                )],
+            )
+
+    provider = RecordingProvider()
+    subagent = SubAgent(SubAgentType.GENERAL, workdir=workspace, provider=provider)
+
+    result = subagent.run("inspect", max_iterations=1)
+
+    assert result.success
+    assert [tool.name for tool in provider.tools] == [
+        "bash", "read_file", "write_file", "edit_file",
+    ]
+    assert all(isinstance(tool, ProviderToolDef) for tool in provider.tools)
+
+
+def test_main_feature_manager_still_filters_registered_tools():
+    features = FeatureManager()
+    for name in ("background", "skills", "compression"):
+        features.register_feature(FeatureDefinition(name=name, enabled=False))
+    features.register_tool_for_feature("run_background", "background")
+    for name in ("get_background_status", "get_background_logs", "stop_background", "health_check"):
+        features.register_tool_for_feature(name, "background")
+    features.register_tool_for_feature("load_skill", "skills")
+    features.register_tool_for_feature("update_agent_note", "compression")
+    main = _agent_without_initialization(features)
+
+    visible = [tool["name"] for tool in main._get_llm_tools()]
+
+    assert "bash" in visible
+    assert "run_background" not in visible
+    assert "get_background_status" not in visible
+    assert "load_skill" not in visible
+    assert "update_agent_note" not in visible

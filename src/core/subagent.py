@@ -5,15 +5,21 @@ from __future__ import annotations
 import logging
 import json
 import uuid
-import sys
 from pathlib import Path
 from dataclasses import dataclass, field
-from typing import Dict, List, Optional, Any, Callable
+from typing import Dict, List, Optional, Any
 from enum import Enum
 
 from providers.base import LLMProvider, Message, ToolDefinition
 from providers.manager import ProviderManager
 from core.tools.base_tools import BaseTools, ToolResult
+from core.tools.registry import ToolRegistry
+from core.tools.definitions import (
+    bash_spec,
+    edit_file_spec,
+    read_file_spec,
+    write_file_spec,
+)
 from core.runtime_context.shell_session import ShellSession
 from core.loop_controller import AttemptHistory, CommandNormalizer, RuntimeDecision, RuntimePolicy
 
@@ -66,79 +72,29 @@ class SubAgent:
         self.model = model or getattr(provider, 'model', '')
         self.messages: List[Message] = []
         self.runtime_policy = RuntimePolicy(AttemptHistory(maxlen=32))
+        self.tool_registry = ToolRegistry()
+        self._register_tools()
+
+    def _register_tools(self) -> None:
+        """Bind shared tool definitions to this SubAgent's own handlers."""
+        if self.agent_type != SubAgentType.EXPLORE:
+            self.tool_registry.register(bash_spec(self.tools.run_bash))
+        self.tool_registry.register(read_file_spec(self.tools.read_file))
+        if self.agent_type == SubAgentType.EXPLORE:
+            return
+        self.tool_registry.register(write_file_spec(self.tools.write_file))
+        self.tool_registry.register(edit_file_spec(self.tools.edit_file))
 
     def get_tools(self) -> List[Dict[str, Any]]:
-        """Get tools available based on agent type."""
-        all_tools = [
-            {
-                'name': 'bash',
-                'description': 'Run a shell command.',
-                'input_schema': {
-                    'type': 'object',
-                    'properties': {
-                        'command': {'type': 'string', 'description': 'The command to run'},
-                    },
-                    'required': ['command']
-                }
-            },
-            {
-                'name': 'read_file',
-                'description': 'Read file contents with optional line limit.',
-                'input_schema': {
-                    'type': 'object',
-                    'properties': {
-                        'path': {'type': 'string', 'description': 'Path to the file'},
-                        'limit': {'type': 'integer', 'description': 'Maximum lines to read'},
-                    },
-                    'required': ['path']
-                }
-            },
-            {
-                'name': 'write_file',
-                'description': 'Write content to a file.',
-                'input_schema': {
-                    'type': 'object',
-                    'properties': {
-                        'path': {'type': 'string', 'description': 'Path to the file'},
-                        'content': {'type': 'string', 'description': 'Content to write'},
-                    },
-                    'required': ['path', 'content']
-                }
-            },
-            {
-                'name': 'edit_file',
-                'description': 'Replace exact text in a file.',
-                'input_schema': {
-                    'type': 'object',
-                    'properties': {
-                        'path': {'type': 'string', 'description': 'Path to the file'},
-                        'old_text': {'type': 'string', 'description': 'Text to replace'},
-                        'new_text': {'type': 'string', 'description': 'Replacement text'},
-                    },
-                    'required': ['path', 'old_text', 'new_text']
-                }
-            },
-        ]
-
-        # Explore type get only read tools
-        if self.agent_type == SubAgentType.EXPLORE:
-            return [t for t in all_tools if t['name'] in ('read_file',)]
-
-        return all_tools
+        """Return this SubAgent's Provider-compatible definitions."""
+        return self.tool_registry.definitions()
 
     def execute_tool(self, tool_name: str, arguments: Dict[str, Any]) -> str:
-        """Execute a tool and return result string (dict dispatch)."""
-        handlers = {
-            'bash':       lambda a: self.tools.run_bash(a['command']),
-            'read_file':  lambda a: self.tools.read_file(a['path'], a.get('start_line'), a.get('end_line')),
-            'write_file': lambda a: self.tools.write_file(a['path'], a['content']),
-            'edit_file':  lambda a: self.tools.edit_file(a['path'], a['edits']),
-        }
-        handler = handlers.get(tool_name)
-        if not handler:
+        """Compatibility wrapper around registry dispatch."""
+        if not self.tool_registry.has_handler(tool_name):
             return f"Unknown tool: {tool_name}"
         try:
-            result = handler(arguments)
+            result = self.tool_registry.execute(tool_name, arguments)
             return result.content if isinstance(result, ToolResult) else str(result)
         except Exception as e:
             return f"Error: {str(e)}"
@@ -166,8 +122,9 @@ class SubAgent:
             )
 
         try:
-            tools = self.get_tools()
-            tool_defs = [ToolDefinition(**t) for t in tools]
+            tool_defs = [
+                ToolDefinition(**tool) for tool in self.tool_registry.definitions()
+            ]
             total_usage: Dict[str, int] = {}
             final_content = ""
             tool_call_total = 0
