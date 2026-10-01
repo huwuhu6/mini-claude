@@ -41,7 +41,7 @@ from core.tools.definitions import (
     read_file_spec,
     write_file_spec,
 )
-from core.features import FeatureManager, FeatureDefinition, FeatureDependency
+from core.features import FeatureManager, FeatureDefinition
 from core.messaging import MessageBus, Message as BusMessage, MessagePriority
 from core.teammate_manager import TeammateManager, TeammateConfig
 from core.background import BackgroundProcessor, BackgroundTaskStatus
@@ -309,10 +309,6 @@ class MiniClaudeAgent:
             category='advanced', enabled=features_config.subagent,
         ))
         self.feature_manager.register_feature(FeatureDefinition(
-            name='tasks', description='Task management system',
-            category='core', enabled=features_config.tasks,
-        ))
-        self.feature_manager.register_feature(FeatureDefinition(
             name='compression', description='Context compression',
             category='core', enabled=features_config.compression,
         ))
@@ -323,11 +319,6 @@ class MiniClaudeAgent:
         self.feature_manager.register_feature(FeatureDefinition(
             name='background', description='Background command execution',
             category='core', enabled=features_config.background,
-        ))
-        self.feature_manager.register_feature(FeatureDefinition(
-            name='team', description='AI teammate system',
-            category='advanced', enabled=features_config.team,
-            dependencies=[FeatureDependency('tasks')],
         ))
         self.feature_manager.register_feature(FeatureDefinition(
             name='skills', description='Skill modules',
@@ -373,11 +364,8 @@ class MiniClaudeAgent:
     def run(self, user_input: str, require_tool_call: bool = False) -> str:
         """Process user input and return agent response."""
         self._current_user_prompt = user_input
-        # Check for compressed mode
-        if not self.feature_manager.is_enabled('tasks'):
-            return self._run_simple(user_input, require_tool_call=require_tool_call)
-
-        return self._run_with_tasks(user_input, require_tool_call=require_tool_call)
+        self.messages.append(Message(role='user', content=user_input))
+        return self._llm_tool_cycle(require_tool_call=require_tool_call)
 
     def set_ui_event_handler(
         self, handler: Optional[Callable[[str, Dict[str, Any]], None]]
@@ -406,16 +394,6 @@ class MiniClaudeAgent:
             target = args.get("path") or args.get("pattern") or args.get("query")
             return str(target)[:100] if target else ""
         return ""
-
-    def _run_simple(self, user_input: str, require_tool_call: bool = False) -> str:
-        """Simple execution without task management."""
-        self.messages.append(Message(role='user', content=user_input))
-        return self._llm_tool_cycle(require_tool_call=require_tool_call)
-
-    def _run_with_tasks(self, user_input: str, require_tool_call: bool = False) -> str:
-        """Execution with task management."""
-        self.messages.append(Message(role='user', content=user_input))
-        return self._llm_tool_cycle(require_tool_call=require_tool_call)
 
     def _register_tools(self) -> None:
         """Register each exposed tool schema together with its existing handler."""
@@ -1464,7 +1442,6 @@ class MiniClaudeAgent:
         Sources:
           - Incomplete todo items (from in-memory TodoManager)
           - Background task notifications
-          - Teammate inbox messages
           - Nag reminder when todos are stale (``rounds_without_todo >= 3``)
 
         Returns:
@@ -1490,11 +1467,6 @@ class MiniClaudeAgent:
         if bg_text:
             parts.append(f"<background-results>\n{bg_text}\n</background-results>")
 
-        # 3. Inbox
-        inbox_text = self._check_inbox()
-        if inbox_text:
-            parts.append(f"<inbox>\n{inbox_text}\n</inbox>")
-
         # Bounded file observations are transient and freshness-checked.
         if (
             getattr(self, "memory", None) is not None
@@ -1507,7 +1479,7 @@ class MiniClaudeAgent:
                     f"<structured-file-memory>\n{memory_text}\n</structured-file-memory>"
                 )
 
-        # 4. Nag reminder (soft prompt, not persisted)
+        # 3. Nag reminder (soft prompt, not persisted)
         if self.todo.has_open_items() and rounds_without_todo >= 3:
             parts.append("<nag>Consider updating your todos.</nag>")
 

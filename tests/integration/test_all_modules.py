@@ -49,7 +49,10 @@ def test_config_system():
     _test_result("Default config loads", isinstance(config, Config))
     _test_result("Default provider", config.llm.provider == "deepseek")
     _test_result("Default model", config.llm.model == "deepseek-chat")
-    _test_result("Features enabled", config.features.subagent and config.features.tasks)
+    _test_result(
+        "Active feature defaults",
+        config.features.subagent and not config.features.tasks and not config.features.team,
+    )
 
     # Test 2: Config update
     orig_temp = config.llm.temperature

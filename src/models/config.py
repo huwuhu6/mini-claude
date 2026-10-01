@@ -30,10 +30,12 @@ class AgentConfig:
 @dataclass
 class FeaturesConfig:
     subagent: bool = True
-    tasks: bool = True
+    # tasks/team are reserved/dormant multi-agent infrastructure;
+    # neither is registered as an active runtime feature.
+    tasks: bool = False
     compression: bool = True
     background: bool = True
-    team: bool = True
+    team: bool = False
     skills: bool = True
     memory: bool = True
 

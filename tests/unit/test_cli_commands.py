@@ -10,6 +10,7 @@ from cli.commands import create_agent_console, execute_agent_command
 from cli.console import Command, ConsoleCommandSystem
 from cli.entrypoint import _dispatch_input
 from core.features import FeatureDefinition, FeatureManager
+from models.config import FeaturesConfig
 from skills.loader import SkillLoader
 
 
@@ -86,6 +87,21 @@ def test_tasks_invalid_status_has_explicit_values():
     assert "pending, running, completed, failed, blocked, cancelled" in result
 
 
+
+def test_features_list_omits_reserved_multi_agent_infrastructure():
+    agent = _minimal_command_agent()
+    agent.config = SimpleNamespace(features=FeaturesConfig())
+    agent.feature_manager = FeatureManager()
+    MiniClaudeAgent._register_features(agent)
+
+    result = create_agent_console(agent).execute("/features")
+    listed = {line.split()[0] for line in result.splitlines()[1:]}
+
+    assert {"subagent", "compression", "memory", "background", "skills"} <= listed
+    assert "tasks" not in listed
+    assert "team" not in listed
+
+
 def test_features_enable_skills_refreshes_and_updates_prompt():
     features = FeatureManager()
     features.register_feature(FeatureDefinition("skills", enabled=False))
@@ -123,10 +139,7 @@ def _config_agent(feature_manager):
     agent.config = SimpleNamespace(
         agent=SimpleNamespace(name="MiniClaude", version="1"),
         llm=SimpleNamespace(provider="test", model="test", max_tokens=10, temperature=0),
-        features=SimpleNamespace(
-            subagent=True, tasks=True, compression=True, background=False,
-            team=True, skills=True,
-        ),
+        features=SimpleNamespace(subagent=True, compression=True, background=False, skills=True),
     )
     return agent
 
@@ -134,8 +147,8 @@ def _config_agent(feature_manager):
 def test_config_reports_runtime_feature_states():
     features = FeatureManager()
     for name, enabled in (
-        ("subagent", True), ("tasks", True), ("compression", True),
-        ("background", True), ("team", True), ("skills", False),
+        ("subagent", True), ("compression", True),
+        ("background", True), ("skills", False),
     ):
         features.register_feature(FeatureDefinition(name, enabled=enabled))
     agent = _config_agent(features)
@@ -147,6 +160,8 @@ def test_config_reports_runtime_feature_states():
     assert "background=True" in result
     assert "skills=False" in result
     assert "memory=" not in result
+    assert "tasks=" not in result
+    assert "team=" not in result
 
     assert "已enable" in console.execute("/features enable skills")
     assert "已disable" in console.execute("/features disable background")
