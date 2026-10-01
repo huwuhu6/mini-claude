@@ -4,7 +4,6 @@ Mini Claude Agent - Unified agent integrating all systems.
 from __future__ import annotations
 import logging
 import hashlib
-import os
 import sys
 import json
 import re
@@ -31,6 +30,7 @@ from models.teammate import Teammate, TeammateRole
 from models.todo import TodoManager
 
 from providers.base import Message, ToolDefinition as ProviderToolDef
+from providers.bootstrap import configure_primary_provider
 from providers.manager import ProviderManager
 
 from core.tools.base_tools import BaseTools, ToolResult
@@ -185,7 +185,7 @@ class MiniClaudeAgent:
 
         # LLM Providers
         self.provider_manager = ProviderManager()
-        self._setup_providers()
+        configure_primary_provider(self.provider_manager, self.config.llm)
 
         # Task management
         self.task_manager = TaskManager(self.data_paths.tasks)
@@ -342,52 +342,6 @@ class MiniClaudeAgent:
             'stop_background', 'health_check',
         ):
             self.feature_manager.register_tool_for_feature(tool_name, 'background')
-
-    def _setup_providers(self):
-        """Setup LLM providers from config."""
-        llm = self.config.llm
-
-        # Resolve api_key and base_url: env var → config → default
-        if llm.provider == 'deepseek':
-            api_key = os.getenv('DEEPSEEK_API_KEY', llm.api_key or '')
-            base_url = os.getenv('DEEPSEEK_BASE_URL',
-                                 llm.base_url or 'https://api.deepseek.com')
-        elif llm.provider == 'dashscope':
-            api_key = os.getenv('DASHSCOPE_API_KEY', llm.api_key or '')
-            base_url = os.getenv(
-                'DASHSCOPE_COMPATIBLE_BASE_URL',
-                os.getenv(
-                    'AI_BASE_URL',
-                    llm.base_url or 'https://dashscope.aliyuncs.com/compatible-mode/v1',
-                ),
-            )
-        elif llm.provider == 'anthropic':
-            api_key = os.getenv('ANTHROPIC_API_KEY', llm.api_key or '')
-            base_url = os.getenv('ANTHROPIC_BASE_URL',
-                                 llm.base_url or 'https://api.anthropic.com')
-        else:
-            api_key = ''
-            base_url = ''
-
-        provider_config = {
-            'model': llm.model,
-            'max_tokens': llm.max_tokens,
-            'temperature': llm.temperature,
-            'api_key': api_key,
-            'base_url': base_url,
-            'timeout': llm.timeout_ms / 1000.0,
-            'stream': llm.stream,
-        }
-
-        if api_key:
-            try:
-                self.provider_manager.create_provider(
-                    llm.provider, provider_config, is_primary=True
-                )
-                logger.info(f"提供者 '{llm.provider}' 创建成功")
-            except Exception as e:
-                logger.warning(f"创建提供者 '{llm.provider}' 失败: {e}")
-                logger.info("正在无提供者模式下运行（功能受限）")
 
     def refresh_system_prompt(self) -> None:
         """Rebuild the stable system prompt from current runtime state."""
