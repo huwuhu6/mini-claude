@@ -261,7 +261,7 @@ CLI
 
 - 项目仍是单机、单进程为主的 runtime，不承诺生产级并发、分布式队列或多租户隔离。
 - 当前对话状态主要保存在进程内；进程异常退出后，完整 LLM 对话上下文不会自动恢复。
-- `s_full.py`、`minimal_agent.py`、模块化 Agent 和评测脚本并存，历史兼容代码仍增加了一定维护成本。
+- `s_full.py` 作为历史实现保留；当前正式 Agent Runtime 位于 `src/agent/mini_claude_agent.py`。
 - `src/core/compression.py` 使用 `tiktoken` 做 estimated token 估算；包未安装或编码资源初始化失败时会安全回退到粗略估算，不提供 provider-specific tokenizer。Provider 返回的 `usage.prompt_tokens` 才是实际请求用量。
 - 评测结果中的过程指标用于工程分析，不等同于通用 Agent 能力排名。
 
