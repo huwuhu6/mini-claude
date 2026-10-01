@@ -11,10 +11,11 @@ if str(SRC) not in sys.path:
     sys.path.insert(0, str(SRC))
 
 from agent.mini_claude_agent import MiniClaudeAgent
-from core.features import FeatureDefinition, FeatureManager
+from core.features import FeatureManager
 from core.subagent import SubAgent, SubAgentType
 from core.tools.base_tools import BaseTools, ToolResult
 from core.tools.registry import ToolRegistry, ToolSpec
+from models.config import FeaturesConfig
 from providers.base import ToolDefinition as ProviderToolDef
 
 
@@ -232,21 +233,37 @@ def test_subagent_run_sends_registry_definitions_to_provider(workspace):
     assert all(isinstance(tool, ProviderToolDef) for tool in provider.tools)
 
 
-def test_main_feature_manager_still_filters_registered_tools():
-    features = FeatureManager()
-    for name in ("background", "skills", "compression"):
-        features.register_feature(FeatureDefinition(name=name, enabled=False))
-    features.register_tool_for_feature("run_background", "background")
-    for name in ("get_background_status", "get_background_logs", "stop_background", "health_check"):
-        features.register_tool_for_feature(name, "background")
-    features.register_tool_for_feature("load_skill", "skills")
-    features.register_tool_for_feature("update_agent_note", "compression")
-    main = _agent_without_initialization(features)
+def test_main_agent_feature_flags_gate_production_tool_wiring():
+    main = object.__new__(MiniClaudeAgent)
+    main.config = SimpleNamespace(features=FeaturesConfig())
+    main.feature_manager = FeatureManager()
+    main.tool_registry = ToolRegistry()
+    main._register_features()
+    main._register_tools()
 
-    visible = [tool["name"] for tool in main._get_llm_tools()]
+    tools_by_feature = {
+        "bash": {"bash"},
+        "read_file": {"read_file"},
+        "write_file": {"write_file"},
+        "edit_file": {"edit_file"},
+        "subagent": {"task"},
+        "background": {
+            "run_background", "get_background_status", "get_background_logs",
+            "stop_background", "health_check",
+        },
+        "skills": {"load_skill"},
+        "compression": {"update_agent_note"},
+    }
+    initially_visible = {tool["name"] for tool in main._get_llm_tools()}
+    all_mapped_tools = set().union(*tools_by_feature.values())
+    assert all_mapped_tools <= initially_visible
 
-    assert "bash" in visible
-    assert "run_background" not in visible
-    assert "get_background_status" not in visible
-    assert "load_skill" not in visible
-    assert "update_agent_note" not in visible
+    for feature_name, feature_tools in tools_by_feature.items():
+        assert main.feature_manager.disable(feature_name)
+        visible = {tool["name"] for tool in main._get_llm_tools()}
+        assert feature_tools.isdisjoint(visible)
+        assert all_mapped_tools - feature_tools <= visible
+
+        assert main.feature_manager.enable(feature_name)
+        visible = {tool["name"] for tool in main._get_llm_tools()}
+        assert feature_tools <= visible
