@@ -151,7 +151,7 @@ Commit Description: `fix(context): 合并请求预算观测并阻止截断响应
 
 ## 2026-09-30：将结构化近期文件记忆接入 main 并复跑
 
-Commit: `PENDING`
+Commit: `44ba9a9`
 Commit Description: `feat(context): 默认开启结构化近期文件记忆`
 
 ### Description
