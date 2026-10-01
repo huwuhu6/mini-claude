@@ -95,13 +95,14 @@ def _config(agent: Any, _args: list[str], _context: dict[str, Any]) -> str:
     lines.append(f"  LLM: {agent.config.llm.provider} / {agent.config.llm.model}")
     lines.append(f"  最大 tokens: {agent.config.llm.max_tokens}")
     lines.append(f"  温度: {agent.config.llm.temperature}")
+    features = agent.feature_manager
     lines.append(
-        f"  功能: subagent={agent.config.features.subagent}, "
-        f"tasks={agent.config.features.tasks}, "
-        f"compression={agent.config.features.compression}, "
-        f"background={agent.config.features.background}, "
-        f"team={agent.config.features.team}, "
-        f"skills={agent.config.features.skills}"
+        f"  功能: subagent={features.is_enabled('subagent')}, "
+        f"tasks={features.is_enabled('tasks')}, "
+        f"compression={features.is_enabled('compression')}, "
+        f"background={features.is_enabled('background')}, "
+        f"team={features.is_enabled('team')}, "
+        f"skills={features.is_enabled('skills')}"
     )
     return '\n'.join(lines)
 
@@ -160,9 +161,9 @@ def _features(agent: Any, args: list[str], _context: dict[str, Any]) -> str:
         if not ok:
             return f"无法{action}功能 '{name}'。"
         if name == 'skills' and action == 'enable':
-            names = agent.skill_loader.discover()
-            if names:
-                logger.info("已加载 %s 个技能模块: %s", len(names), ', '.join(names))
+            count = agent.skill_loader.refresh()
+            if count:
+                logger.info("已加载 %s 个技能模块", count)
         agent._load_system_prompt()
         return f"功能 '{name}' 已{action}。"
     return "用法: /features [enable|disable <名称>]"

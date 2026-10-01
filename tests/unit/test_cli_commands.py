@@ -1,4 +1,7 @@
+import shutil
 from types import SimpleNamespace
+from pathlib import Path
+from uuid import uuid4
 
 import pytest
 
@@ -7,6 +10,7 @@ from cli.commands import create_agent_console, execute_agent_command
 from cli.console import Command, ConsoleCommandSystem
 from cli.entrypoint import _dispatch_input
 from core.features import FeatureDefinition, FeatureManager
+from skills.loader import SkillLoader
 
 
 class Recorder:
@@ -82,13 +86,14 @@ def test_tasks_invalid_status_has_explicit_values():
     assert "pending, running, completed, failed, blocked, cancelled" in result
 
 
-def test_features_enable_skills_discovers_and_refreshes_prompt():
+def test_features_enable_skills_refreshes_and_updates_prompt():
     features = FeatureManager()
     features.register_feature(FeatureDefinition("skills", enabled=False))
     loader = SimpleNamespace(
-        discoveries=0,
-        discover=lambda: (setattr(loader, "discoveries", loader.discoveries + 1) or ["sample"]),
-        descriptions=lambda: "sample: skill description" if loader.discoveries else "",
+        refreshes=0,
+        refresh=lambda: (setattr(loader, "refreshes", loader.refreshes + 1) or 1),
+        discover=lambda: pytest.fail("enable skills should call refresh"),
+        descriptions=lambda: "sample: skill description" if loader.refreshes else "",
     )
     agent = _minimal_command_agent()
     agent.feature_manager = features
@@ -103,13 +108,89 @@ def test_features_enable_skills_discovers_and_refreshes_prompt():
     console = create_agent_console(agent)
 
     assert "已enable" in console.execute("/features enable skills")
-    assert loader.discoveries == 1
+    assert loader.refreshes == 1
     assert "skills" in agent.system_prompt
     assert "sample: skill description" in agent.system_prompt
 
     assert "已disable" in console.execute("/features disable skills")
     assert "skills" not in agent.system_prompt
     assert "sample: skill description" not in agent.system_prompt
+
+
+def _config_agent(feature_manager):
+    agent = _minimal_command_agent()
+    agent.feature_manager = feature_manager
+    agent.config = SimpleNamespace(
+        agent=SimpleNamespace(name="MiniClaude", version="1"),
+        llm=SimpleNamespace(provider="test", model="test", max_tokens=10, temperature=0),
+        features=SimpleNamespace(
+            subagent=True, tasks=True, compression=True, background=False,
+            team=True, skills=True,
+        ),
+    )
+    return agent
+
+
+def test_config_reports_runtime_feature_states():
+    features = FeatureManager()
+    for name, enabled in (
+        ("subagent", True), ("tasks", True), ("compression", True),
+        ("background", True), ("team", True), ("skills", False),
+    ):
+        features.register_feature(FeatureDefinition(name, enabled=enabled))
+    agent = _config_agent(features)
+    agent.skill_loader = SimpleNamespace(refresh=lambda: 0)
+    agent._load_system_prompt = lambda: None
+    console = create_agent_console(agent)
+
+    result = console.execute("/config")
+    assert "background=True" in result
+    assert "skills=False" in result
+    assert "memory=" not in result
+
+    assert "已enable" in console.execute("/features enable skills")
+    assert "已disable" in console.execute("/features disable background")
+    result = console.execute("/config")
+    assert "background=False" in result
+    assert "skills=True" in result
+
+
+def test_enabling_skills_refreshes_removed_files_and_prompt():
+    skills_dir = Path.cwd() / f"test-cli-skills-{uuid4().hex}"
+    skills_dir.mkdir()
+    skill_path = skills_dir / "stale-skill.md"
+    skill_path.write_text(
+        "---\nname: stale-skill\ndescription: stale skill description\n---\ncontent",
+        encoding="utf-8",
+    )
+    try:
+        features = FeatureManager()
+        features.register_feature(FeatureDefinition("skills", enabled=True))
+        loader = SkillLoader(skills_dir)
+        assert loader.refresh() == 1
+        assert loader.get_skill_content("stale-skill") == "content"
+
+        agent = _minimal_command_agent()
+        agent.feature_manager = features
+        agent.skill_loader = loader
+
+        def refresh_prompt():
+            description = loader.descriptions() if features.is_enabled("skills") else ""
+            agent.system_prompt = description
+
+        agent._load_system_prompt = refresh_prompt
+        agent._load_system_prompt()
+        assert "stale-skill" in agent.system_prompt
+
+        skill_path.unlink()
+        console = create_agent_console(agent)
+        assert "已disable" in console.execute("/features disable skills")
+        assert "已enable" in console.execute("/features enable skills")
+
+        assert loader.get_all() == []
+        assert "stale-skill" not in agent.system_prompt
+    finally:
+        shutil.rmtree(skills_dir)
 
 
 def test_command_execution_records_input_and_result():
