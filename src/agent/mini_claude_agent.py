@@ -334,6 +334,14 @@ class MiniClaudeAgent:
             category='advanced', enabled=features_config.skills,
         ))
         # Register tool→feature mapping for feature-aware tool filtering
+        for tool_name, feature_name in (
+            ('bash', 'bash'),
+            ('read_file', 'read_file'),
+            ('write_file', 'write_file'),
+            ('edit_file', 'edit_file'),
+            ('task', 'subagent'),
+        ):
+            self.feature_manager.register_tool_for_feature(tool_name, feature_name)
         self.feature_manager.register_tool_for_feature('load_skill', 'skills')
         self.feature_manager.register_tool_for_feature('update_agent_note', 'compression')
         self.feature_manager.register_tool_for_feature('run_background', 'background')
