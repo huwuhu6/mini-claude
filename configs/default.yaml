@@ -35,6 +35,7 @@ features:
   background: true
   team: true
   skills: true
+  memory: true
 
 # Task Management
 tasks:

@@ -8,6 +8,7 @@
 - OpenAI-compatible 主 Provider 现默认使用流式请求；响应仍在 Provider 内完整组装后再交给 Agent，Trace 记录每轮是否启用流式传输。此功能不是 UI 逐 Token 展示。`llm.stream: false` 可切回非流式。
 - 2026-09-29 的 `make-mips-interpreter` 单次试跑使用整合前的 20 秒配置，第 10 次请求超时，Harbor reward 0.0；前 9 次未见输出上限截断或压缩。原始结果在 `sandbox/terminal_bench_runs/main-context-mips-20260929-1/`。新超时配置尚未进行付费 Provider 复跑。
 - 250K/500K 和 8000 输出上限仍需更多 Trace 验证，压缩后尚无实际窗口余量硬性检查。
+- 应用 `feat/structured-context-memory` 上的实现后，当前 main 默认开启结构化近期文件记忆：只合并记忆模块，不合并分支上其他改动；Agent Note、压缩提醒和流式请求保留。memory、Prompt 与 Agent Note 相关确定性测试 21 项通过。第一次 Harbor 启动在依赖安装时失败，Agent 未启动；之后仅有 1 个有效 trial。结果：34 轮、50 次工具调用、940572 prompt、175034 completion、163360 reasoning tokens，压缩 0，末轮输出上限，Harbor 0 exception / reward 0。9 次 read_file 成功；第 23/25/27 轮写入并运行了三个分析脚本，未生成目标 `vm.js`，也未运行 `node vm.js`。Verifier 3 项因 `/tmp/frame.bmp` 缺失失败。相较 memory-off Prompt-only 的单次样本少 3 轮和 5 次工具调用，但未完成目标，不能把差异归因于记忆。Trace 在 `benchmark/harbor/jobs/main-context-memory-on-mips-20260930b/make-mips-interpreter__SK7VwAN/agent/mini-claude/traces/task_1889d301.json`。详情见 `docs/evolution/context_management.md`。
 - 长期背景与证据见 `docs/evolution/context_management.md`。
 - Provider 传输演进见 `docs/evolution/provider_transport.md`；当前流式请求尚未在 main 上做真实 Provider Benchmark。
 - 循环治理已降低归一化意图导致的误拦截；不同 grep/sed 范围可以继续执行，只有状态振荡在给过重规划机会后仍会硬停止。治理 Trace 区分 observation 变化、实际 workspace/verification 进展，并记录工具耗时。

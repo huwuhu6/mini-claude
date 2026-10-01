@@ -35,6 +35,7 @@ class FeaturesConfig:
     background: bool = True
     team: bool = True
     skills: bool = True
+    memory: bool = True
 
 
 @dataclass

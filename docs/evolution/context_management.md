@@ -148,3 +148,24 @@ Commit Description: `fix(context): 合并请求预算观测并阻止截断响应
 ### 工具输出可见性补充（2026-09-29）
 
 主线现将 bash 输出的截断状态、原始/可见字符数、展示行范围和相对日志路径写入 Trace。只有超过 200 行或 4000 字符的结果才自动文件化，普通的中等源码窗口会完整返回。新增 flow 调试视图可以显示预览比例，但不显示日志路径和正文。该变化只解决“模型实际看到了多少工具输出”的可观测性与过早文件化；真实 Token 节省和读取行为仍需要运行 Trace 验证。
+
+## 2026-09-30：将结构化近期文件记忆接入 main 并复跑
+
+Commit: `PENDING`
+Commit Description: `feat(context): 默认开启结构化近期文件记忆`
+
+### Description
+
+前一轮 Prompt-only Harbor 运行与预期的项目配置不一致：`main` 没有结构化近期文件记忆，而 `feat/structured-context-memory` 已有实现。该分支的功能默认关闭，且包含其他历史变更，因此本次只移入记忆核心和 Agent 接线，不合并整条分支；保留 `main` 已有的 Agent Note、压缩提醒、流式请求与其他 Runtime 行为。记忆限制为最近 8 个文件路径、最多 16 条范围观察和 1600 字符渲染；成功的 `read_file` 写入简短观察，文件被修改时旧观察失效。每轮动态上下文在检查新鲜度后临时注入，不进入持久消息历史。`FeaturesConfig.memory` 与仓库默认 YAML 均设为开启。
+
+### Result / Evidence
+
+结构化记忆、默认配置、Agent Note 和 System Prompt 相关确定性测试共 21 项通过，`git diff --check` 通过。第一次 Harbor 启动在模型启动前因容器 pip 依赖解析 (`ResolutionImpossible`) 失败，未产生 Agent 请求；随后唯一一次有效 trial 成功运行，Harbor 0 exception、reward `0.0`。该运行共 34 轮、50 次工具调用，Provider prompt `940572`、completion `175034`、reasoning `163360` tokens，本地 prompt 估算 `925823`；压缩 0 次。9 次 `read_file` 均成功；运行时配置来自本仓库默认 YAML，memory 已开启。当前 Trace 不序列化临时动态上下文正文，因此无法从 Trace 单独逐轮核验注入文本。
+
+首次成功 workspace mutation 在第 23 轮，为辅助脚本 `/app/analyze.py`；第 25、27 轮又写入 `analyze2.py`、`analyze3.py`。一次第 21 轮写 `/tmp/analyze.py` 的尝试被 workspace 权限拒绝。三个辅助脚本后来都被运行，但没有创建目标 `vm.js`，也没有运行 `node vm.js`。最后一轮 `finish_reason=length`，completion/reasoning 都达到 32768，Runtime 以 `PROVIDER_OUTPUT_LIMIT` 结束；Verifier 3 项均因没有 `/tmp/frame.bmp` 失败。Trace 位于 `benchmark/harbor/jobs/main-context-memory-on-mips-20260930b/make-mips-interpreter__SK7VwAN/agent/mini-claude/traces/task_1889d301.json`。
+
+与最近一次 memory-off、同样包含 Prompt 策略改动的单次结果相比，本次少 3 轮、少 5 次工具调用，prompt 少 57253、completion 少 1078、reasoning 少 6361 tokens；本次首次 mutation 是分析脚本，不是目标实现。该差异只来自两个单次样本，不能据此断言近期文件记忆导致了 Token 或行为改善。Prompt-level 探索转实现问题仍未解决。
+
+### Decision / Limitation
+
+将该功能在 main 默认启用，保留 `features.memory: false` 作为可关闭选项。实现只从显式文件工具记录路径和有限文本观察；不会从 `bash` 命令推断最近文件，也不会自动注入整份文件内容。下一步如需评估记忆本身的因果效果，需要匹配的 memory-off/on 对照；本轮只运行一次，没有追加 trial。
