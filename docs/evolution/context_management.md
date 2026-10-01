@@ -149,6 +149,44 @@ Commit Description: `fix(context): 合并请求预算观测并阻止截断响应
 
 主线现将 bash 输出的截断状态、原始/可见字符数、展示行范围和相对日志路径写入 Trace。只有超过 200 行或 4000 字符的结果才自动文件化，普通的中等源码窗口会完整返回。新增 flow 调试视图可以显示预览比例，但不显示日志路径和正文。该变化只解决“模型实际看到了多少工具输出”的可观测性与过早文件化；真实 Token 节省和读取行为仍需要运行 Trace 验证。
 
+## 2026-09-29：将单次输出上限提高到 32768 的 Terminal-Bench 试跑
+
+Commit: `PENDING`
+Commit Description: `feat(agent): 调整实现策略并提高输出预算`
+
+### Description
+
+先前 `make-mips-interpreter` 的单次 Harbor trial 在第 27 轮以 `finish_reason=length` 结束，最后一轮正好消耗 8000 completion tokens。为判断扩大单轮输出预算能否避免该截断，本次只把 `configs/default.yaml` 的 `llm.max_tokens` 从 8000 调到 32768，并对同一个 Terminal-Bench case 运行 1 次；该配置随本阶段实验记录提交。
+
+### Result / Evidence
+
+Harbor 1 trial、0 exception，reward `0.0`。MiniClaude 在第 32 轮、50 次工具调用后仍以 `PROVIDER_OUTPUT_LIMIT` 结束；最后一轮 `finish_reason=length`，completion 与 reasoning tokens 均为 32768。全程 Provider usage 为 706051 prompt、83530 completion、789581 total tokens；本地估算 prompt 为 689721。没有触发压缩，也没有 `write_file` 或 `edit_file` 调用。Verifier 的 3 项检查全部失败：`vm.js` 未能在 30 秒内生成 `/tmp/frame.bmp`，后续两项也因该文件缺失失败。
+
+同一 case 前次 8000 配置试跑为 27 轮、40 次工具调用、reward 0.0，累计 420031 prompt 和 22428 completion tokens。提高上限让运行多进行了 5 轮并完成更多检查，但没有改变任务结果，且总 Token 明显增加。Harbor 结果与 Trace 分别保存在 `benchmark/harbor/jobs/main-max-tokens-32768-mips-20260929/result.json` 和该 job 的 `make-mips-interpreter__Ucb6mtp/agent/mini-claude/traces/task_4bbefdef.json`。
+
+### Decision / Limitation
+
+这个单次试跑确认当前 provider 会把 reasoning tokens 计入 32768 的 completion 上限；扩大预算只推迟了截断，没有让 Agent 完成任务。单个 case、单次运行不足以评估成功率或一般成本影响；是否长期保留该默认值仍需结合后续需求和更多运行证据决定。
+
+## 2026-09-29：复杂 Coding Task 的探索到实现提示词实验
+
+Commit: `PENDING`
+Commit Description: `feat(agent): 调整实现策略并提高输出预算`
+
+### Description
+
+上一轮把单轮输出上限提高到 32768 后，`make-mips-interpreter` 仍在 32 轮和 50 次工具调用后达到 Provider 输出上限。Trace 显示任务从未写入文件；模型多次表示要收敛调查，却继续检查源码和二进制。本次只改 System Prompt：补充“缺失信息是否阻塞下一步实现”的判断、最小可验证实现和用运行反馈继续调查的原则，并把行为任务的运行验证从少见例外改为可行时的常规步骤。Max tokens、stream、压缩、Runtime 策略和其他请求配置保持不变；同一 case 只运行一个 trial。
+
+### Result / Evidence
+
+新增的 System Prompt 确定性测试与 Agent Note 相关测试共 4 项通过，`git diff --check` 通过。Harbor 单次 trial 为 1 trial、0 exception、reward `0.0`。Agent 用了 37 轮和 55 次工具调用，累计 Provider prompt `997825`、completion `176112`、reasoning `169721` tokens；本地 prompt 估算 `980510`。未触发压缩，`write_file` / `edit_file` 均为 0，所有工具调用都用于检查，没有 workspace mutation，也没有创建目标实现文件或运行首次实现。第 37 轮以 `finish_reason=length` 达到 32768 completion/reasoning tokens，Runtime 以 `PROVIDER_OUTPUT_LIMIT` 结束。Harbor verifier 3 项均失败：未生成 `/tmp/frame.bmp`，首项等待 30 秒超时，其余两项因文件缺失失败。Trace 位于 `benchmark/harbor/jobs/main-implementation-strategy-mips-20260929/make-mips-interpreter__uKey5ci/agent/mini-claude/traces/task_13ff2b2c.json`。
+
+与同一配置下的前次 32768 baseline（32 轮、50 次工具调用、706051 prompt、83530 completion、78245 reasoning tokens）相比，本次多了 5 次模型轮次、5 次工具调用，累计 prompt 增加 291774、completion 增加 92582、reasoning 增加 91476 tokens；两次均没有 mutation，且都因输出上限失败。新实验中前 36 轮约消耗 136953 reasoning tokens，仍全在检查阶段。
+
+### Decision / Limitation
+
+这一次试验没有观察到提示词促成更早的 Analysis → Action 转换；反而在达到输出上限前继续探索了更多轮次。因此，该 Prompt-level 改动在本次样本中不足以解决过度探索假设。单次运行不能判定总体效果或提示词因果效应；但它足以说明此次任务没有出现预期的更早实现信号。本次实验代码与结果作为实验记录提交；仅运行 1 次 Harbor trial，没有追加第二次运行。
+
 ## 2026-09-30：将结构化近期文件记忆接入 main 并复跑
 
 Commit: `44ba9a9`
