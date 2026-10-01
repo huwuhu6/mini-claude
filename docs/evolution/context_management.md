@@ -210,7 +210,7 @@ Commit Description: `feat(context): 默认开启结构化近期文件记忆`
 
 ## 2026-10-01：抽离并收敛静态 System Prompt
 
-Commit: `PENDING`
+Commit: `389f5e4`
 Commit Description: `refactor: 抽离静态 System Prompt 构造并精简规则`
 
 ### Description
