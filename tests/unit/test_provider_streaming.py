@@ -13,6 +13,7 @@ sys.path.insert(0, "src")
 from agent.mini_claude_agent import MiniClaudeAgent
 from models.config import ConfigManager
 from providers.base import Message
+from providers.bootstrap import configure_primary_provider
 from providers.deepseek import DeepseekProvider
 from providers.manager import ProviderManager
 from core.tracing import TraceManager
@@ -260,18 +261,17 @@ def test_nonstream_opt_out_preserves_response_contract():
 
 
 @pytest.mark.parametrize("enabled", [True, False])
-def test_agent_passes_stream_configuration_to_provider(monkeypatch, enabled):
+def test_bootstrap_passes_stream_configuration_to_provider(monkeypatch, enabled):
     monkeypatch.setenv("DASHSCOPE_API_KEY", "local-test")
 
-    agent = MiniClaudeAgent.__new__(MiniClaudeAgent)
-    agent.config = ConfigManager().get_config()
-    agent.config.llm.provider = "dashscope"
-    agent.config.llm.model = "test"
-    agent.config.llm.stream = enabled
-    agent.provider_manager = ProviderManager()
-    agent._setup_providers()
+    llm = ConfigManager().get_config().llm
+    llm.provider = "dashscope"
+    llm.model = "test"
+    llm.stream = enabled
+    provider_manager = ProviderManager()
+    configure_primary_provider(provider_manager, llm)
 
-    assert agent.provider_manager.get_primary_provider().stream is enabled
+    assert provider_manager.get_primary_provider().stream is enabled
 
 
 def test_provider_stream_mode_is_saved_on_turn_trace():

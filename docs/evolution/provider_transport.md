@@ -24,3 +24,22 @@ Commit Description: `feat(provider): 启用流式响应并记录传输模式`
 流式传输允许客户端在模型仍生成回答时持续收到数据，能减少“等待整份响应期间没有数据”的情况；它不能保证首个分片及时到达，也不能避免网络断开或代理缓冲。当前实现把流完整缓冲后再交给 Agent，因此保留了 tool call 的原子执行边界，但不提供 UI 逐字输出。流中途失败不自动重试，以免把可能已计费的请求静默重放。
 
 `stream_options.include_usage` 只在流式请求时发送。DeepSeek Chat Completions 文档规定该选项需与 `stream=true` 同用，并说明 usage 可位于最终内容 chunk；DashScope OpenAI-compatible 示例也使用相同选项。[DeepSeek Chat Completions API](https://api-docs.deepseek.com/api/create-chat-completion/)；[Alibaba Cloud Model Studio 流式输出说明](https://help.aliyun.com/en/model-studio/stream)。
+
+## 2026-10-01：将 Provider bootstrap 从 Agent 中抽离
+
+Commit: `PENDING`
+Commit Description: `refactor: 从 Agent 抽离 Provider bootstrap`
+
+### Description
+
+`MiniClaudeAgent` 原先同时创建 `ProviderManager`、按 Provider 读取环境变量、解析 API key 与 endpoint、组装配置并注册 primary provider。环境变量名称和默认 endpoint 属于 Provider 配置边界，将这些逻辑留在 Agent 会让 Runtime orchestration 依赖每个 Provider 的部署细节。
+
+本阶段将现有解析与注册代码移到 `src/providers/bootstrap.py` 的 `configure_primary_provider()` 普通函数。Agent 仍创建并持有 `ProviderManager`，然后交由 bootstrap 配置 primary provider；ProviderManager 架构和现有环境变量优先级不变。配置加载器的环境变量替换与显式 Provider 环境覆盖仍然并存，本次不重新定义这两层配置语义。
+
+### Result / Evidence
+
+Provider bootstrap、诊断和流式定向测试共 `32 passed`。测试只使用本地对象、mock 传输与临时工作区，没有运行真实 Provider API。
+
+### Decision / Limitation
+
+保留轻量函数，不增加 Provider factory 或 resolver 抽象。环境变量解析现在集中在 `src/providers/`，但 ConfigManager 的 `${ENV_NAME}` 替换仍可能与显式环境覆盖重叠；该配置体系问题留待独立任务处理。
