@@ -151,7 +151,7 @@ Commit Description: `fix(context): 合并请求预算观测并阻止截断响应
 
 ## 2026-09-29：将单次输出上限提高到 32768 的 Terminal-Bench 试跑
 
-Commit: `PENDING`
+Commit: `dd7c200`
 Commit Description: `feat(agent): 调整实现策略并提高输出预算`
 
 ### Description
@@ -170,7 +170,7 @@ Harbor 1 trial、0 exception，reward `0.0`。MiniClaude 在第 32 轮、50 次�
 
 ## 2026-09-29：复杂 Coding Task 的探索到实现提示词实验
 
-Commit: `PENDING`
+Commit: `dd7c200`
 Commit Description: `feat(agent): 调整实现策略并提高输出预算`
 
 ### Description
