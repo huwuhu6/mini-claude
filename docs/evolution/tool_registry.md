@@ -44,7 +44,7 @@ Todo 现在可表达模型自己的高层任务进度，并可作为后续 execu
 
 ## 2026-10-02：在稳定 Prompt 中说明 TodoWrite 的适用场景
 
-Commit: `PENDING`
+Commit: `d0bc3e1`
 Commit Description: `fix: 明确复杂任务的 TodoWrite 使用策略`
 
 ### Description
@@ -67,7 +67,7 @@ Harbor 结果中的输入/输出 Token usage 为 `null`；超时也导致 Agent 
 
 ## 2026-10-02：修复工具观察结果的可靠性
 
-Commit: `PENDING`
+Commit: `8c7af3e`
 Commit Description: `fix: 提高工具结果观察的可靠性`
 
 ### Description
