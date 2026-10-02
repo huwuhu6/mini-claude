@@ -23,7 +23,7 @@ TodoWrite 的 handler、TodoManager 以及 RuntimePolicy / Compression 对历史
 
 ## 2026-10-01：恢复主 Agent 的轻量 TodoWrite
 
-Commit: `PENDING`
+Commit: `eb1b021`
 Commit Description: `feat: 恢复主 Agent 轻量 TodoWrite`
 
 ### Description
