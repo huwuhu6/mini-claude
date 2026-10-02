@@ -4,7 +4,7 @@
 - System Prompt 第一阶段重构已进入 main：新增纯函数 `src/core/prompt_builder.py`，Agent 只通过 `refresh_system_prompt()` 刷新；CLI 改用公开方法。Prompt 收敛为 identity、environment、execution policy、skills 区块，回答语言策略已从 Preflight context 移到 identity；动态 hot context 和请求消息构造未变。代表性输入下旧/新 Prompt 为 5,788/2,174 字符，估算 1,231/438 tokens。详见 `docs/evolution/context_management.md`。
 - CLI 命令边界重构已提交并推送：Console parser 与 Agent-bound 命令位于 `src/cli/`，REPL 入口负责 slash command dispatch，`MiniClaudeAgent.chat()` 不解析命令；移除了 Agent 底部重复的旧 main/demo 入口。同步修复 `/clear`、malformed command、`/tasks` 非法状态，以及 `/features` 状态切换后的 skills discovery / system prompt 更新。详见 `docs/evolution/cli_command_boundary.md`。
 
-- Tool 层共享 schema 已收敛到 `src/core/tools/definitions.py`；SubAgent 使用独立 `ToolRegistry`，EXPLORE 只读，GENERAL/PLAN/REVIEW 保持四个基础工具且没有 `task`。TodoWrite 第一阶段已恢复到 MainAgent registry：只作为每次 `run()` 范围内的轻量进度状态，动态状态临时注入，不再每三轮重复催更。定向单元与 LoopController 集成测试共 73 项通过。详见 `docs/evolution/tool_registry.md`。
+- Tool 层共享 schema 已收敛到 `src/core/tools/definitions.py`；SubAgent 使用独立 `ToolRegistry`，EXPLORE 只读，GENERAL/PLAN/REVIEW 保持四个基础工具且没有 `task`。TodoWrite 第一阶段已恢复到 MainAgent registry：只作为每次 `run()` 范围内的轻量进度状态，动态状态临时注入，不再每三轮重复催更。稳定 System Prompt 已加入复杂多步骤任务的 TodoWrite 使用策略；定向 Prompt、Todo runtime 与 Registry 测试共 32 项通过。之后对同一个 Terminal-Bench case 的唯一 trial 达到 Harbor 1800 秒上限，32 次请求开始、49 次工具调用，仍为 0 TodoWrite、0 workspace mutation，reward 0.0。该样本没有显示 Prompt 策略促使模型调用 TodoWrite；Token usage 未从超时 Trace 中取得。详见 `docs/evolution/tool_registry.md`。
 
 - 已将上下文与工具输出核心修复移入 `main`：完整请求预算估算、显式 1M/250K/500K 配置、Provider usage 与缓存命中 Trace、压缩事务和有界工具输出。
 - Agent Note 继续每轮临时注入；自动压缩先提醒再执行。整合时修复了提醒状态与本轮动态上下文不同步的问题。

@@ -41,3 +41,26 @@ Todo runtime、ToolRegistry、冻结多 Agent 合约、Agent Note、结构化记
 ### Decision / Limitation
 
 Todo 现在可表达模型自己的高层任务进度，并可作为后续 execution-progress governance 的观测输入；本阶段没有据此添加强制阶段控制、MUTATION_STARVATION 或 Anti-Loop 规则。此前关闭 TodoWrite 的单次观察说明维护 Todo 可能增加成本，因此真实任务中它是否能促进探索转实现，仍需用同一 Terminal-Bench case 的 Trace 做单次观察或后续 A/B 评测后判断。Todo 生命周期目前以每次公开 `run()` 为界。
+
+## 2026-10-02：在稳定 Prompt 中说明 TodoWrite 的适用场景
+
+Commit: `PENDING`
+Commit Description: `fix: 明确复杂任务的 TodoWrite 使用策略`
+
+### Description
+
+TodoWrite 恢复后，首个 `make-mips-interpreter` trial 里模型进行了 36 轮请求和 53 次工具调用（41 次 `bash`、12 次 `read_file`），但没有调用 TodoWrite，也没有修改文件；任务在 Harbor 1800 秒上限处超时。工具已经在 MainAgent 的模型可见列表中，生命周期和 hot context wiring 也正常，因此这次现象指向工具选择策略缺少引导，而非 TodoWrite 注册失败。
+
+本阶段只在稳定 execution policy 中增加一条适用规则：复杂多步骤 Coding Task 在大量探索或实现前建立小型高层计划；一次只标记一个进行中目标，只在目标变化或完成时更新；简单单步任务跳过 TodoWrite。没有改变 schema、RuntimePolicy、FeatureManager 或执行治理。
+
+### Result / Evidence
+
+Prompt 策略、Todo runtime 和 ToolRegistry 定向测试共 `32 passed`；`git diff --check` 通过。单测确认 Prompt 包含复杂/简单任务的差异化指导，TodoWrite 仍存在于 MainAgent 模型可见工具中，现有实现没有每三轮 nag。
+
+按授权对同一个 `terminal-bench/make-mips-interpreter` 运行 1 trial，job 为 `benchmark/harbor/jobs/todo-write-prompt-policy-20261002/`。Agent 执行达到 Harbor 的 1800 秒时限，Harbor 记录 `AgentTimeoutError`、reward `0.0`；Verifier 的 3 项检查均因未生成 `/tmp/frame.bmp` 失败。Trace 有 32 次模型请求开始事件、49 次工具调用（45 次 `bash`、3 次 `read_file`、1 次 `list_files`），没有 `TodoWrite`、`write_file` 或 `edit_file`，也没有目标实现文件或首次程序运行。模型在多轮中说明调查方向并继续检查 ELF、stdlib 和指令集；最后一个模型请求未能在 Agent 时限内完成。
+
+Harbor 结果中的输入/输出 Token usage 为 `null`；超时也导致 Agent 最终 usage 结果文件未生成，因此本 trial 没有可核实的累计 prompt、completion 或 reasoning Token 数。此前未加 Todo 使用策略的单次 trial 为 36 轮请求、53 次工具调用（41 次 `bash`、12 次 `read_file`），同样没有 TodoWrite、文件修改并以 1800 秒 timeout 结束。两次单样本都未观察到 TodoWrite 或实现动作；不能据此归因于 Prompt，也不能推断总体成功率。
+
+### Decision / Limitation
+
+本次 Prompt contract 与工具可见性均通过确定性测试，但唯一一次后续 trial 没有出现 TodoWrite，亦未发生 workspace mutation 或实现运行；尚未观察到复杂任务使用 TodoWrite 建立高层规划的证据。不要仅凭这个 case 的单次失败再叠加 Prompt 规则。若继续研究，应先查看完整模型输出与中断请求的证据是否可获得，再决定是否需要另一个具备不同行为指标的评测任务；任何新策略仍应独立验证，不能将 Todo 维护直接等同于执行进展。

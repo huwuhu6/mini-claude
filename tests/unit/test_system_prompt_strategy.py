@@ -1,3 +1,4 @@
+import sys
 from types import SimpleNamespace
 
 import pytest
@@ -45,7 +46,10 @@ def test_prompt_contract_has_clear_blocks_and_current_runtime_facts():
     assert identity < environment < policy < skills
     assert prompt.count("/workspace/project") == 1
     assert "Enabled features: memory, skills." in prompt
-    assert "Platform: Windows." in prompt
+    expected_platform = {
+        "win32": "Windows", "linux": "Linux", "darwin": "macOS",
+    }.get(sys.platform, sys.platform)
+    assert f"Platform: {expected_platform}." in prompt
     assert "Network at startup: OFFLINE" in prompt
     assert "time-bounded evidence" in prompt
     assert "conditions can change" in prompt
@@ -90,7 +94,7 @@ def test_windows_guidance_keeps_only_high_value_shell_advice():
     assert "trailing &" not in guidance
 
 
-def test_execution_policy_covers_contract_without_old_sections():
+def test_execution_policy_covers_contract_and_todowrite_strategy():
     prompt, _preflight = _build_prompt()
     prompt = prompt.lower()
 
@@ -101,10 +105,17 @@ def test_execution_policy_covers_contract_without_old_sections():
     assert "behavioral changes" in prompt and "runtime verification" in prompt
     assert "stop when the requested work is complete" in prompt
     assert "do not claim completion" in prompt and "verified" in prompt
+    assert "for complex, multi-step coding tasks, use todowrite" in prompt
+    assert "before substantial exploration or implementation" in prompt
+    assert "keep one item in_progress at a time" in prompt
+    assert "only when the current goal changes or completes" in prompt
+    assert "not after every tool call" in prompt
+    assert "skip todowrite for simple, single-step tasks" in prompt
+    assert "<nag>" not in prompt
+    assert "every 3 rounds" not in prompt
     assert "planning rule:" not in prompt
     assert "implementation strategy:" not in prompt
     assert "verification strategy (must follow):" not in prompt
-    assert "todowrite" not in prompt
 
 
 def test_preflight_context_does_not_set_response_language():

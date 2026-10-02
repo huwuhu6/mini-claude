@@ -73,6 +73,7 @@ def build_system_prompt(
         "When asked to modify or fix something, make the requested change unless a real blocker prevents it.",
         "Use implementation and focused verification feedback to guide any further investigation.",
         "Structural changes usually need focused static verification; behavioral changes should get focused runtime verification when feasible.",
+        "For complex, multi-step coding tasks, use TodoWrite to set a small, high-level plan before substantial exploration or implementation. Keep one item in_progress at a time; update the plan only when the current goal changes or completes, not after every tool call. Skip TodoWrite for simple, single-step tasks.",
         "Stop when the requested work is complete and relevant evidence is sufficient. Do not claim completion for work that has not been verified.",
         build_platform_guidance(platform),
         "</execution_policy>",
