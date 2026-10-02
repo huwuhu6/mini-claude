@@ -13,6 +13,7 @@ from agent.mini_claude_agent import MiniClaudeAgent
 from core.features import FeatureManager
 from core.runtime_context.preflight import PreflightResult
 from models.config import FeaturesConfig
+from models.todo import TodoManager
 from providers.base import Message
 
 
@@ -55,6 +56,7 @@ def test_production_features_and_prompt_exclude_dormant_multi_agent_features():
 def test_run_appends_user_message_and_enters_llm_cycle_directly():
     agent = object.__new__(MiniClaudeAgent)
     agent.messages = []
+    agent.todo = TodoManager()
     observed = {}
 
     def llm_tool_cycle(*, require_tool_call=False):

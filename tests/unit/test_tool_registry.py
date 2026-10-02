@@ -45,6 +45,7 @@ MAIN_AGENT_TOOL_NAMES = [
     "search_code",
     "count_occurrences",
     "list_files",
+    "TodoWrite",
 ]
 
 
@@ -74,7 +75,7 @@ def test_every_exposed_tool_has_schema_and_handler():
         assert definition["input_schema"]["type"] == "object"
         assert agent.tool_registry.has_handler(definition["name"])
 
-    assert "TodoWrite" not in [tool["name"] for tool in definitions]
+    assert "TodoWrite" in [tool["name"] for tool in definitions]
 
 
 def test_registry_unknown_tool_raises_key_error():

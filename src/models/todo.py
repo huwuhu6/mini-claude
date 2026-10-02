@@ -1,7 +1,7 @@
 """
-TodoManager — Lightweight in-memory task tracking for the agent.
+TodoManager — Lightweight in-memory planning state for one agent run.
 
-Used by the ``TodoWrite`` tool and the Nag reminder system.
+Used by the ``TodoWrite`` tool and transient hot-context injection.
 Max 20 items, only one ``in_progress`` at a time.
 """
 
@@ -12,6 +12,10 @@ from typing import List, Dict, Any
 class TodoManager:
     def __init__(self):
         self.items: List[Dict[str, str]] = []
+
+    def reset(self) -> None:
+        """Clear planning state at the start of a new agent run."""
+        self.items.clear()
 
     # ── Update & Validation ────────────────────────────────────
 

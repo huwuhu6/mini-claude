@@ -1,10 +1,10 @@
 
 ## 2026-10-01 当前现场
 
-- System Prompt 第一阶段重构已在本地完成，待最终检查、提交和推送：新增纯函数 `src/core/prompt_builder.py`，Agent 只通过 `refresh_system_prompt()` 刷新；CLI 改用公开方法。Prompt 收敛为 identity、environment、execution policy、skills 区块，回答语言策略已从 Preflight context 移到 identity；动态 hot context 和请求消息构造未变。代表性输入下旧/新 Prompt 为 5,788/2,174 字符，估算 1,231/438 tokens。Prompt/CLI/Agent Note/记忆/Context 相关测试 38 项通过、2 项因 pytest 临时目录 ACL 跳过；Runtime Context 两项通过。详见 `docs/evolution/context_management.md`。
+- System Prompt 第一阶段重构已进入 main：新增纯函数 `src/core/prompt_builder.py`，Agent 只通过 `refresh_system_prompt()` 刷新；CLI 改用公开方法。Prompt 收敛为 identity、environment、execution policy、skills 区块，回答语言策略已从 Preflight context 移到 identity；动态 hot context 和请求消息构造未变。代表性输入下旧/新 Prompt 为 5,788/2,174 字符，估算 1,231/438 tokens。详见 `docs/evolution/context_management.md`。
 - CLI 命令边界重构已提交并推送：Console parser 与 Agent-bound 命令位于 `src/cli/`，REPL 入口负责 slash command dispatch，`MiniClaudeAgent.chat()` 不解析命令；移除了 Agent 底部重复的旧 main/demo 入口。同步修复 `/clear`、malformed command、`/tasks` 非法状态，以及 `/features` 状态切换后的 skills discovery / system prompt 更新。详见 `docs/evolution/cli_command_boundary.md`。
 
-- Tool 层第二阶段将 MainAgent 与 SubAgent 共有的 `bash`、`read_file`、`write_file`、`edit_file` schema 收敛到 `src/core/tools/definitions.py`；SubAgent 使用独立 `ToolRegistry`，EXPLORE 只读，GENERAL/PLAN/REVIEW 保持四个基础工具且没有 `task`。TodoWrite 仍 dormant，提示词已移除对未暴露工具的调用指引。相关单测 16 项、SubAgent 集成测试 1 项、LoopController 测试 35 项通过；完整 `test_all_modules.py` 中若干用例受 Windows 临时目录 / 外部数据目录权限影响。详见 `docs/evolution/tool_registry.md`。
+- Tool 层共享 schema 已收敛到 `src/core/tools/definitions.py`；SubAgent 使用独立 `ToolRegistry`，EXPLORE 只读，GENERAL/PLAN/REVIEW 保持四个基础工具且没有 `task`。TodoWrite 第一阶段已恢复到 MainAgent registry：只作为每次 `run()` 范围内的轻量进度状态，动态状态临时注入，不再每三轮重复催更。定向单元与 LoopController 集成测试共 73 项通过。详见 `docs/evolution/tool_registry.md`。
 
 - 已将上下文与工具输出核心修复移入 `main`：完整请求预算估算、显式 1M/250K/500K 配置、Provider usage 与缓存命中 Trace、压缩事务和有界工具输出。
 - Agent Note 继续每轮临时注入；自动压缩先提醒再执行。整合时修复了提醒状态与本轮动态上下文不同步的问题。

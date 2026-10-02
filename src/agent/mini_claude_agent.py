@@ -363,6 +363,7 @@ class MiniClaudeAgent:
 
     def run(self, user_input: str, require_tool_call: bool = False) -> str:
         """Process user input and return agent response."""
+        self.todo.reset()
         self._current_user_prompt = user_input
         self.messages.append(Message(role='user', content=user_input))
         return self._llm_tool_cycle(require_tool_call=require_tool_call)
@@ -638,53 +639,37 @@ class MiniClaudeAgent:
                     'required': [],
                 },
             },
-            # {
-            #     'name': 'TodoWrite',
-            #     # 外层 description 保持精简，定下“目标导向”的基调
-            #     'description': (
-            #         'Update the task tracking list. Describe GOALS, not implementations. '
-            #         'Use to plan and track progress through complex multi-step tasks. '
-            #         'Max 20 items, only one in_progress at a time.'
-            #     ),
-            #     'input_schema': {
-            #         'type': 'object',
-            #         'properties': {
-            #             'items': {
-            #                 'type': 'array',
-            #                 'items': {
-            #                     'type': 'object',
-            #                     'properties': {
-            #                         # 【核心修改 1】在 content 字段直接拦截 verify.py
-            #                         'content': {
-            #                             'type': 'string', 
-            #                             'description': (
-            #                                 'Task goal. Prefer: "Verify refactor", "Check consistency". '
-            #                                 'AVOID: "Write verify.py", "Run test script" for simple tasks '
-            #                                 '(renames/cleanups). Only plan runtime tests for bugs/features.'
-            #                             )
-            #                         },
-            #                         'status': {
-            #                             'type': 'string', 
-            #                             'enum': ['pending', 'in_progress', 'completed'], 
-            #                             'description': 'Task status'
-            #                         },
-            #                         # 【核心修改 2】防止 activeForm 出现 "Writing verify.py"
-            #                         'activeForm': {
-            #                             'type': 'string', 
-            #                             'description': (
-            #                                 'Present continuous form of the GOAL (e.g. "Verifying refactor", '
-            #                                 'NOT "Writing verify.py")'
-            #                             )
-            #                         },
-            #                     },
-            #                     'required': ['content', 'status', 'activeForm'],
-            #                 },
-            #                 'description': 'List of todo items',
-            #             },
-            #         },
-            #         'required': ['items'],
-            #     },
-            # },
+            {
+                'name': 'TodoWrite',
+                'handler': self._handle_todo_write,
+                'description': (
+                    'Maintain lightweight progress for a multi-step user task when useful. '
+                    'Avoid maintaining todos for simple tasks. Max 20 items; only one '
+                    'in_progress item is allowed.'
+                ),
+                'input_schema': {
+                    'type': 'object',
+                    'properties': {
+                        'items': {
+                            'type': 'array',
+                            'maxItems': 20,
+                            'items': {
+                                'type': 'object',
+                                'properties': {
+                                    'content': {'type': 'string'},
+                                    'status': {
+                                        'type': 'string',
+                                        'enum': ['pending', 'in_progress', 'completed'],
+                                    },
+                                    'activeForm': {'type': 'string'},
+                                },
+                                'required': ['content', 'status', 'activeForm'],
+                            },
+                        },
+                    },
+                    'required': ['items'],
+                },
+            },
         ]
 
         for tool in all_tools:
@@ -1430,7 +1415,6 @@ class MiniClaudeAgent:
         return text
 
     def _get_dynamic_hot_context(self,
-                                  rounds_without_todo: int = 0,
                                   iteration: Optional[int] = None,
                                   max_iterations: Optional[int] = None) -> str:
         """Aggregate all transient dynamic state into one hot-context block.
@@ -1442,7 +1426,6 @@ class MiniClaudeAgent:
         Sources:
           - Incomplete todo items (from in-memory TodoManager)
           - Background task notifications
-          - Nag reminder when todos are stale (``rounds_without_todo >= 3``)
 
         Returns:
             Empty string if nothing dynamic; otherwise an XML-wrapped block.
@@ -1478,10 +1461,6 @@ class MiniClaudeAgent:
                 parts.append(
                     f"<structured-file-memory>\n{memory_text}\n</structured-file-memory>"
                 )
-
-        # 3. Nag reminder (soft prompt, not persisted)
-        if self.todo.has_open_items() and rounds_without_todo >= 3:
-            parts.append("<nag>Consider updating your todos.</nag>")
 
         # Late-run guidance is advisory; it does not block useful inspection.
         if (iteration is not None and max_iterations is not None
@@ -1548,9 +1527,6 @@ class MiniClaudeAgent:
         # ── Reset benchmark metrics ──
         self.last_metrics = self._empty_usage_metrics()
 
-        # ── Nag tracking (s_full.py s03) ──
-        rounds_without_todo = 0
-
         # ── Start task-level trace for this agent.chat() call ──
         tid = self.trace.start_task(
             user_prompt=self._current_user_prompt,
@@ -1586,7 +1562,6 @@ class MiniClaudeAgent:
                 # (safe inside the loop — only modifies existing messages)
                 self.messages = Compressor._clean_tool_chains(self.messages)
                 hot_text = self._get_dynamic_hot_context(
-                    rounds_without_todo=rounds_without_todo,
                     iteration=iteration,
                     max_iterations=max_iterations,
                 )
@@ -1748,8 +1723,6 @@ class MiniClaudeAgent:
 
                 # ── Deduplicate: skip identical tool+args in the same response ──
                 seen_tool_sigs: set = set()
-                used_todo = False
-
                 # ── Execute each tool and store results ──
                 for tc in tool_calls:
                     fn = tc.get('function', {})
@@ -1839,9 +1812,6 @@ class MiniClaudeAgent:
                         tool=tname,
                         args=args,
                     )
-
-                    if tname == "TodoWrite":
-                        used_todo = True
 
                     # ── Trace + V3 Defense + Execute + Failure Intelligence ──
                     t_start = time.time()
@@ -2183,9 +2153,6 @@ class MiniClaudeAgent:
                             content=("[Progress Governance] 最近的策略没有产生新的有效 Observation 或 State Progress。"
                                      "请重新规划，改变解决路径；不要继续重复同一失败或振荡操作。"),
                         ))
-
-                # ── Nag tracking (s_full.py s03 — hot-injected via _get_dynamic_hot_context) ──
-                rounds_without_todo = 0 if used_todo else rounds_without_todo + 1
 
             except KeyboardInterrupt:
                 logger.warning("LLM_TASK_CANCELLED: interrupted by user at iteration=%s", iteration + 1)
