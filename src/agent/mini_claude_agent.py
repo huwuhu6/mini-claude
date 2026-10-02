@@ -408,7 +408,9 @@ class MiniClaudeAgent:
             bash_spec(
                 self._handle_bash,
                 description=(
-                    f'Run a shell command. Platform: {_platform_label}. '
+                    f'Run shell commands on {_platform_label} for builds/tests, system inspection, '
+                    'binary analysis, and shell operations. For ordinary source-file reading or search, '
+                    'prefer read_file or search_code for bounded observations. '
                     'Large output is saved under .agent/logs and only a preview is returned; '
                     'use read_file with line ranges on that path for omitted content.'
                 ),
@@ -538,23 +540,30 @@ class MiniClaudeAgent:
             {
                 'name': 'search_code',
                 'handler': self._handle_search_code,
-                'description': '在指定文件或目录中搜索正则表达式模式。跨平台纯 Python 实现，自动忽略 .git/__pycache__/node_modules 等目录。优先使用此工具进行代码搜索，而不是编写 Python 脚本或调用 grep/findstr。',
+                'description': (
+                    'Search source and text files for line-oriented regular expressions and return matching lines with bounded context. '
+                    'Patterns are evaluated one line at a time and do not match across lines. Binary files are not searched. '
+                    'Use read_file for a known file or line range; use bash for binary inspection, system commands, builds, and tests.'
+                ),
                 'input_schema': {
                     'type': 'object',
                     'properties': {
                         'paths': {
                             'type': 'array',
                             'items': {'type': 'string'},
-                            'description': '文件或目录路径列表，支持通配符（*、**）。例如 ["*.py", "src/"]。不传则默认为项目根目录。',
+                            'description': 'Workspace file/directory paths or globs (for example ["*.py", "src/"]). Defaults to the workspace. .agent is omitted from broad searches; name .agent/logs explicitly to search saved command output.',
                         },
                         'patterns': {
                             'type': 'array',
                             'items': {'type': 'string'},
-                            'description': '要搜索的正则表达式列表（OR关系）。例如 ["user_id", "user_ids"]',
+                            'description': 'Line-oriented regex patterns; a line is returned once if it matches any pattern.',
                         },
                         'context_lines': {
                             'type': 'integer',
-                            'description': '显示匹配行前后各 N 行上下文（类似 grep -C）。默认 0',
+                            'description': 'Number of context lines before and after each matching line (0-50). Default: 0.',
+                            'minimum': 0,
+                            'maximum': 50,
+                            'default': 0,
                         },
                         'case_sensitive': {
                             'type': 'boolean',
@@ -562,7 +571,10 @@ class MiniClaudeAgent:
                         },
                         'max_matches': {
                             'type': 'integer',
-                            'description': '最大匹配行数，超过则截断并提示。默认 50，最大 200',
+                            'description': 'Maximum matching lines to return. Default: 50; range: 1-200.',
+                            'minimum': 1,
+                            'maximum': 200,
+                            'default': 50,
                         },
                         'include_filename': {
                             'type': 'boolean',
@@ -579,7 +591,7 @@ class MiniClaudeAgent:
             {
                 'name': 'count_occurrences',
                 'handler': self._handle_count_occurrences,
-                'description': '统计正则表达式模式在多个文件中的出现次数。返回每个 pattern 的总匹配数和文件级分布。比 search_code 更轻量，适合验证 rename/refactor 的完成度。',
+                'description': 'Count regex occurrences, not matching lines, across files and report totals with per-file counts. Use to verify renames/refactors; use search_code to inspect matching source lines.',
                 'input_schema': {
                     'type': 'object',
                     'properties': {
@@ -619,7 +631,7 @@ class MiniClaudeAgent:
             {
                 'name': 'list_files',
                 'handler': self._handle_list_files,
-                'description': '列出目录中的文件和子目录（支持深度控制和忽略规则）。不可用于读取文件内容，只用于浏览项目结构。',
+                'description': 'Browse project structure by listing files and directories with depth and ignore rules. Does not read file contents.',
                 'input_schema': {
                     'type': 'object',
                     'properties': {
@@ -819,9 +831,9 @@ class MiniClaudeAgent:
         healthy = bool(health_checks) and all(item.get("healthy") is True for item in health_checks)
         return json.dumps({"healthy": healthy, "checks": checks}, ensure_ascii=False)
 
-    def _handle_read_file(self, path: str, start_line: int = None, end_line: int = None) -> str:
-        result = self.tools.read_file(path, start_line, end_line)
-        return result.content
+    def _handle_read_file(self, path: str, start_line: int = None,
+                          end_line: int = None) -> ToolResult:
+        return self.tools.read_file(path, start_line, end_line)
 
     def _handle_write_file(self, path: str, content: str) -> str:
         result = self.tools.write_file(path, content)
@@ -956,13 +968,13 @@ class MiniClaudeAgent:
                              case_sensitive: bool = False,
                              max_matches: int = 50,
                              include_filename: bool = True,
-                             include_line_number: bool = True) -> str:
+                              include_line_number: bool = True) -> ToolResult:
         """Handle search_code tool calls — delegate to BaseTools."""
         if paths is None:
             paths = ["."]
         if patterns is None:
-            return "错误: 需要至少提供一个模式 (patterns)"
-        result = self.tools.search_code(
+            return ToolResult("错误: 需要至少提供一个模式 (patterns)", success=False)
+        return self.tools.search_code(
             paths=paths, patterns=patterns,
             context_lines=context_lines,
             case_sensitive=case_sensitive,
@@ -970,20 +982,18 @@ class MiniClaudeAgent:
             include_filename=include_filename,
             include_line_number=include_line_number,
         )
-        return result.content
 
     def _handle_count_occurrences(self, paths: list = None, patterns: list = None,
-                                   case_sensitive: bool = False) -> str:
+                                   case_sensitive: bool = False) -> ToolResult:
         """Handle count_occurrences tool calls — delegate to BaseTools."""
         if paths is None:
             paths = ["."]
         if patterns is None:
-            return "错误: 需要至少提供一个模式 (patterns)"
-        result = self.tools.count_occurrences(
+            return ToolResult("错误: 需要至少提供一个模式 (patterns)", success=False)
+        return self.tools.count_occurrences(
             paths=paths, patterns=patterns,
             case_sensitive=case_sensitive,
         )
-        return result.content
 
     # def _handle_syntax_check(self, paths: list) -> str:
     #     """Handle syntax_check tool calls — delegate to BaseTools with semantic wrapping."""
@@ -1003,12 +1013,11 @@ class MiniClaudeAgent:
     #         )
 
     def _handle_list_files(self, path: str = ".", max_depth: int = 2,
-                            max_files: int = 200) -> str:
+                            max_files: int = 200) -> ToolResult:
         """Handle list_files tool calls — delegate to BaseTools."""
-        result = self.tools.list_files(
+        return self.tools.list_files(
             path=path, max_depth=max_depth, max_files=max_files,
         )
-        return result.content
 
     def _load_skill_internal(self, name: str) -> ToolResult:
         """Load skill content and format it for the LLM."""

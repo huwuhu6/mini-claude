@@ -122,7 +122,7 @@ def test_read_file_dispatches_through_registry():
 
     result = agent.tool_registry.execute("read_file", {"path": "sample.py"})
 
-    assert result == "sample.py"
+    assert result.content == "sample.py"
 
 
 def _definitions_by_name(registry):

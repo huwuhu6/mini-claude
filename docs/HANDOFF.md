@@ -20,4 +20,5 @@
 - 循环治理已降低归一化意图导致的误拦截；不同 grep/sed 范围可以继续执行，只有状态振荡在给过重规划机会后仍会硬停止。治理 Trace 区分 observation 变化、实际 workspace/verification 进展，并记录工具耗时。
 - Bash 工具结果现在记录可见性元数据；阈值为 200 行/4000 字符。Task Trace 记录请求配置，`--debug flow` 概括请求轮次、工具结果和输出截断比例，不展开输出内容。
 - 本轮相关循环治理、flow、工具可见性、Trace 与流式 Provider 测试合计 101 passed，8 个依赖 pytest 临时目录的用例未运行；完整 `test_runtime_context` 集成测试受 Windows pytest 临时目录 ACL 阻挡，不能声称全套通过。无付费 Provider 运行。
+- Tool Observation Reliability 本地修改待用户提交：POSIX 单行 `;` 链仅在保守语法门槛下采集分段退出码；Runtime 用结构化 segment code 向模型展示部分失败。`search_code` 的路径权限、确定性顺序、exact-cap 判断、整块输出和跳过/截断可见性已加强；MainAgent 文件观察 handler 保留 ToolResult。Windows 定向回归 117 passed、10 skipped、7 deselected，另直接验证 Windows CMD 状态掩盖；Docker Python 3.12.15 Linux 回归 160 passed、1 skipped、1 deselected，POSIX shell 与 symlink 场景均通过。一个既有 Provider parse-error 测试 fixture 缺当前配置字段，单独 deselect；Windows Context audit 仍受 pytest Temp ACL 阻挡。无 Terminal-Bench 或付费 Provider 运行。详见 `docs/evolution/tool_registry.md`。
 - Evolution 记录已分别补到 `tool_deduplication.md`、`context_management.md` 和 `session_trace_evolution.md`；对应实现 Commit 尚待用户创建，标记为 PENDING。

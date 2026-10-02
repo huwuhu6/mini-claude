@@ -10,7 +10,13 @@ from core.tools.registry import ToolSpec
 ToolHandler = Callable[..., Any]
 
 
-def bash_spec(handler: ToolHandler, description: str = "Run a shell command.") -> ToolSpec:
+def bash_spec(
+    handler: ToolHandler,
+    description: str = (
+        "Run shell commands for builds/tests, system inspection, binary analysis, and shell operations. "
+        "For ordinary source-file reading or search, prefer read_file or search_code for bounded observations."
+    ),
+) -> ToolSpec:
     return ToolSpec(
         name="bash",
         description=description,
@@ -29,21 +35,21 @@ def read_file_spec(handler: ToolHandler) -> ToolSpec:
     return ToolSpec(
         name="read_file",
         description=(
-            f"按行读取文件，默认最多返回 {READ_FILE_MAX_LINES} 行；"
-            "start_line/end_line 为 1-based 窗口，超过行数或字符/字节硬上限会截断。"
-            "长文件请使用后续窗口继续读取。"
+            f"Read a known file (source, configuration, or text) by contiguous 1-based line range. "
+            f"Returns at most {READ_FILE_MAX_LINES} lines and is subject to character/byte limits; "
+            "read later ranges to continue through long files."
         ),
         input_schema={
             "type": "object",
             "properties": {
-                "path": {"type": "string", "description": "文件路径"},
+                "path": {"type": "string", "description": "Path to the known file"},
                 "start_line": {
                     "type": "integer",
-                    "description": "起始行号（包含），从 1 开始。不传则从头读取",
+                    "description": "Inclusive 1-based first line; omit to start at the beginning",
                 },
                 "end_line": {
                     "type": "integer",
-                    "description": "结束行号（包含）；仍受后端硬上限约束，超出会截断",
+                    "description": "Inclusive 1-based last line; backend limits may truncate the range",
                 },
             },
             "required": ["path"],

@@ -124,7 +124,7 @@ class ShellSession:
                     )
                 else:
                     r = subprocess.run(
-                        command,
+                        instrumented_command,
                         shell=True,
                         cwd=str(effective_cwd),
                         capture_output=True,
@@ -240,6 +240,9 @@ class ShellSession:
         the equivalent ``$?`` marker.  ``&`` on POSIX is left untouched:
         launch status is not the background process's completion status.
         """
+        if sys.platform != "win32":
+            return cls._instrument_posix_composite(command)
+
         separators = cls._top_level_separators(command)
         if not separators:
             return command
@@ -253,11 +256,6 @@ class ShellSession:
                     f" & echo {_SEGMENT_MARKER}{marker_index}=!errorlevel! & "
                 )
                 marker_index += 1
-            elif sys.platform != "win32" and separator == ";":
-                pieces.append(
-                    f"; printf '{_SEGMENT_MARKER}{marker_index}=%s\\n' \"$?\"; "
-                )
-                marker_index += 1
             else:
                 pieces.append(command[position:position + len(separator)])
             cursor = position + len(separator)
@@ -266,6 +264,95 @@ class ShellSession:
         if sys.platform == "win32" and any(s == "&" for _, s in separators):
             return "setlocal EnableDelayedExpansion & " + instrumented
         return instrumented
+
+    @classmethod
+    def _instrument_posix_composite(cls, command: str) -> str:
+        """Instrument only simple, single-line POSIX lists separated by ``;``.
+
+        Inserting a marker runs another command and therefore changes ``$?``.
+        We skip commands that read that status, enable ``errexit``, use heredocs,
+        multiline syntax, grouping, substitutions, or background operators.
+        Those commands execute unchanged; their final exit code and stderr are
+        still reported normally.
+        """
+        if "\n" in command or "\r" in command or "\0" in command:
+            return command
+        # Comments make it difficult to tell whether the text after a
+        # separator is a command or only a comment. Leave that syntax intact.
+        if "#" in command:
+            return command
+        if re.search(r"\$\s*\?|<<|`|\$\(|\(|\)", command):
+            return command
+        if re.search(r"(?i)(?:^|[;&|])\s*set\s+(?:-[a-zA-Z]*e|--?o\s+errexit)\b", command):
+            return command
+        if re.search(
+            r"\b(if|then|elif|else|fi|for|while|until|do|done|case|esac|function)\b",
+            command,
+        ):
+            return command
+
+        separators = cls._posix_semicolons(command)
+        if not separators:
+            return command
+
+        # A trailing separator has no following command to instrument.
+        # Inserting after it would replace the command's final status with printf.
+        if not command[separators[-1] + 1:].strip():
+            separators = separators[:-1]
+        if not separators:
+            return command
+
+        pieces: list[str] = []
+        cursor = 0
+        for marker_index, position in enumerate(separators):
+            pieces.append(command[cursor:position + 1])
+            pieces.append(
+                f" command printf '{_SEGMENT_MARKER}{marker_index}=%s\\n' \"$?\" >&2;"
+            )
+            cursor = position + 1
+        pieces.append(command[cursor:])
+        return "".join(pieces)
+
+    @staticmethod
+    def _posix_semicolons(command: str) -> list[int]:
+        """Find unquoted top-level semicolons, or reject unsupported syntax."""
+        positions: list[int] = []
+        quote: Optional[str] = None
+        escaped = False
+        index = 0
+        while index < len(command):
+            char = command[index]
+            if escaped:
+                escaped = False
+                index += 1
+                continue
+            if char == "\\" and quote != "'":
+                escaped = True
+                index += 1
+                continue
+            if quote:
+                if char == quote:
+                    quote = None
+                index += 1
+                continue
+            if char in {"'", '"'}:
+                quote = char
+                index += 1
+                continue
+            if char == "#" and (index == 0 or command[index - 1].isspace()):
+                break  # A single-line command: the rest is a shell comment.
+            if char == "&":
+                # Background lists and shell-specific combined redirects are
+                # left alone; their completion status cannot be sampled safely.
+                return []
+            if char == ";":
+                if index + 1 < len(command) and command[index + 1] == ";":
+                    return []  # case/esac grammar
+                positions.append(index)
+            index += 1
+        if quote or escaped:
+            return []
+        return positions
 
     @staticmethod
     def _top_level_separators(command: str) -> list[tuple[int, str]]:

@@ -64,3 +64,28 @@ Harbor 结果中的输入/输出 Token usage 为 `null`；超时也导致 Agent 
 ### Decision / Limitation
 
 本次 Prompt contract 与工具可见性均通过确定性测试，但唯一一次后续 trial 没有出现 TodoWrite，亦未发生 workspace mutation 或实现运行；尚未观察到复杂任务使用 TodoWrite 建立高层规划的证据。不要仅凭这个 case 的单次失败再叠加 Prompt 规则。若继续研究，应先查看完整模型输出与中断请求的证据是否可获得，再决定是否需要另一个具备不同行为指标的评测任务；任何新策略仍应独立验证，不能将 Todo 维护直接等同于执行进展。
+
+## 2026-10-02：修复工具观察结果的可靠性
+
+Commit: `PENDING`
+Commit Description: `fix: 提高工具结果观察的可靠性`
+
+### Description
+
+ShellSession 原先为复合命令构造了包含状态标记的命令文本，但 POSIX 分支仍执行未经修改的原命令。因此 Runtime 无法获知被后续成功命令掩盖的早期失败。本次只对可安全识别的单行 POSIX `;` 命令链插入状态标记；遇到多行、heredoc、注释、状态变量、命令替换、控制结构等无法可靠解析的语法时，保留原命令不变。BaseTools 根据结构化 `segment_exit_codes` 给模型补充简短的部分失败标记；普通 stderr 警告仍不作为失败证据。
+
+搜索工具此前在路径展开中绕过了统一 WorkspaceAuthority 检查，目录遍历和 glob 结果也不稳定；命中数恰好达到上限时还会误报截断，最终输出边界可能切开上下文块并丢掉警告。本次改为在直接路径、glob 锚点和每个结果上复用 `safe_path`，按固定顺序遍历，跳过 broad search 中的 `.agent` Runtime 数据但允许显式搜索；限制后的结果以完整匹配行或完整上下文块输出，并在文本和 `ToolResult.output_visibility` 中记录搜索范围、截断原因、遗漏匹配下限及跳过文件。`search_code` 明确按行匹配正则；`count_occurrences` 明确返回正则出现次数。
+
+MainAgent 的 `read_file`、`search_code`、`count_occurrences` 和 `list_files` handler 此前把 BaseTools 的 `ToolResult` 降级成字符串。本次保留结果对象，使执行事实及可见性元数据能通过现有 Agent Loop、Trace 和 AttemptHistory 边界。
+
+### Result / Evidence
+
+Windows Python `3.14.3` 上的非临时目录定向回归为 `117 passed, 10 skipped, 7 deselected`；被跳过的是 POSIX-only / symlink 权限场景，被排除项依赖被 ACL 限制的 pytest 临时目录，Windows CMD 状态掩盖用例另以本地 workspace 直接调用验证通过。Context audit 的完整 Linux 运行覆盖了这些临时目录用例。
+
+Linux 验证使用 Docker Python `3.12.15`、当前工作区 bind mount 和项目 editable install。工具观察、ToolRegistry、ObservationNormalizer、System Prompt、LoopController、Runtime Context、完整 Context audit 与 search_code 集成测试合计 `160 passed, 1 skipped, 1 deselected`。唯一 skip 是 Windows CMD 专属测试；唯一 deselected 是一个既有 Provider parse-error 测试，它的 Agent fixture 缺少当前 `_llm_tool_cycle()` 要求的 `config.llm.provider/model/stream`，与本次改动无关。POSIX 普通命令成功/失败、`false ; echo ok` 分段失败、多个 segment、引号内分号、成功/失败 heredoc、多行 heredoc 后续命令以及完整 ShellSession → BaseTools → ObservationNormalizer / LLM-visible marker 均通过。Linux symlink 可用，直接路径与 glob 路径的越界链接均被拒绝；`count_occurrences` 权限校验、额外授权根、稳定排序、`.agent` 隐式排除/显式可读、exact max 与 max+1、整上下文块 budget 和 metadata 也通过。
+
+Windows 的完整 Context audit 测试仍受系统 pytest 临时目录 ACL 阻挡，不能把这些 setup errors 算作代码通过。没有运行真实 Provider 或 Terminal-Bench。
+
+### Decision / Limitation
+
+保持 WorkspaceAuthority、ToolResult、ObservationNormalizer 与既有 Trace 数据流为唯一事实来源，没有加入新治理策略。POSIX 状态采集采用保守语法门槛，无法识别的 Shell 构造可能不提供 segment 级状态，但执行命令本身不变。输出行预览仍受单行 200 字符限制，并在可见文本与 metadata 中标记；完整内容应通过缩小范围或其他读取方式获取。下一次 Terminal-Bench 运行应观察 bash 部分失败标记、search 输出可见性 metadata，以及是否还有截断后被误认为完整结果的 Trace。

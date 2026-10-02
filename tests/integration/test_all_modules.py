@@ -155,7 +155,7 @@ def test_search_code():
 
         # Test 2: No match
         result = tools.search_code(paths=["."], patterns=["XYZZZZ_NOTFOUND"])
-        _test_result("search_code no match", "未找到匹配" in result.content)
+        _test_result("search_code no match", "0 matching lines" in result.content)
 
         # Test 3: Multiple patterns (OR)
         result = tools.search_code(paths=["."], patterns=["user_id", "user_ids"])
@@ -172,7 +172,7 @@ def test_search_code():
         result = tools.search_code(
             paths=["."], patterns=[r"x_\d+"], max_matches=5,
         )
-        _test_result("search_code truncation", "已截断" in result.content)
+        _test_result("search_code truncation", result.output_visibility["truncated"])
 
         # Test 5: Ignored directory (.git should be skipped)
         ignored_dir = Path(tmpdir) / ".git"
@@ -185,7 +185,7 @@ def test_search_code():
         result = tools.search_code(
             paths=["test.py"], patterns=["USER"], case_sensitive=True,
         )
-        _test_result("search_code case sensitive", "未找到匹配" in result.content)
+        _test_result("search_code case sensitive", "0 matching lines" in result.content)
 
         # Test 7: Context lines (> marker)
         result = tools.search_code(

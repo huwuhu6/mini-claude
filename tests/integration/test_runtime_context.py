@@ -236,6 +236,7 @@ def test_long_bash_output_is_saved_and_can_be_read_in_windows():
         assert "log line 35" in window.content
 
 
+@pytest.mark.skipif(sys.platform != "win32", reason="covers Windows CMD status masking")
 def test_bash_result_keeps_process_facts_when_wrapper_masks_failure(tmp_path):
     tools = BaseTools(tmp_path, shell_session=ShellSession(tmp_path))
 

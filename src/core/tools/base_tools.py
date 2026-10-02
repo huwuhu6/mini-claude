@@ -31,6 +31,7 @@ READ_FILE_MAX_LINES = 200
 READ_FILE_MAX_CHARS = 100_000
 READ_FILE_MAX_BYTES = 256 * 1024
 SEARCH_CODE_MAX_CONTEXT_LINES = 50
+SEARCH_CODE_MAX_MATCHES = 200
 
 
 def _truncate_utf8(text: str, max_chars: int, max_bytes: int) -> str:
@@ -221,11 +222,24 @@ class BaseTools:
         result = self.shell_session.execute(
             command, timeout=timeout, cwd_override=cwd_override,
         )
+        segment_exit_codes = list(result.get("segment_exit_codes", []))
+        display_content = result["content"]
+        if any(code != 0 for code in segment_exit_codes):
+            display_content = (
+                "[Partial process failure detected: one or more command segments failed]\n"
+                f"[Final shell exit code: {result.get('exit_code')}]\n"
+                f"{display_content}"
+            )
         formatted, visibility = self._format_tool_output_with_visibility(
-            result["content"],
+            display_content,
             success=result["success"],
             exit_code=result.get("exit_code"),
         )
+        if any(code != 0 for code in segment_exit_codes):
+            visibility.update({
+                "partial_process_failure": True,
+                "segment_exit_codes": segment_exit_codes,
+            })
         return ToolResult(
             content=formatted,
             success=result["success"],
@@ -235,7 +249,7 @@ class BaseTools:
             stderr=result.get("stderr", ""),
             timed_out=result.get("timed_out", False),
             cancelled=result.get("cancelled", False),
-            segment_exit_codes=list(result.get("segment_exit_codes", [])),
+            segment_exit_codes=segment_exit_codes,
             output_visibility=visibility,
         )
 
@@ -871,58 +885,95 @@ class BaseTools:
             return True
 
     def _expand_search_paths(self, paths: List[str]) -> List[Path]:
-        """Expand user path patterns into a deduplicated list of resolved file paths.
-
-        Supports three forms:
-          - Glob pattern (contains ``*``, ``?``, or ``[``) → Path.glob()
-          - Directory path                              → os.walk()
-          - Single file path                            → direct inclusion
-        """
+        """Expand paths only after validating roots and every resolved candidate."""
         files: List[Path] = []
         seen: set = set()
 
         for p in paths:
-            # ── Glob pattern ──────────────────────────────────────
+            explicit_agent = self._explicit_agent_path(p)
+
             if any(c in p for c in '*?['):
-                matched_any = False
-                for match in self.workdir.glob(p.replace('\\', '/')):
+                normalized = p.replace('\\', '/')
+                pattern_path = Path(normalized)
+                if not pattern_path.is_absolute():
+                    pattern_path = self.workdir / pattern_path
+                parts = pattern_path.parts
+                wildcard_index = next(
+                    (i for i, part in enumerate(parts) if any(c in part for c in '*?[')),
+                    len(parts),
+                )
+                if wildcard_index == len(parts):
+                    continue
+                anchor = Path(*parts[:wildcard_index])
+                if not anchor.parts:
+                    anchor = self.workdir
+                pattern = Path(*parts[wildcard_index:]).as_posix()
+                # The fixed prefix itself must be authorized before globbing.
+                safe_anchor = self.safe_path(str(anchor))
+                matches = sorted(
+                    safe_anchor.glob(pattern), key=lambda path: path.as_posix()
+                )
+                for match in matches:
                     if not match.is_file():
                         continue
-                    resolved = (self.workdir / match).resolve()
-                    if resolved in seen:
+                    try:
+                        resolved = self.safe_path(str(match))
+                    except ValueError:
+                        # A glob may encounter an in-workspace symlink that
+                        # points out. Never read its target.
                         continue
-                    if not _is_relative_to(resolved, self.workdir):
+                    if resolved in seen or self._is_search_ignored(resolved):
                         continue
-                    if not self._is_search_ignored(resolved):
-                        files.append(resolved)
-                        seen.add(resolved)
-                    matched_any = True
-                if not matched_any:
-                    logger.warning(f"glob 模式 '{p}' 在 {self.workdir} 中未匹配到任何文件")
+                    if not explicit_agent and self._is_agent_runtime_path(resolved):
+                        continue
+                    files.append(resolved)
+                    seen.add(resolved)
                 continue
 
-            resolved = (self.workdir / p).resolve()
+            resolved = self.safe_path(p)
             if resolved in seen:
                 continue
 
-            # ── Directory → recursive walk ────────────────────────
             if resolved.is_dir():
                 for root, dirs, filenames in os.walk(resolved):
-                    dirs[:] = [d for d in dirs if d not in BaseTools.IGNORE_DIRS]
-                    for fn in filenames:
+                    dirs[:] = sorted(
+                        d for d in dirs
+                        if d not in BaseTools.IGNORE_DIRS
+                        and (explicit_agent or d != ".agent")
+                    )
+                    for fn in sorted(filenames):
                         fp = Path(root) / fn
-                        if fp.suffix in BaseTools.IGNORE_EXTS:
+                        if self._is_search_ignored(fp):
                             continue
-                        if fp not in seen:
-                            files.append(fp)
-                            seen.add(fp)
-            # ── Single file ──────────────────────────────────────
+                        if not explicit_agent and self._is_agent_runtime_path(fp):
+                            continue
+                        try:
+                            resolved_file = self.safe_path(str(fp))
+                        except ValueError:
+                            # Ignore an escaped symlink encountered during a
+                            # broad walk; explicit paths still fail closed.
+                            continue
+                        if resolved_file.is_file() and resolved_file not in seen:
+                            files.append(resolved_file)
+                            seen.add(resolved_file)
             elif resolved.is_file():
-                if not self._is_search_ignored(resolved):
+                if (not self._is_search_ignored(resolved)
+                        and (explicit_agent or not self._is_agent_runtime_path(resolved))):
                     files.append(resolved)
                     seen.add(resolved)
 
         return files
+
+    def _explicit_agent_path(self, path: str) -> bool:
+        normalized = path.replace('\\', '/').split('/')
+        return ".agent" in normalized
+
+    def _is_agent_runtime_path(self, path: Path) -> bool:
+        try:
+            relative = path.resolve().relative_to(self.workdir.resolve())
+        except ValueError:
+            return False
+        return ".agent" in relative.parts
 
     def search_code(
         self,
@@ -934,35 +985,25 @@ class BaseTools:
         include_filename: bool = True,
         include_line_number: bool = True,
     ) -> ToolResult:
-        """Search files for regex patterns (pure-Python, cross-platform).
+        """Return matching lines for line-oriented regex searches.
 
-        Args:
-            paths:         File/directory/glob path specifiers (default ``["."]``).
-            patterns:      Regex patterns (OR logic — a line matching any
-                           one of them is a hit).
-            context_lines: Lines of context shown before & after each match
-                           (like ``grep -C``).  0 = no context.
-            case_sensitive: Whether matching is case-sensitive.
-            max_matches:   Hard cap on total matches returned.
-            include_filename, include_line_number:
-                           Control the ``file:line:`` prefix on output lines.
-
-        Returns:
-            ToolResult with a human-readable match report.
+        Multiple patterns use OR semantics. Patterns are applied separately
+        to each line, so matches cannot span newline boundaries. Context blocks
+        are emitted atomically to keep bounded output from showing partial
+        code regions as if they were complete.
         """
-        # ── Validate inputs ───────────────────────────────────────
         if not paths:
             paths = ["."]
         if not patterns:
-            return ToolResult("错误: 需要至少提供一个模式 (patterns)", success=False)
+            return ToolResult("Error: at least one pattern is required.", success=False)
 
         try:
             context_lines = min(
                 max(0, int(context_lines)), SEARCH_CODE_MAX_CONTEXT_LINES,
             )
-            max_matches = max(1, min(200, int(max_matches)))
+            max_matches = max(1, min(SEARCH_CODE_MAX_MATCHES, int(max_matches)))
         except (ValueError, TypeError):
-            return ToolResult("错误: 数值参数无效", success=False)
+            return ToolResult("Error: numeric search options are invalid.", success=False)
 
         # ── Compile regexes ───────────────────────────────────────
         flags = 0 if case_sensitive else re.IGNORECASE
@@ -971,7 +1012,7 @@ class BaseTools:
             try:
                 compiled.append(re.compile(pat, flags))
             except re.error as e:
-                return ToolResult(f"错误: 无效的正则表达式 '{pat}': {e}", success=False)
+                return ToolResult(f"Error: invalid regular expression {pat!r}: {e}", success=False)
 
         # ── Expand paths ──────────────────────────────────────────
         try:
@@ -981,36 +1022,40 @@ class BaseTools:
 
         if not search_files:
             return ToolResult(
-                f"在路径 {paths} 中未找到可搜索的文件", success=False,
+                f"No searchable files found under paths {paths!r}.", success=False,
             )
 
-        # ── Search ────────────────────────────────────────────────
-        total_matches = 0
-        truncated = False
-        output_lines: List[str] = []
-        file_warnings: List[str] = []
+        # Each entry is one indivisible display block and the matching-line
+        # count it represents. Context blocks can contain several hits.
+        blocks: List[tuple[str, int]] = []
+        matched_lines = 0
+        searched_files = 0
+        incomplete_reasons: set[str] = set()
+        skipped_files: List[Dict[str, str]] = []
+        skipped_file_count = 0
+        line_preview_clipped = False
+
+        def skip_file(path: Path, reason: str) -> None:
+            nonlocal skipped_file_count
+            skipped_file_count += 1
+            if len(skipped_files) < 20:
+                skipped_files.append({
+                    "path": str(path)[:240], "reason": reason,
+                })
 
         for file_path in search_files:
-            if total_matches >= max_matches:
-                truncated = True
-                break
-
-            # ── Size gate ─────────────────────────────────────────
             try:
                 if file_path.stat().st_size > BaseTools.MAX_FILE_SIZE:
-                    file_warnings.append(
-                        f"跳过 {file_path} (>{BaseTools.MAX_FILE_SIZE // 1024 // 1024}MB)"
-                    )
+                    skip_file(file_path, "file_size_limit")
                     continue
-            except OSError as e:
-                file_warnings.append(str(e))
+            except OSError:
+                skip_file(file_path, "stat_error")
                 continue
 
-            # ── Binary gate ───────────────────────────────────────
             if BaseTools._is_binary_file(file_path):
+                skip_file(file_path, "binary_file")
                 continue
 
-            # ── Read ──────────────────────────────────────────────
             try:
                 with open(file_path, 'r', encoding='utf-8') as f:
                     lines = f.readlines()
@@ -1018,15 +1063,15 @@ class BaseTools:
                 try:
                     with open(file_path, 'r', encoding='latin-1') as f:
                         lines = f.readlines()
-                except Exception as e:
-                    file_warnings.append(f"无法读取 {file_path}: {e}")
+                except Exception:
+                    skip_file(file_path, "decode_error")
                     continue
-            except Exception as e:
-                file_warnings.append(f"无法读取 {file_path}: {e}")
+            except Exception:
+                skip_file(file_path, "read_error")
                 continue
 
-            # ── Locate all matching lines ─────────────────────────
-            file_matches: list = []
+            searched_files += 1
+            file_matches: List[tuple[int, str]] = []
             for i, line in enumerate(lines):
                 text = line.rstrip('\n\r')
                 for cp in compiled:
@@ -1034,28 +1079,26 @@ class BaseTools:
                         file_matches.append((i, text))
                         break
 
-            # ── Emit with context ─────────────────────────────────
             if not file_matches:
                 continue
 
-            # 1. No context — compact mode, line-number prefix only
             if context_lines == 0:
-                file_header_printed = False
                 for line_idx, matched_text in file_matches:
-                    if total_matches >= max_matches:
-                        truncated = True
+                    if matched_lines >= max_matches:
+                        incomplete_reasons.add("max_matches")
                         break
-                    total_matches += 1
-                    if include_filename and not file_header_printed:
-                        output_lines.append(f"{file_path}")
-                        file_header_printed = True
-                    display = (matched_text[:200] + "..."
-                               if len(matched_text) > 200 else matched_text)
+                    matched_lines += 1
+                    if len(matched_text) > 200:
+                        line_preview_clipped = True
+                    display = matched_text[:200] + ("... [line preview clipped]" if len(matched_text) > 200 else "")
                     prefix = f"{line_idx + 1}: " if include_line_number else ""
-                    output_lines.append(f"{prefix}{display}")
+                    rendered_line = f"> {prefix}{display}"
+                    rendered = f"{file_path}\n{rendered_line}" if include_filename else rendered_line
+                    blocks.append((rendered, 1))
+                if "max_matches" in incomplete_reasons:
+                    break
                 continue
 
-            # 2. Context mode — merge overlapping intervals
             intervals = []
             for idx, _ in file_matches:
                 start = max(0, idx - context_lines)
@@ -1084,67 +1127,93 @@ class BaseTools:
 
             file_header_printed = False
             for block in merged_blocks:
-                if total_matches >= max_matches:
-                    truncated = True
+                hit_count = len(block['hits'])
+                if matched_lines + hit_count > max_matches:
+                    incomplete_reasons.add("max_matches")
                     break
 
-                block_lines = []
+                block_lines = [str(file_path)] if include_filename and not file_header_printed else []
+                file_header_printed = file_header_printed or include_filename
                 for ci in range(block['start'], block['end'] + 1):
-                    is_hit = ci in block['hits']
-                    if is_hit:
-                        if total_matches >= max_matches:
-                            truncated = True
-                            break
-                        total_matches += 1
-
                     raw = lines[ci].rstrip('\n\r')
                     if len(raw) > 200:
-                        raw = raw[:200] + "..."
+                        line_preview_clipped = True
+                        raw = raw[:200] + "... [line preview clipped]"
 
                     line_prefix = f"{ci + 1}: " if include_line_number else ""
-                    block_lines.append(f"{line_prefix}{raw}")
+                    marker = "> " if ci in block['hits'] else "  "
+                    block_lines.append(f"{marker}{line_prefix}{raw}")
+                matched_lines += hit_count
+                blocks.append(("\n".join(block_lines), hit_count))
+            if "max_matches" in incomplete_reasons:
+                break
 
-                if block_lines:
-                    if include_filename and not file_header_printed:
-                        output_lines.append(f"{file_path}")
-                        file_header_printed = True
-                    output_lines.extend(block_lines)
-                    output_lines.append("  ---")
+        def render() -> str:
+            visible_matches = sum(count for _, count in blocks)
+            header = (f"Search complete: {visible_matches} matching lines across "
+                      f"{searched_files} searched files.")
+            if incomplete_reasons:
+                header = (f"Search incomplete: returned {visible_matches} matching lines "
+                          f"from {searched_files} searched files.")
+            parts = [header]
+            if blocks:
+                parts.append("\n\n".join(text for text, _ in blocks))
+            if incomplete_reasons or skipped_file_count:
+                parts.append("Search visibility:")
+                parts.append(f"- truncated_or_incomplete: {bool(incomplete_reasons or skipped_file_count)}")
+                if incomplete_reasons:
+                    parts.append(f"- reasons: {', '.join(sorted(incomplete_reasons))}")
+                    if "max_matches" in incomplete_reasons or "output_budget" in incomplete_reasons:
+                        omitted_lower_bound = max(
+                            1 if "max_matches" in incomplete_reasons else 0,
+                            candidate_matches - visible_matches,
+                        )
+                        parts.append(
+                            f"- additional_matching_lines_omitted: at least {omitted_lower_bound}"
+                        )
+                if skipped_file_count:
+                    parts.append(f"- skipped_files: {skipped_file_count}")
+                    for item in skipped_files:
+                        parts.append(f"  - {item['path']} ({item['reason']})")
+                    omitted = skipped_file_count - len(skipped_files)
+                    if omitted:
+                        parts.append(f"  - {omitted} additional skipped files omitted")
+            return "\n".join(parts)
 
-            if output_lines and output_lines[-1] == "  ---":
-                output_lines.pop()
+        candidate_matches = sum(count for _, count in blocks)
+        if line_preview_clipped:
+            incomplete_reasons.add("line_preview")
+        if skipped_file_count:
+            incomplete_reasons.add("skipped_files")
+        output_text = render()
+        while (len(output_text) > TOOL_OUTPUT_MAX_CHARS
+               or len(output_text.encode('utf-8')) > TOOL_OUTPUT_MAX_BYTES):
+            if not blocks:
+                # The summary/footer is bounded independently below.
+                output_text = output_text[:TOOL_OUTPUT_MAX_CHARS]
+                incomplete_reasons.add("output_budget")
+                break
+            blocks.pop()  # Drop a complete line/context block, never a fragment.
+            incomplete_reasons.add("output_budget")
+            output_text = render()
 
-        # ── Build result text ─────────────────────────────────────
-        result_parts: List[str] = []
-
-        if total_matches == 0:
-            result_parts.append(f"未找到任何匹配模式: {patterns}")
-        else:
-            status = (" (⚠️ 系统触发 Hard-Cap 安全熔断，已强行截断)"
-                      if truncated else "")
-            result_parts.append(
-                f"🔍 搜索报告: 在项目中找到 {total_matches} 处核心匹配{status}"
-            )
-            result_parts.append("=" * 50)
-            result_parts.extend(output_lines)
-
-        if truncated:
-            result_parts.append("\n" + "=" * 50)
-            result_parts.append(
-                "⚠️ 【系统核心警告】由于项目内匹配点过多，输出已被强制熔断。\n"
-                "请【严禁】尝试通过微调 paths 或重复运行此命令来刷取后续结果"
-                "（这会导致死循环报错）。\n"
-                "请立即换用更长、更精准的关键词（例如带上特定的函数名、"
-                "唯一的类前缀）来缩窄搜索范围！"
-            )
-
-        if file_warnings:
-            result_parts.append("\n警告日志:\n" + "\n".join(file_warnings))
-
-        return ToolResult(_bound_tool_output(
-            "\n".join(result_parts),
-            "⚠️ search_code 输出达到硬上限，结果已截断；请缩小 paths、patterns 或 context_lines。",
-        ))
+        visible_matches = sum(count for _, count in blocks)
+        omitted_match_lower_bound = max(
+            1 if "max_matches" in incomplete_reasons else 0,
+            candidate_matches - visible_matches,
+        )
+        output_visibility = {
+            "truncated": bool(incomplete_reasons or skipped_file_count),
+            "truncation_reasons": sorted(incomplete_reasons),
+            "returned_matching_lines": visible_matches,
+            "additional_matching_lines_omitted_lower_bound": omitted_match_lower_bound,
+            "searched_files": searched_files,
+            "max_matches": max_matches,
+            "skipped_files": skipped_files,
+            "skipped_file_count": skipped_file_count,
+            "skipped_files_omitted": max(0, skipped_file_count - len(skipped_files)),
+        }
+        return ToolResult(output_text, output_visibility=output_visibility)
 
     # ── count_occurrences ────────────────────────────────────────────
 
@@ -1212,8 +1281,7 @@ class BaseTools:
                 continue
 
             for pat_str, cp in zip(patterns, compiled):
-                # re.findall returns all matches (including overlapping? no — non-overlapping)
-                # Use finditer for correctness with overlapping patterns
+                # Python regex iteration counts non-overlapping occurrences.
                 count = sum(1 for _ in cp.finditer(content))
                 if count:
                     result[pat_str]["total"] += count
@@ -1227,11 +1295,11 @@ class BaseTools:
         for pat_str in patterns:
             info = result[pat_str]
             if info["total"] == 0:
-                lines.append(f'Pattern "{pat_str}": 0 matches')
+                lines.append(f'Pattern "{pat_str}": 0 occurrences')
             else:
                 file_count = len(info["files"])
                 lines.append(
-                    f'Pattern "{pat_str}": {info["total"]} matches '
+                    f'Pattern "{pat_str}": {info["total"]} occurrences '
                     f"across {file_count} file(s)"
                 )
                 for fpath in sorted(info["files"]):
