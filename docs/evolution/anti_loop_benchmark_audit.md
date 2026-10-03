@@ -1,5 +1,36 @@
 # Anti-Loop Benchmark Red-Team Audit
 
+## 首次 workspace mutation 前的 Shadow 观测（2026-10-03）
+
+Commit: `5a2dde3`
+Commit Description: `实验(runtime): 添加首次工作区修改前的 Shadow 检测器`
+
+### Description
+
+此前的循环治理可以识别重复意图、重复观察、振荡和重复失败，但无法识别另一种轨迹：Coding Agent 每次都执行不同的检查，观察也持续变化，却迟迟没有第一次修改 workspace。本阶段只补充观测，不改变模型提示、工具可用性、RuntimeDecision 或任务终止行为。
+
+新增的 task-local Shadow 状态只对用户明确要求改动的任务启用，统计第一次有效 workspace mutation 前已执行的模型工具动作，并分别记录 8、10、12 次动作的候选触发位置；触发还要求至少经过 3 个模型请求轮次。首次 mutation 使用现有 `WorkspaceStateGuard` 的 `changed_paths` 作为事实来源，命中后停止统计。TodoWrite 单独计数，不算实现动作；Agent Note 更新、执行前被拦截的调用、无效参数、重复调用和用户取消不计入；已执行但失败的动作仍计入，因为它们确实消耗了模型行动与运行时间。
+
+任务意图分类只识别直接、明确的中英文修改请求与只读请求，其余归为 UNKNOWN 并关闭 detector。分类不调用模型、不读取 Todo 或 task id，也不解释 assistant 自述。
+
+### Result / Evidence
+
+- 确定性覆盖包含 REQUIRED / NOT_REQUIRED / UNKNOWN、8/10/12 候选点、最少轮数、A9 首次 mutation、Bash 实际写入、workspace 外路径、忽略目录、执行前阻断、已执行失败、Todo/Note 记账、RuntimeDecision 不变和 TaskTrace 序列化。
+- 定向及相关回归共 `102 passed, 10 skipped`；跳过项是平台相关用例。`compileall` 与 `git diff --check` 通过。Windows pytest 临时目录 ACL 阻止标准 `tmp_path` 清理，因此相关集合使用临时本地 fixture 完成验证。
+- 离线扫描 833 份 TaskTrace：537 UNKNOWN、262 REQUIRED、34 NOT_REQUIRED。257 份 REQUIRED Trace 有完整 workspace 证据，其中 44 份记录到首次 mutation。该总体集合含失败轨迹，不能用于把阈值校准成行为规则。
+- 44 份首次 mutation 轨迹的动作数为 n=44、min=3、median=4、p75=6、p90=12、max=38；模型轮次为 n=44、min=3、median=3、p75=4、p90=8、max=23。
+- 匹配到有效 verifier 成功结果的轨迹为 n=33，但只来自两个 case family（task_024 有 5 次、task_025 有 28 次，且有重复版本）。其中 T8 会在 2 条成功轨迹首次 mutation 前触发，T10 会在 1 条触发，T12 也会在 1 条触发。因此 T12 在这些样本中最少提前触发，但仍会提前触发；样本覆盖不足以证明它安全。
+- Tool Observation Reliability 的 MIPS Trace 有 28 个模型请求、48 次工具动作、没有观察到 mutation：T8=T5/A8、T10=T6/A10、T12=T7/A12，触发前均为 Bash。该 trial 未成功完成。
+- 另一条 context-memory MIPS Trace 在 A39/T23 才首次 mutation，T8/T10/T12 分别在 A8/T4、A10/T5、A12/T6 产生候选信号，最终该轨迹也失败。这说明低阈值可在长探索轨迹上远早于首次修改，但不能仅凭失败轨迹判断介入是否有益。
+- Todo Prompt Policy 与 Todo 首次接入的 MIPS 只有 session JSONL，没有 workspace snapshot。两条分别有 49/32 和 53/36 次动作/模型轮次；其候选阈值仅是“假设期间无未观察 mutation”的条件性结果，不能记作确认的无 mutation Trace。
+- synthetic read-only 与 UNKNOWN 序列在 30 次动作后均从未触发。
+
+本阶段未运行 Provider、Harbor、Terminal-Bench 或网络评测。`scripts/replay_pre_mutation_shadow.py` 可对已保存的 TaskTrace 和 session 文件复算候选触发点。
+
+### Decision / Limitation
+
+保留 Shadow-only，当前建议为“继续 Shadow”。已有成功轨迹只覆盖两个 case family，Todo MIPS 缺少 workspace 差异证据，而且 T12 仍会在一个后来成功 mutation 的轨迹上提前触发。候选触发位置只能用于后续收集样本，不能作为软承诺或强制实现的依据。Detector 的分类器也有意保持保守，复杂或间接表达会落入 UNKNOWN。
+
 ## Tool Outcome Observation Loss 修复（2026-09-11）
 
 【观察到的问题】旧链路把 stdout/stderr 合并为展示文本，再只看最终 `[Exit Code: 0]`。`A & echo OK` 会让前一个失败被 echo 的 0 覆盖，所以 019 r03、020 r03、021 r01 的 Trace 写成 SUCCESS；问题发生在 Policy 之前，Policy 根本没有看到失败事实。

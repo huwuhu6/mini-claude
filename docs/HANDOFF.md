@@ -1,4 +1,8 @@
 
+## 2026-10-03 当前现场
+
+- 当前有独立实验分支 `experiment/pre-mutation-shadow-detector`，基线为 `9c79b6f`。实现提交 `5a2dde3` 增加首次 workspace mutation 前的只观测 detector 和历史 Trace replay；不修改 Prompt、工具暴露、RuntimeDecision 或终止行为。离线证据目前只支持继续 Shadow，不能据此引入执行承诺。实现与回放结果记录在 `docs/evolution/anti_loop_benchmark_audit.md`；文档回填已完成，实验分支待推送。
+
 ## 2026-10-01 当前现场
 
 - System Prompt 第一阶段重构已进入 main：新增纯函数 `src/core/prompt_builder.py`，Agent 只通过 `refresh_system_prompt()` 刷新；CLI 改用公开方法。Prompt 收敛为 identity、environment、execution policy、skills 区块，回答语言策略已从 Preflight context 移到 identity；动态 hot context 和请求消息构造未变。代表性输入下旧/新 Prompt 为 5,788/2,174 字符，估算 1,231/438 tokens。详见 `docs/evolution/context_management.md`。
