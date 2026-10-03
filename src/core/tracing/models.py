@@ -259,6 +259,7 @@ class TaskTrace:
     open_blocker_count: int = 0
     environment: Dict[str, Any] = field(default_factory=dict)
     request_config: Dict[str, Any] = field(default_factory=dict)
+    execution_commitment_shadow: Dict[str, Any] = field(default_factory=dict)
     attempt_events: List[Dict[str, Any]] = field(default_factory=list)
     turns: List[TurnTrace] = field(default_factory=list)
 
@@ -312,6 +313,7 @@ class TaskTrace:
             'open_blocker_count': self.open_blocker_count,
             'environment': dict(self.environment),
             'request_config': dict(self.request_config),
+            'execution_commitment_shadow': dict(self.execution_commitment_shadow),
             'attempt_events': [dict(event) for event in self.attempt_events],
             'turns': [t.to_dict() for t in self.turns],
         }

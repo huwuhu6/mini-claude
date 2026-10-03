@@ -20,6 +20,11 @@ from .command_policy import CommandPolicy
 from .preflight import PreflightResult, run_preflight
 from .environment_guard import EnvironmentBlock, EnvironmentBlocker
 from .workspace_state import WorkspaceMutation, WorkspaceStateGuard
+from .execution_shadow import (
+    MutationRequirement,
+    PreFirstMutationShadow,
+    classify_mutation_requirement,
+)
 
 __all__ = [
     'RuntimeContext',
@@ -29,4 +34,6 @@ __all__ = [
     'PreflightResult', 'run_preflight',
     'EnvironmentBlock', 'EnvironmentBlocker',
     'WorkspaceMutation', 'WorkspaceStateGuard',
+    'MutationRequirement', 'PreFirstMutationShadow',
+    'classify_mutation_requirement',
 ]

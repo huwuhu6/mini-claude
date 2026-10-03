@@ -64,6 +64,8 @@ from core.runtime_context import (
     run_preflight,
     EnvironmentBlocker,
     WorkspaceStateGuard,
+    PreFirstMutationShadow,
+    classify_mutation_requirement,
 )
 from core.runtime_context.observation import ObservationNormalizer
 from core.runtime_context.command_policy import CommandPolicy
@@ -1551,6 +1553,10 @@ class MiniClaudeAgent:
                 "stream": self.config.llm.stream,
             },
         )
+        execution_shadow = PreFirstMutationShadow(
+            classify_mutation_requirement(self._current_user_prompt)
+        )
+        self.trace.record_execution_commitment_shadow(execution_shadow.snapshot())
         self.runtime_context.current_task_id = tid
         self.runtime_policy.reset()
         self.workspace_state_guard.reset()
@@ -1567,6 +1573,8 @@ class MiniClaudeAgent:
                 logger.info("LLM_TURN_START: iteration=%s messages=%s", iteration + 1, len(self.messages))
                 # ── Start turn-level trace for this iteration ──
                 self.trace.start_turn(iteration)
+                execution_shadow.observe_model_turn(iteration + 1)
+                self.trace.record_execution_commitment_shadow(execution_shadow.snapshot())
                 # ── Pre-LLM: compression pipeline (s_full.py s06) ──
                 # (safe inside the loop — only modifies existing messages)
                 self.messages = Compressor._clean_tool_chains(self.messages)
@@ -1830,6 +1838,7 @@ class MiniClaudeAgent:
                     tracker_state_before = self.workspace_state_guard.snapshot()
                     state_before = tracker_state_before if self.workspace_state_guard.is_write_operation(tname, args) else None
                     state_guard_blocked = False
+                    tool_executed = False
                     v3_block_msg = None
                     failure_sig = None
                     observation_text = ""
@@ -1910,6 +1919,7 @@ class MiniClaudeAgent:
                             )
                             logger.warning("TOOL_BLOCKED: name=%s reason=%s", tname, result_text)
                         else:
+                            tool_executed = True
                             result = self._execute_tool(tname, args)
                             tool_result = result if isinstance(result, ToolResult) else ToolResult(
                                 content=str(result), success=not self._is_tool_error(str(result), tname)
@@ -2095,6 +2105,14 @@ class MiniClaudeAgent:
                         evidence_ids=observation_evidence.evidence_ids,
                     )
                     self.trace.record_attempt_event(progress_decision.event.to_dict())
+                    self.trace.record_execution_commitment_shadow(
+                        execution_shadow.observe_tool_action(
+                            tool_name=tname,
+                            turn=iteration + 1,
+                            executed=tool_executed,
+                            changed_paths=progress_decision.event.changed_paths,
+                        )
+                    )
                     self.trace.annotate_current_tool(
                         intent_key=intent.to_key(),
                         observation_fingerprint=progress_decision.event.observation_fingerprint,

@@ -98,6 +98,11 @@ class TraceManager:
         if self.current_task is not None:
             self.current_task.provider_diagnostic = dict(diagnostic)
 
+    def record_execution_commitment_shadow(self, evidence: Dict[str, Any]) -> None:
+        """Replace task-level shadow evidence without adding runtime behavior."""
+        if self.current_task is not None:
+            self.current_task.execution_commitment_shadow = dict(evidence)
+
     def end_task(self, status: str, terminal_reason: str = "") -> str:
         """Close the current task and write to disk.
 
