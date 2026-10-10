@@ -1,13 +1,15 @@
 """
 ShellSession — persistent shell session with cwd tracking.
 
-Maintains a logical shell state (cwd, env) across tool calls.
+Maintains a logical cwd across tool calls. Child processes inherit the current
+process environment; ShellSession does not provide persistent environment
+overrides.
 Commands are executed via subprocess.run() with cwd=session.cwd.
 """
 from __future__ import annotations
 import logging
-import os
 import re
+import shlex
 import subprocess
 import sys
 import tempfile
@@ -17,8 +19,6 @@ from typing import Dict, Any, List, Optional
 
 logger = logging.getLogger(__name__)
 
-# Detect cd commands
-_RE_CD = re.compile(r'(?:^|\s*&&\s*)cd\s+(.+?)(?:\s*&&\s*.*)?$', re.DOTALL)
 _SEGMENT_MARKER = "__MINICLAUDE_SEGMENT_EXIT_"
 
 
@@ -29,12 +29,12 @@ class ShellSession:
         session = ShellSession(workspace_root=Path("/project"))
         session.execute("cd src")          # cwd → /project/src
         session.execute("ls")              # runs in /project/src
-        session.execute("cd .. && ls")     # cwd → /project
+        session.execute("cd .. && ls")     # runs from /project for this call only
     """
 
     def __init__(self, workspace_root: Path):
-        self.cwd = Path(workspace_root).resolve()
-        self.env: Dict[str, str] = os.environ.copy()
+        self.workspace_root = Path(workspace_root).resolve()
+        self.cwd = self.workspace_root
         self.session_id: str = uuid.uuid4().hex[:8]
         self.command_history: List[str] = []
 
@@ -53,31 +53,38 @@ class ShellSession:
         Returns:
             Dict with keys: content (str), success (bool), cwd (str).
         """
-        cmd_stripped = command.strip()
+        pure_cd = (
+            self._parse_standalone_cd(command, self.cwd)
+            if cwd_override is None
+            else None
+        )
+        if pure_cd is not None:
+            target = pure_cd
+            target_path = Path(target)
+            if not target_path.is_absolute():
+                target_path = (self.cwd / target_path).resolve()
+            else:
+                target_path = target_path.resolve()
 
-        # Capture cwd BEFORE any cd updates (subprocess cd needs old cwd)
-        old_cwd = self.cwd
-        try:
-            self._update_cwd(command)
-        except FileNotFoundError as e:
-            return {
-                "content": f"[Exit Code: 1]\n{str(e)}",
-                "success": False,
-                "execution_success": False,
-                "cwd": str(self.cwd),
-                "stdout": "",
-                "stderr": str(e),
-                "exit_code": 1,
-                "timed_out": False,
-                "cancelled": False,
-                "segment_exit_codes": [],
-            }
+            if not target_path.exists() or not target_path.is_dir():
+                error = f"cd: {target}: No such file or directory"
+                return {
+                    "content": f"[Exit Code: 1]\n{error}",
+                    "success": False,
+                    "execution_success": False,
+                    "cwd": str(self.cwd),
+                    "stdout": "",
+                    "stderr": error,
+                    "exit_code": 1,
+                    "timed_out": False,
+                    "cancelled": False,
+                    "segment_exit_codes": [],
+                }
 
-        # Record history
-        self.command_history.append(command)
-
-        # Pure cd command: cwd tracking is sufficient, skip subprocess exec
-        if cmd_stripped.startswith("cd ") and "&&" not in cmd_stripped:
+            # Only a narrowly recognized standalone cd can update logical cwd.
+            self.cwd = target_path
+            logger.info("ShellSession: cwd → %s", self.cwd)
+            self.command_history.append(command)
             return {
                 "content": f"[Exit Code: 0]\n(ShellSession: cwd → {self.cwd})",
                 "success": True,
@@ -91,8 +98,10 @@ class ShellSession:
                 "segment_exit_codes": [],
             }
 
-        # Determine effective cwd for subprocess (cwd_override takes precedence)
-        effective_cwd = cwd_override if cwd_override is not None else old_cwd
+        # cwd_override is one-call-only; child-shell cd commands never update
+        # self.cwd.
+        effective_cwd = cwd_override if cwd_override is not None else self.cwd
+        self.command_history.append(command)
 
         # For non-cd (or chained) commands, use effective_cwd so relative paths resolve
         try:
@@ -209,6 +218,75 @@ class ShellSession:
                 "cancelled": False,
                 "segment_exit_codes": [],
             }
+
+    @staticmethod
+    def _parse_standalone_cd(command: str, cwd: Path) -> Optional[str]:
+        """Recognize only literal standalone cd forms safe to model in Python.
+
+        Shell expansions, operators, ambiguous quoting, and drive-relative CMD
+        paths stay in the real child shell and never update the persistent cwd.
+        """
+        stripped = command.strip()
+        if sys.platform == "win32":
+            match = re.fullmatch(r"(?i:cd)[ \t]+(.+)", stripped)
+            if not match:
+                return None
+            target = match.group(1).strip()
+            changes_drive = bool(re.match(r"(?i)^/d(?:[ \t]+|$)", target))
+            if changes_drive:
+                target = re.sub(r"(?i)^/d[ \t]*", "", target, count=1)
+            if not target:
+                return None
+            if target.startswith('"') and target.endswith('"') and len(target) >= 2:
+                target = target[1:-1]
+                if '"' in target:
+                    return None
+            elif '"' in target or any(char.isspace() for char in target):
+                return None
+            if not target:
+                return None
+            if any(char in target for char in "&|;<>^%!'"):
+                return None
+            if (
+                target.startswith("\\") or target.startswith("/")
+            ) and not Path(target).drive:
+                return None
+            target_drive = Path(target).drive
+            if (
+                target_drive
+                and cwd.drive
+                and target_drive.lower() != cwd.drive.lower()
+                and not changes_drive
+            ):
+                return None
+            if (
+                len(target) >= 2
+                and target[1] == ":"
+                and (len(target) == 2 or target[2] not in "\\/")
+            ):
+                return None
+            return target
+
+        match = re.fullmatch(r"cd[ \t]+(.+)", stripped)
+        if not match:
+            return None
+        try:
+            parts = shlex.split(match.group(1), comments=False, posix=True)
+        except ValueError:
+            return None
+        if len(parts) != 1:
+            return None
+        target = parts[0]
+        if (
+            not target
+            or target.startswith("-")
+            or target.startswith("~")
+            or any(
+                char in target for char in "$" + chr(96) + "*?[]&|;<>()[{},]"
+            )
+        ):
+            return None
+        return target
 
     @staticmethod
     def _decode(value: bytes) -> str:
@@ -377,54 +455,15 @@ class ShellSession:
             if quote is None and char in {"&", ";"}:
                 previous = command[index - 1] if index else ""
                 following = command[index + 1] if index + 1 < len(command) else ""
-                if previous != ">" and following not in {"&", "|", ">"}:
+                if (
+                    previous not in {">", "&", "|"}
+                    and following not in {"&", "|", ">"}
+                ):
                     result.append((index, char))
             index += 1
         return result
 
-    # ── CWD Management ─────────────────────────────────────────────
-
-    def _update_cwd(self, command: str) -> None:
-        """Track cd-commands and update the session cwd."""
-        # Handle simple "cd <dir>" at the start or after &&
-        parts = command.split("&&")
-        for part in parts:
-            trimmed = part.strip()
-            if trimmed.startswith("cd "):
-                target_text = trimmed[3:].strip()
-                if sys.platform == "win32" and re.match(r"^/d(?:\s|$)", target_text, re.IGNORECASE):
-                    target_text = target_text[2:].strip()
-                target = target_text.strip().strip('"').strip("'")
-                if not target:
-                    continue
-                self._apply_cd(target)
-
-    def _apply_cd(self, target: str) -> None:
-        """Resolve and apply a cd target to the session cwd.
-
-        Raises:
-            FileNotFoundError: If the target directory does not exist.
-        """
-        p = Path(target)
-        if not p.is_absolute():
-            p = (self.cwd / p).resolve()
-        else:
-            p = p.resolve()
-
-        if p.exists() and p.is_dir():
-            self.cwd = p
-            logger.info(f"ShellSession: cwd → {self.cwd}")
-        else:
-            raise FileNotFoundError(
-                f"cd: {target}: No such file or directory"
-            )
-
     def reset(self) -> None:
-        """Reset session to workspace root."""
-        self.cwd = self._original_root
+        """Reset session to its configured workspace root."""
+        self.cwd = self.workspace_root
         self.command_history.clear()
-
-    @property
-    def _original_root(self) -> Path:
-        """Return the original workspace root (inferred from first cwd)."""
-        return self.cwd

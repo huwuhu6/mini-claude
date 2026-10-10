@@ -110,3 +110,25 @@ Windows Python `3.14.3` 上，工具批次闭环、ToolRegistry、工具观察�
 本阶段只保护 Main Agent 的 `_execute_tool()` 调度路径，没有把 FeatureManager 塞入 ToolRegistry，也没有改造 SubAgent。直接调用 `ToolRegistry.execute()` 和 SubAgent 自己的 Registry 不经过主 Agent 校验，仍是独立入口。CommandPolicy 继续只做命令规则检查，WorkspaceAuthority 继续约束 BaseTools 的文件路径；二者都不是通用 HITL 或 Shell 沙箱。
 
 后续 HITL 可在同一 dispatch 边界返回显式 pending/control 状态，由 `_llm_tool_cycle()` 决定暂停，并保留原 Tool Call 为待处理状态；必须避免把 pending 转成终结 Tool Result。本阶段没有实现该状态，也没有持久化或 Resume。
+
+
+## 2026-10-10：限定 ShellSession 持久 cwd 的确认边界
+
+Commit: `PENDING`
+Commit Description: `fix: 只持久化可确认的 ShellSession cwd`
+
+### Description
+
+ShellSession 此前会在启动子进程前扫描复合命令里的 `cd`，并立即修改逻辑 cwd。若 `cd` 位于失败命令之后、条件分支未运行，或执行随后超时、取消，内存状态仍可能保留并未发生的目录变化。ShellSession 也复制了完整进程环境到 `self.env`，但启动 subprocess 时没有使用该副本；真正的子进程继承调用时 Agent 进程的环境。
+
+现在只有严格识别出的独立字面 `cd` 会在确认目标存在且为目录后更新逻辑 cwd。复合命令不再由 Python 侧预扫描 cwd，而是按既有分段观测规则交给实际平台 Shell 执行；子 Shell 的目录不会持久到后续工具调用；需要跨调用保留目录时，应先单独调用 `cd`。传入 `cwd_override` 时，即使命令只有 `cd` 也交给子 Shell 执行，且不会改变会话 cwd。ShellSession 不再持有环境副本，也不承诺跨调用环境变量修改；subprocess 继续继承每次调用时 Agent 进程的环境。
+
+同时显式保留初始化时的 `workspace_root`，使 `reset()` 能真正恢复到配置根目录，而不是把当前 cwd 当作原始根目录。
+
+### Result / Evidence
+
+Windows Python `3.14.3` 上，新增 ShellSession 状态测试及 RuntimeContext、工具观察、分段退出码、Tool Call 闭环和执行能力校验相关回归合计 `113 passed, 12 skipped`。Windows CMD 实测覆盖 `&`、`&&`、`||`、纯 `cd /d`，以及跨调用 cwd、timeout、cancel、`cwd_override` 和子进程环境继承；单独 `&` 的分段退出码回归通过。10 项 POSIX Shell 用例和 2 项 symlink 权限用例跳过。当前机器没有 POSIX Shell；`wsl --list --quiet` 因 `E_ACCESSDENIED` 无法列举发行版，因此未声称 POSIX Shell 实测通过。POSIX 复合命令 instrumentation 的纯函数测试通过。没有调用真实 Provider。
+
+### Decision / Limitation
+
+本阶段为避免猜测而收紧兼容行为：`cd src && command` 仍会在同一次子 Shell 中正常执行，但不会把 `src` 写入跨调用逻辑 cwd；跨调用目录导航使用单独的纯 `cd`。ShellSession 的 cwd 仍不是 Shell 沙箱；它本身不授予 WorkspaceAuthority 权限。未来恢复必须依据当前 Runtime 的授权重新验证目录，不保存或恢复旧权限、进程环境和命令历史。 Windows CMD 的标记扫描现将 && 保持为双字符运算符，同时继续对独立 & 插入分段标记。
