@@ -200,8 +200,8 @@ Windows Bash 的 start 路由曾绕过 background Feature。后台队列和主 A
 
 ## 2026-10-10：暂停 Run 的 JSON 快照与新实例继续执行
 
-Commit: `PENDING`
-Commit Description: `feat: 增加暂停 Run 快照契约与跨实例继续执行`
+Commit: `f6ff2571fa2a8f0d826a7a83a1a8ea6b21bfd8a1`
+Commit Description: `feat: 增加版本化 Run 快照与跨实例恢复`
 
 ### Description
 

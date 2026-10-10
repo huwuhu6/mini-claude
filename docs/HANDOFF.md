@@ -1,12 +1,12 @@
-## 2026-10-10 当前现场：第五阶段暂停快照契约
+## 2026-10-11 当前现场：第五阶段暂停快照契约
 
-- 前四阶段已经整合到本地 main，HEAD 为 `a3cbd530631fdd9d54616624bcc6de0b6eccf512`；第四阶段功能提交为 `a3ef6b3`。之前“暂缓合并”的现场记录已经被后续安全 fast-forward 整合取代。
-- 第五阶段在分支 `codex/run-snapshot-contract`、Worktree `D:\02_study\code\AgentProject\mini-claude-worktrees\run-snapshot-contract` 开发；基线 / 当前 HEAD 仍为 `a3cbd53`，本轮未提交、合并或推送，没有修改其他 Worktree。
+- 第五阶段整合基线为 `a3cbd530631fdd9d54616624bcc6de0b6eccf512`，已经包含前四阶段；第四阶段功能提交为 `a3ef6b3`。之前“暂缓合并”的现场记录已经被后续安全 fast-forward 整合取代。
+- 第五阶段实现已在 `codex/run-snapshot-contract` 提交为 `f6ff2571fa2a8f0d826a7a83a1a8ea6b21bfd8a1`，提交说明为 `feat: 增加版本化 Run 快照与跨实例恢复`；Worktree 为 `D:\02_study\code\AgentProject\mini-claude-worktrees\run-snapshot-contract`。用户已授权仅以 fast-forward 整合到本地 main，不推送、不删除 Worktree、不开始第六阶段。
 - 新增 JSON schema v1：export_run_snapshot() 只导出受控 PAUSED 状态；restore_run_snapshot() 先完整验证，再装入新实例，随后显式 _continue_run()。消息、原 Call ID / 参数、结果前缀 / 游标、预算、重试、Todo、Note 内容及有界 AttemptHistory 恢复。没有 SQLite、跨进程崩溃恢复或 HITL。
 - 当前工具 / 关键配置 / Workspace 不兼容时拒绝；可观察工作区内容变化时拒绝导入或首次继续。该前置条件保存在 RunState，在首个完成调用后消费。cwd 在恢复与继续时用当前授权重新检查。执行仍使用当前 Feature / CommandPolicy / WorkspaceAuthority；旧授权和环境不被复制。
 - 新实例建立新 Trace / Session 片段并关联原 Run。文件观察与 Recent Files 重建，不把陈旧观察当当前事实。后台任务表、子 Agent 栈、旧 Shell / 客户端 / 锁不恢复。
 - 最终 Windows Python 3.14.3 验证：快照专项 54 passed；扩展 Runtime / Tools / CLI / LoopController 定向回归 260 passed、12 skipped；完整 tests/unit 419 passed、12 skipped、4 failed。main 同四项复核 2 failed、2 passed，仍为 Provider fixture / schema 文本断言两项基线问题与两项 Worktree CRLF oracle 哈希差异；原 oracle 未改。Linux 全套验证仍未执行。
-- 当前新增的 `src/core/run_snapshot.py`、`tests/unit/test_run_snapshot.py` 尚未跟踪，后续提交必须明确 git add；Evolution 的本阶段 Commit 为 PENDING，获得真实实现 SHA 后再回填。完整契约、取舍及限制以 docs/evolution/tool_registry.md 为准。
+- `src/core/run_snapshot.py`、`tests/unit/test_run_snapshot.py` 已明确加入第五阶段实现提交；暂存差异检查通过。Evolution 已使用真实实现 SHA 回填，回填由独立文档提交保存。完整契约、取舍及限制以 docs/evolution/tool_registry.md 为准。
 - 快照复制给多个新实例没有全局去重保证；调用方需要唯一继续者。本轮只支持受控暂停边界，不支持副作用成功后结果未落盘、handler 内退出或任意异步中断。
 
 ## 2026-10-01 当前现场
