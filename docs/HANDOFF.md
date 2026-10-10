@@ -1,4 +1,10 @@
 
+## 2026-10-10 当前现场
+
+- Checkpoint / Resume / HITL 前置整理前三阶段已整合到本地 `main`：工具批次消息闭环（`c158978`）、dispatch 前 Feature 能力校验（`3f61cee`）、ShellSession cwd/env 状态语义（`123586a`）。本地改动尚未推送。
+- ShellSession 只在成功校验的纯 `cd` 调用中持久更新逻辑 cwd；复合命令的 cwd 仅作用于该子进程，`cwd_override` 不改变会话 cwd。环境变量继承当前进程环境，不提供跨调用持久环境覆盖。
+- Windows Python 3.14.3 定向回归为 113 passed、12 skipped。10 项 POSIX Shell 测试和 2 项 symlink 测试因平台条件跳过；POSIX 实测待后续 Linux/GitHub Actions 补齐，不阻塞第四阶段。第三阶段 Worktree 保留且干净。
+
 ## 2026-10-01 当前现场
 
 - System Prompt 第一阶段重构已进入 main：新增纯函数 `src/core/prompt_builder.py`，Agent 只通过 `refresh_system_prompt()` 刷新；CLI 改用公开方法。Prompt 收敛为 identity、environment、execution policy、skills 区块，回答语言策略已从 Preflight context 移到 identity；动态 hot context 和请求消息构造未变。代表性输入下旧/新 Prompt 为 5,788/2,174 字符，估算 1,231/438 tokens。详见 `docs/evolution/context_management.md`。
