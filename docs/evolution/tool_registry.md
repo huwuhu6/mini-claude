@@ -89,3 +89,24 @@ Windows 的完整 Context audit 测试仍受系统 pytest 临时目录 ACL 阻�
 ### Decision / Limitation
 
 保持 WorkspaceAuthority、ToolResult、ObservationNormalizer 与既有 Trace 数据流为唯一事实来源，没有加入新治理策略。POSIX 状态采集采用保守语法门槛，无法识别的 Shell 构造可能不提供 segment 级状态，但执行命令本身不变。输出行预览仍受单行 200 字符限制，并在可见文本与 metadata 中标记；完整内容应通过缩小范围或其他读取方式获取。下一次 Terminal-Bench 运行应观察 bash 部分失败标记、search 输出可见性 metadata，以及是否还有截断后被误认为完整结果的 Trace。
+
+## 2026-10-10：主 Agent dispatch 前复查 Feature 能力
+
+Commit: `PENDING`
+Commit Description: `fix: 在主 Agent 工具 dispatch 前复查 Feature 能力`
+
+### Description
+
+FeatureManager 原先只在构造发给模型的工具列表时过滤工具。ToolRegistry 仍保留 handler，而 Main Agent 的 `_execute_tool()` 只检查 handler 是否注册，所以模型生成工具调用后若 Feature 被关闭，过期调用仍可能 dispatch。
+
+本阶段把工具所属 Feature 的查询收敛到 `FeatureManager.is_tool_enabled()`，模型可见性过滤与 Main Agent 的执行前校验复用同一映射。主执行入口返回明确的 dispatch 状态；功能关闭和工具未注册会成为未执行的阻断结果，仍为 Tool Call 写入对应 Tool Result。控制类 `RuntimeEscalationException` 从普通工具异常捕获中透传到现有 Agent Loop 控制处理器。
+
+### Result / Evidence
+
+Windows Python `3.14.3` 上，工具批次闭环、ToolRegistry、工具观察、Todo、Runtime Resolution、LoopController、CLI、System Prompt 和结构化记忆定向回归合计 `136 passed, 10 skipped`。10 项跳过均为当前 Windows 环境不支持 POSIX shell 或符号链接的用例。新增测试覆盖模型返回调用后关闭 Feature、禁用期间不调用 handler、重新启用后恢复、dispatch 状态区分、Tool Result 闭环，以及 Main Agent 与 Registry/SubAgent 独立入口边界。没有调用真实 Provider。
+
+### Decision / Limitation
+
+本阶段只保护 Main Agent 的 `_execute_tool()` 调度路径，没有把 FeatureManager 塞入 ToolRegistry，也没有改造 SubAgent。直接调用 `ToolRegistry.execute()` 和 SubAgent 自己的 Registry 不经过主 Agent 校验，仍是独立入口。CommandPolicy 继续只做命令规则检查，WorkspaceAuthority 继续约束 BaseTools 的文件路径；二者都不是通用 HITL 或 Shell 沙箱。
+
+后续 HITL 可在同一 dispatch 边界返回显式 pending/control 状态，由 `_llm_tool_cycle()` 决定暂停，并保留原 Tool Call 为待处理状态；必须避免把 pending 转成终结 Tool Result。本阶段没有实现该状态，也没有持久化或 Resume。

@@ -10,11 +10,12 @@ SRC = Path(__file__).resolve().parents[2] / "src"
 if str(SRC) not in sys.path:
     sys.path.insert(0, str(SRC))
 
-from agent.mini_claude_agent import MiniClaudeAgent
-from core.features import FeatureManager
+from agent.mini_claude_agent import MiniClaudeAgent, ToolDispatchStatus
+from core.features import FeatureDefinition, FeatureManager
 from core.subagent import SubAgent, SubAgentType
 from core.tools.base_tools import BaseTools, ToolResult
 from core.tools.registry import ToolRegistry, ToolSpec
+from core.loop_controller import RuntimeEscalationException
 from models.config import FeaturesConfig
 from providers.base import ToolDefinition as ProviderToolDef
 
@@ -54,7 +55,8 @@ def _agent_without_initialization(feature_manager=None):
     agent.feature_manager = feature_manager or type(
         "FeatureManagerStub", (),
         {"filter_tools": staticmethod(lambda tools: tools),
-         "is_enabled": staticmethod(lambda _name: True)},
+         "is_enabled": staticmethod(lambda _name: True),
+         "is_tool_enabled": staticmethod(lambda _name: True)},
     )()
     agent.tool_registry = ToolRegistry()
     agent._register_tools()
@@ -85,18 +87,22 @@ def test_registry_unknown_tool_raises_key_error():
         registry.execute("unknown_tool", {})
 
 
-def test_agent_unknown_tool_keeps_legacy_error_result():
+def test_agent_unknown_tool_is_distinct_from_handler_failures():
     agent = _agent_without_initialization()
 
-    assert agent._execute_tool("unknown_tool", {}) == "错误: 未知工具 'unknown_tool'"
+    result = agent._execute_tool("unknown_tool", {})
+
+    assert result.status is ToolDispatchStatus.UNKNOWN_TOOL
+    assert result.value == "错误: 未知工具 'unknown_tool'"
 
 
-def test_agent_handler_argument_errors_keep_legacy_result():
+def test_agent_handler_argument_errors_have_a_distinct_dispatch_status():
     agent = _agent_without_initialization()
 
     result = agent._execute_tool("read_file", {"unexpected": True})
 
-    assert result.startswith("错误: 工具 'read_file' 参数无效。")
+    assert result.status is ToolDispatchStatus.INVALID_ARGUMENTS
+    assert result.value.startswith("错误: 工具 'read_file' 参数无效。")
 
 
 def test_registry_definitions_match_provider_tool_format():
@@ -234,6 +240,79 @@ def test_subagent_run_sends_registry_definitions_to_provider(workspace):
     assert all(isinstance(tool, ProviderToolDef) for tool in provider.tools)
 
 
+def _feature_gated_agent(handler):
+    features = FeatureManager()
+    features.register_feature(FeatureDefinition(name="files", enabled=True))
+    features.register_tool_for_feature("read_file", "files")
+    registry = ToolRegistry()
+    registry.register(ToolSpec(
+        name="read_file",
+        description="read a file",
+        input_schema={"type": "object", "properties": {}},
+        handler=handler,
+    ))
+    agent = object.__new__(MiniClaudeAgent)
+    agent.feature_manager = features
+    agent.tool_registry = registry
+    return agent, features
+
+
+def test_dispatch_rechecks_feature_at_execution_and_recovers_when_reenabled():
+    calls = []
+    agent, features = _feature_gated_agent(lambda: calls.append("run") or "ok")
+
+    enabled = agent._execute_tool("read_file", {})
+    assert enabled.status is ToolDispatchStatus.DISPATCHED
+    assert enabled.value == "ok"
+    assert calls == ["run"]
+
+    assert features.disable("files")
+    disabled = agent._execute_tool("read_file", {})
+    assert disabled.status is ToolDispatchStatus.FEATURE_DISABLED
+    assert isinstance(disabled.value, ToolResult)
+    assert disabled.value.execution_success is False
+    assert "当前未启用" in disabled.value.content
+    assert calls == ["run"]
+
+    assert features.enable("files")
+    reenabled = agent._execute_tool("read_file", {})
+    assert reenabled.status is ToolDispatchStatus.DISPATCHED
+    assert reenabled.value == "ok"
+    assert calls == ["run", "run"]
+
+
+def test_runtime_escalation_control_signal_is_not_swallowed_by_dispatch():
+    def stop():
+        raise RuntimeEscalationException("stop now")
+
+    agent, _features = _feature_gated_agent(stop)
+
+    with pytest.raises(RuntimeEscalationException, match="stop now"):
+        agent._execute_tool("read_file", {})
+
+
+def test_raw_registry_and_subagent_paths_are_outside_main_feature_gate(workspace, monkeypatch):
+    calls = []
+    main, features = _feature_gated_agent(lambda: calls.append("main") or "ok")
+    assert features.disable("files")
+
+    denied = main._execute_tool("read_file", {})
+    assert denied.status is ToolDispatchStatus.FEATURE_DISABLED
+    assert calls == []
+
+    # ToolRegistry has no FeatureManager dependency; direct callers bypass the
+    # Main Agent's policy boundary by design.
+    assert main.tool_registry.execute("read_file", {}) == "ok"
+    assert calls == ["main"]
+
+    monkeypatch.setattr(
+        BaseTools, "read_file",
+        lambda _self, path, **_kwargs: ToolResult(f"subagent:{path}"),
+    )
+    subagent = SubAgent(SubAgentType.EXPLORE, workdir=workspace)
+    assert subagent.execute_tool("read_file", {"path": "sample.py"}) == "subagent:sample.py"
+
+
 def test_main_agent_feature_flags_gate_production_tool_wiring():
     main = object.__new__(MiniClaudeAgent)
     main.config = SimpleNamespace(features=FeaturesConfig())
@@ -264,6 +343,9 @@ def test_main_agent_feature_flags_gate_production_tool_wiring():
         visible = {tool["name"] for tool in main._get_llm_tools()}
         assert feature_tools.isdisjoint(visible)
         assert all_mapped_tools - feature_tools <= visible
+        for tool_name in feature_tools:
+            assert main.tool_registry.has_handler(tool_name)
+            assert main._execute_tool(tool_name, {}).status is ToolDispatchStatus.FEATURE_DISABLED
 
         assert main.feature_manager.enable(feature_name)
         visible = {tool["name"] for tool in main._get_llm_tools()}

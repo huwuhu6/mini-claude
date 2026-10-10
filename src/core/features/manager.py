@@ -118,15 +118,17 @@ class FeatureManager:
 
     # ── Tool Filtering ────────────────────────────────────────
 
+    def is_tool_enabled(self, tool_name: str) -> bool:
+        """Return whether the tool's mapped feature is currently enabled."""
+        required_feature = self._tool_feature_map.get(tool_name)
+        return required_feature is None or self.is_enabled(required_feature)
+
     def filter_tools(self, tools: List[Dict]) -> List[Dict]:
         """Filter tools based on which features are enabled."""
-        filtered = []
-        for tool in tools:
-            tool_name = tool.get('name', '')
-            req_feature = self._tool_feature_map.get(tool_name)
-            if req_feature is None or self.is_enabled(req_feature):
-                filtered.append(tool)
-        return filtered
+        return [
+            tool for tool in tools
+            if self.is_tool_enabled(tool.get('name', ''))
+        ]
 
     # ── Dependency Graph ──────────────────────────────────────
 

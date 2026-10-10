@@ -110,7 +110,9 @@ def _hot_context_agent(items):
     agent.todo.update(items)
     agent.agent_note = SimpleNamespace(read=lambda: "")
     agent._compression_notice_pending = False
-    agent.feature_manager = SimpleNamespace(is_enabled=lambda _name: False)
+    agent.feature_manager = SimpleNamespace(
+        is_enabled=lambda _name: False, is_tool_enabled=lambda _name: True,
+    )
     agent._drain_background_notifications = lambda: None
     agent.memory = None
     return agent
@@ -141,7 +143,7 @@ def test_todowrite_result_and_hot_context_preserve_persisted_message_history():
     agent.messages = [Message(role="user", content="Implement the feature")]
     items = [_item("Add the feature", "in_progress")]
 
-    call_result = agent._execute_tool("TodoWrite", {"items": items})
+    call_result = agent._execute_tool("TodoWrite", {"items": items}).value
     agent.messages.extend([
         Message(
             role="assistant",

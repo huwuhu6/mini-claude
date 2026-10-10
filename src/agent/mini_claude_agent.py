@@ -13,6 +13,8 @@ import shutil
 import socket
 import copy
 from collections import Counter
+from dataclasses import dataclass
+from enum import Enum
 from pathlib import Path
 from typing import Callable, List, Dict, Any, Optional
 from urllib.error import HTTPError, URLError
@@ -71,6 +73,22 @@ from core.runtime_context.workspace_authority import WorkspaceAuthority
 from skills import SkillLoader
 
 logger = logging.getLogger(__name__)
+
+
+class ToolDispatchStatus(str, Enum):
+    DISPATCHED = "dispatched"
+    FEATURE_DISABLED = "feature_disabled"
+    UNKNOWN_TOOL = "unknown_tool"
+    INVALID_ARGUMENTS = "invalid_arguments"
+    EXECUTION_FAILED = "execution_failed"
+
+
+@dataclass(frozen=True)
+class ToolDispatchResult:
+    """Explicit outcome from the Main Agent's pre-handler dispatch boundary."""
+
+    status: ToolDispatchStatus
+    value: Any
 
 
 class _RuntimeCompletionGate:
@@ -1037,18 +1055,40 @@ class MiniClaudeAgent:
         header += ">"
         return ToolResult(content=f"{header}\n{skill.content}\n</skill>")
 
-    def _execute_tool(self, name: str, args: Dict[str, Any]) -> Any:
-        """Execute a registered tool while preserving legacy error formatting."""
+    def _execute_tool(self, name: str, args: Dict[str, Any]) -> ToolDispatchResult:
+        """Check current capability, then dispatch through the Main Agent registry."""
         if not self.tool_registry.has_handler(name):
-            return f"错误: 未知工具 '{name}'"
+            return ToolDispatchResult(
+                ToolDispatchStatus.UNKNOWN_TOOL,
+                f"错误: 未知工具 '{name}'",
+            )
+        if not self.feature_manager.is_tool_enabled(name):
+            return ToolDispatchResult(
+                ToolDispatchStatus.FEATURE_DISABLED,
+                ToolResult(
+                    content=f"错误: 工具 '{name}' 所属功能当前未启用",
+                    success=False,
+                    execution_success=False,
+                ),
+            )
         try:
-            return self.tool_registry.execute(name, args)
+            value = self.tool_registry.execute(name, args)
+            return ToolDispatchResult(ToolDispatchStatus.DISPATCHED, value)
+        except RuntimeEscalationException:
+            # Runtime control signals must reach the loop's control handler.
+            raise
         except TypeError as e:
             logger.error(f"工具 '{name}' 参数错误: {e}")
-            return f"错误: 工具 '{name}' 参数无效。详情: {str(e)}"
+            return ToolDispatchResult(
+                ToolDispatchStatus.INVALID_ARGUMENTS,
+                f"错误: 工具 '{name}' 参数无效。详情: {str(e)}",
+            )
         except Exception as e:
             logger.error(f"执行工具 '{name}' 出错: {e}")
-            return f"错误: {str(e)}"
+            return ToolDispatchResult(
+                ToolDispatchStatus.EXECUTION_FAILED,
+                f"错误: {str(e)}",
+            )
 
     def _close_tool_call_batch(
         self,
@@ -2047,35 +2087,67 @@ class MiniClaudeAgent:
                             logger.warning("TOOL_BLOCKED: name=%s reason=%s", tname, result_text)
                         else:
                             current_tool_execution_started = True
-                            result = self._execute_tool(tname, args)
+                            dispatch = self._execute_tool(tname, args)
+                            # Preserve compatibility with tests/extensions that replace
+                            # the private dispatcher with a plain handler result.
+                            if isinstance(dispatch, ToolDispatchResult):
+                                dispatch_status = dispatch.status
+                                result = dispatch.value
+                            else:
+                                dispatch_status = ToolDispatchStatus.DISPATCHED
+                                result = dispatch
                             tool_result = result if isinstance(result, ToolResult) else ToolResult(
                                 content=str(result), success=not self._is_tool_error(str(result), tname)
                             )
                             result_text = tool_result.content
-                            cancelled = (
-                                tool_result.cancelled
-                                or result_text.startswith("[用户中断]")
-                            )
-                            if cancelled:
-                                result_text += (
-                                    "\n[执行取消；取消前是否产生部分副作用未知。]"
+                            not_dispatched = dispatch_status in {
+                                ToolDispatchStatus.FEATURE_DISABLED,
+                                ToolDispatchStatus.UNKNOWN_TOOL,
+                            }
+                            cancelled = False
+                            if not_dispatched:
+                                current_tool_execution_started = False
+                                v3_block_msg = result_text
+                            else:
+                                cancelled = (
+                                    tool_result.cancelled
+                                    or result_text.startswith("[用户中断]")
                                 )
+                                if cancelled:
+                                    result_text += (
+                                        "\n[执行取消；取消前是否产生部分副作用未知。]"
+                                    )
+
                             append_tool_result(tc, result_text)
                             current_tool_result_received = True
-                            success = not cancelled and bool(tool_result.execution_success)
-                            record_tool_result_event(
-                                tname,
-                                result_text,
-                                success=success,
-                                blocked=False,
-                                outcome=(
-                                    "CANCELLED" if cancelled
-                                    else "EXECUTED_SUCCESS" if success
-                                    else "EXECUTED_FAILURE"
-                                ),
-                                cancelled=cancelled,
-                                output_visibility=tool_result.output_visibility,
-                            )
+                            if not_dispatched:
+                                observation_text = result_text
+                                record_tool_result_event(
+                                    tname,
+                                    result_text,
+                                    success=False,
+                                    blocked=True,
+                                    outcome=f"BLOCKED_{dispatch_status.value.upper()}",
+                                    output_visibility=tool_result.output_visibility,
+                                )
+                                logger.warning(
+                                    "TOOL_BLOCKED: name=%s reason=%s", tname, result_text,
+                                )
+                            else:
+                                success = not cancelled and bool(tool_result.execution_success)
+                                record_tool_result_event(
+                                    tname,
+                                    result_text,
+                                    success=success,
+                                    blocked=False,
+                                    outcome=(
+                                        "CANCELLED" if cancelled
+                                        else "EXECUTED_SUCCESS" if success
+                                        else "EXECUTED_FAILURE"
+                                    ),
+                                    cancelled=cancelled,
+                                    output_visibility=tool_result.output_visibility,
+                                )
                             observation_evidence = ObservationNormalizer.normalize(
                                 tname, args, tool_result
                             )
@@ -2083,70 +2155,73 @@ class MiniClaudeAgent:
                                 observation_evidence.evidence_text or result_text
                             )
 
-                            # Environment classification is evidence only.  A
-                            # dynamic refusal/package/permission error remains
-                            # visible to the analyzer and can recover later.
-                            environment_block = self.environment_blocker.classify_result(
-                                observation_text,
-                                failed=(
-                                    not bool(tool_result.execution_success)
-                                    or observation_evidence.observed_failure
-                                ),
-                            )
-
-                            state_guard_message = None
-                            after_snapshot = self.workspace_state_guard.snapshot()
-                            if state_before is not None:
-                                mutation = self.workspace_state_guard.mutation(state_before, after_snapshot)
-                            # WorkspaceStateGuard is an observer; stall policy is
-                            # derived from the shared AttemptHistory below.
-
-                            if cancelled:
-                                finish_tool_batch("用户取消当前工具")
-                                t_end = time.time()
-                                self.trace.record_tool_call(
-                                    tool_name=tname, args_hash=args_hash,
-                                    success=False, loop_guard_blocked=False,
-                                    error_message=result_text[:200],
-                                    result_preview=result_text[:200],
-                                    started_at=t_start, finished_at=t_end,
-                                    failure_category="USER_CANCELLED",
-                                    recoverability="NON_RECOVERABLE",
-                                    strategy_fingerprint="",
-                                    escalated=False,
-                                    circuit_breaker_triggered=False,
-                                    cwd=str(self.runtime_context.cwd),
-                                    workspace_root=str(self.runtime_context.workspace_root),
-                                    session_id=self.runtime_context.shell_session.session_id,
-                                )
-                                self._emit_ui_event(
-                                    "tool_result",
-                                    name=tname,
-                                    success=False,
-                                    blocked=False,
-                                )
-                                self.session_recorder.record(
-                                    "runtime_cancelled",
-                                    reason="user_interrupt",
-                                    tool=tname,
-                                )
-                                self.trace.end_task("CANCELLED")
-                                return "已取消当前任务。"
-
-                            # ── Failure Intelligence Analysis ──
-                            if (
-                                not bool(tool_result.execution_success)
-                                or observation_evidence.observed_failure
-                            ):
-                                failure_sig = self.failure_analyzer.analyze(
-                                    tool_name=tname,
-                                    tool_args=args,
-                                    result_text=(
-                                        observation_evidence.evidence_text or result_text
+                            if not not_dispatched:
+                                # Environment classification is evidence only. A
+                                # dynamic refusal/package/permission error remains
+                                # visible to the analyzer and can recover later.
+                                environment_block = self.environment_blocker.classify_result(
+                                    observation_text,
+                                    failed=(
+                                        not bool(tool_result.execution_success)
+                                        or observation_evidence.observed_failure
                                     ),
                                 )
-                            # FailureAnalyzer is stateless. The event stream is
-                            # the sole place where this failure is counted.
+
+                                state_guard_message = None
+                                after_snapshot = self.workspace_state_guard.snapshot()
+                                if state_before is not None:
+                                    mutation = self.workspace_state_guard.mutation(
+                                        state_before, after_snapshot,
+                                    )
+                                # WorkspaceStateGuard is an observer; stall policy is
+                                # derived from the shared AttemptHistory below.
+
+                                if cancelled:
+                                    finish_tool_batch("用户取消当前工具")
+                                    t_end = time.time()
+                                    self.trace.record_tool_call(
+                                        tool_name=tname, args_hash=args_hash,
+                                        success=False, loop_guard_blocked=False,
+                                        error_message=result_text[:200],
+                                        result_preview=result_text[:200],
+                                        started_at=t_start, finished_at=t_end,
+                                        failure_category="USER_CANCELLED",
+                                        recoverability="NON_RECOVERABLE",
+                                        strategy_fingerprint="",
+                                        escalated=False,
+                                        circuit_breaker_triggered=False,
+                                        cwd=str(self.runtime_context.cwd),
+                                        workspace_root=str(self.runtime_context.workspace_root),
+                                        session_id=self.runtime_context.shell_session.session_id,
+                                    )
+                                    self._emit_ui_event(
+                                        "tool_result",
+                                        name=tname,
+                                        success=False,
+                                        blocked=False,
+                                    )
+                                    self.session_recorder.record(
+                                        "runtime_cancelled",
+                                        reason="user_interrupt",
+                                        tool=tname,
+                                    )
+                                    self.trace.end_task("CANCELLED")
+                                    return "已取消当前任务。"
+
+                                # ── Failure Intelligence Analysis ──
+                                if (
+                                    not bool(tool_result.execution_success)
+                                    or observation_evidence.observed_failure
+                                ):
+                                    failure_sig = self.failure_analyzer.analyze(
+                                        tool_name=tname,
+                                        tool_args=args,
+                                        result_text=(
+                                            observation_evidence.evidence_text or result_text
+                                        ),
+                                    )
+                                # FailureAnalyzer is stateless. The event stream is
+                                # the sole place where this failure is counted.
 
                     except RuntimeEscalationException as e:
                         # ── V3 hard circuit breaker triggered ──

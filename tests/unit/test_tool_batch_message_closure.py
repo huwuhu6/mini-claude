@@ -11,7 +11,10 @@ sys.path.insert(0, str(Path(__file__).resolve().parents[2] / "src"))
 
 from agent.mini_claude_agent import MiniClaudeAgent
 from core.failure_intelligence import FailureAnalyzer
+from core.features import FeatureDefinition, FeatureManager
+from core.tools.registry import ToolRegistry, ToolSpec
 from core.loop_controller import (
+    RuntimeEscalationException,
     AttemptEvent,
     AttemptStatus,
     LoopController,
@@ -172,6 +175,94 @@ def _tool_messages(agent):
 
 def _assistant_tool_call_ids(message):
     return [call["id"] for call in message.tool_calls or []]
+
+
+def test_feature_disabled_after_model_response_is_blocked_with_closed_tool_result(make_agent):
+    agent, completions = make_agent([
+        _response(tool_calls=[_call(
+            "feature-call", '{"command":"echo ok"}', name="bash",
+        )]),
+        _response(content="done"),
+    ])
+    features = FeatureManager()
+    features.register_feature(FeatureDefinition(name="bash", enabled=True))
+    features.register_tool_for_feature("bash", "bash")
+    registry = ToolRegistry()
+    executed = []
+    registry.register(ToolSpec(
+        name="bash",
+        description="run a command",
+        input_schema={
+            "type": "object",
+            "properties": {"command": {"type": "string"}},
+            "required": ["command"],
+        },
+        handler=lambda command: executed.append(command) or ToolResult("ran"),
+    ))
+    agent.feature_manager = features
+    agent.tool_registry = registry
+    agent._get_llm_tools = lambda: features.filter_tools(registry.definitions())
+    agent._execute_tool = MiniClaudeAgent._execute_tool.__get__(agent, MiniClaudeAgent)
+
+    def disable_after_model_response(event, **_kwargs):
+        if event == "tool_start":
+            features.disable("bash")
+
+    agent._emit_ui_event = disable_after_model_response
+
+    result = agent._llm_tool_cycle(max_iterations=2)
+
+    assert result == "done"
+    assert "bash" in [tool["function"]["name"] for tool in completions.requests[0]["tools"]]
+    assert executed == []
+    assistant = next(
+        message for message in agent.messages
+        if message.role == "assistant" and message.tool_calls
+    )
+    results = _tool_messages(agent)
+    assert _assistant_tool_call_ids(assistant) == ["feature-call"]
+    assert [message.tool_call_id for message in results] == ["feature-call"]
+    assert "所属功能当前未启用" in results[0].content
+    events = [data for event, data in agent.recorded_events if event == "tool_result"]
+    assert events[0]["outcome"] == "BLOCKED_FEATURE_DISABLED"
+    assert events[0]["blocked"] is True
+
+
+def test_runtime_control_exception_reaches_loop_without_becoming_tool_failure(make_agent):
+    agent, _completions = make_agent([
+        _response(tool_calls=[_call(
+            "control-call", '{"command":"echo ok"}', name="bash",
+        )]),
+    ])
+    features = FeatureManager()
+    features.register_feature(FeatureDefinition(name="bash", enabled=True))
+    features.register_tool_for_feature("bash", "bash")
+    registry = ToolRegistry()
+
+    def stop_before_result(command):
+        raise RuntimeEscalationException("runtime stop")
+
+    registry.register(ToolSpec(
+        name="bash",
+        description="run command",
+        input_schema={"type": "object", "properties": {}},
+        handler=stop_before_result,
+    ))
+    agent.feature_manager = features
+    agent.tool_registry = registry
+    agent._get_llm_tools = lambda: features.filter_tools(registry.definitions())
+    agent._execute_tool = MiniClaudeAgent._execute_tool.__get__(agent, MiniClaudeAgent)
+
+    result = agent._llm_tool_cycle(max_iterations=1)
+
+    assert "runtime stop" in result
+    tool_results = _tool_messages(agent)
+    assert len(tool_results) == 1
+    assert tool_results[0].tool_call_id == "control-call"
+    assert "[UNKNOWN]" in tool_results[0].content
+    events = [data for event, data in agent.recorded_events if event == "tool_result"]
+    assert [event["outcome"] for event in events] == ["UNKNOWN"]
+    assert agent.trace.end_task.call_args.args[0] == "CIRCUIT_BROKEN"
 
 
 def test_same_response_duplicate_is_skipped_with_its_own_result(make_agent):

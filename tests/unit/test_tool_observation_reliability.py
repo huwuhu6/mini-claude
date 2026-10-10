@@ -12,7 +12,7 @@ SRC = Path(__file__).resolve().parents[2] / "src"
 if str(SRC) not in sys.path:
     sys.path.insert(0, str(SRC))
 
-from agent.mini_claude_agent import MiniClaudeAgent
+from agent.mini_claude_agent import MiniClaudeAgent, ToolDispatchStatus
 from core.runtime_context.observation import ObservationNormalizer
 from core.runtime_context.shell_session import ShellSession
 from core.runtime_context.workspace_authority import WorkspaceAuthority
@@ -339,7 +339,8 @@ def test_broad_search_omits_agent_runtime_data_but_explicit_paths_are_allowed(tm
 def test_search_code_schema_and_tool_descriptions_state_actual_contract():
     agent = object.__new__(MiniClaudeAgent)
     agent.feature_manager = type(
-        "FeatureStub", (), {"filter_tools": staticmethod(lambda tools: tools)}
+        "FeatureStub", (), {"filter_tools": staticmethod(lambda tools: tools),
+         "is_tool_enabled": staticmethod(lambda _name: True)}
     )()
     agent.tool_registry = ToolRegistry()
     agent._register_tools()
@@ -362,7 +363,8 @@ def test_search_code_schema_and_tool_descriptions_state_actual_contract():
 def test_file_observation_handlers_preserve_toolresult_metadata():
     agent = object.__new__(MiniClaudeAgent)
     agent.feature_manager = type(
-        "FeatureStub", (), {"filter_tools": staticmethod(lambda tools: tools)}
+        "FeatureStub", (), {"filter_tools": staticmethod(lambda tools: tools),
+         "is_tool_enabled": staticmethod(lambda _name: True)}
     )()
     agent.tool_registry = ToolRegistry()
     agent._register_tools()
@@ -389,5 +391,8 @@ def test_file_observation_handlers_preserve_toolresult_metadata():
         ("count_occurrences", {"patterns": ["needle"]}),
         ("list_files", {}),
     ]:
-        assert agent._execute_tool(name, args) is expected
-        assert agent._execute_tool(name, args).output_visibility == facts
+        first = agent._execute_tool(name, args)
+        second = agent._execute_tool(name, args)
+        assert first.status is ToolDispatchStatus.DISPATCHED
+        assert first.value is expected
+        assert second.value.output_visibility == facts
