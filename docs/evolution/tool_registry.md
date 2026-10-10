@@ -92,7 +92,7 @@ Windows 的完整 Context audit 测试仍受系统 pytest 临时目录 ACL 阻�
 
 ## 2026-10-10：主 Agent dispatch 前复查 Feature 能力
 
-Commit: `PENDING`
+Commit: `3f61cee`
 Commit Description: `fix: 在主 Agent 工具 dispatch 前复查 Feature 能力`
 
 ### Description
