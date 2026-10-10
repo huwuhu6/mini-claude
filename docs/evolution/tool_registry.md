@@ -113,8 +113,8 @@ Windows Python `3.14.3` 上，工具批次闭环、ToolRegistry、工具观察�
 
 ## 2026-10-10：显式维护主 Agent Run 与工具批次进度
 
-Commit: `PENDING`
-Commit Description: `refactor: 显式维护主 Agent Run 与工具批次状态`
+Commit: `a3ef6b3`
+Commit Description: `refactor: 显式维护主 Agent Run 与进程内工具批次继续执行`
 
 ### Description
 
@@ -161,8 +161,8 @@ Windows Python `3.14.3` 上，新增 ShellSession 状态测试及 RuntimeContext
 
 ## 2026-10-10：第四阶段审查修复六项执行边界问题
 
-Commit: `PENDING`
-Commit Description: `fix: 修复运行初始化、批次收尾与工具执行分类边界`
+Commit: `a3ef6b3`
+Commit Description: `refactor: 显式维护主 Agent Run 与进程内工具批次继续执行`
 
 ### Description
 
@@ -185,3 +185,14 @@ Windows Bash 的 start 路由曾绕过 background Feature。后台队列和主 A
 ### Decision / Limitation
 
 保留原 RunState、ToolBatchState 和同进程继续执行设计，只增加批次收尾标记及必要的小型辅助入口，没有持久化、审批或新的状态机。测试覆盖明确的同步故障注入边界，不证明任意字节码位置的异步中断、内存耗尽、持续日志/消息写入故障或跨进程恢复具备事务一致性；这些不能直接从当前测试通过推导出来。完整单测仍非全绿，四项既有/检出环境问题保持可见，未扩大到 Evaluation 或 schema 清理。
+
+
+### 提交后的独立最终审查（2026-10-10）
+
+第四阶段已在功能分支提交为 `a3ef6b3`，此前未跟踪的 RunState 和状态测试文件均在该提交中作为新增文件入库。对实际提交补丁的空白检查通过。
+
+此次重新检查批次收尾标记的提交顺序、初始化中断治理及 Tool Result / Call ID 关联，没有再次扩大到全仓扫描。收尾标记只在待写反馈耗尽后设置，最后调用后的继续入口先完成收尾再请求模型；初始化中断原样传播，新 Run 终结，尚未 dispatch 的继续入口保留暂停状态；每次调用的结果临时值独立，异常闭合保留已写结果而不重放工具。
+
+对已提交代码重新运行定向回归为 163 passed、2 skipped。另运行 7 项不写源码的独立内存故障注入：Tool Result 已写入后的游标推进前/后普通异常及 KeyboardInterrupt、下一模型请求前 finalized 与 REPLAN 写回检查，以及新 Run/继续入口的 SystemExit 原对象传播，均通过。未发现此次限定范围内的阻塞项；这不代表任意异步中断或持续写入故障具有事务保证。
+
+决定冻结第四阶段功能实现，暂缓合并 main，不推送。此前完整单测的四项基线/检出环境失败继续保留，跨平台验证可以后续独立处理，不混入 RunState 功能提交。Checkpoint 持久化和 HITL 审批留待后续获准的阶段。
