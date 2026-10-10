@@ -2,7 +2,12 @@
 from __future__ import annotations
 
 from dataclasses import dataclass
+from inspect import signature
 from typing import Any, Callable, Dict, List
+
+
+class ToolArgumentBindingError(TypeError):
+    """Arguments rejected before entering a registered handler."""
 
 
 @dataclass
@@ -43,4 +48,15 @@ class ToolRegistry:
             spec = self._tools[name]
         except KeyError:
             raise KeyError(f"Unknown tool: {name}") from None
+        try:
+            handler_signature = signature(spec.handler)
+        except (TypeError, ValueError):
+            # Some native callables have no inspectable signature. Do not infer
+            # argument rejection from a TypeError raised during their execution.
+            handler_signature = None
+        if handler_signature is not None:
+            try:
+                handler_signature.bind(**args)
+            except TypeError as exc:
+                raise ToolArgumentBindingError(str(exc)) from exc
         return spec.handler(**args)

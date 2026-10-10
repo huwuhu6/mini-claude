@@ -111,6 +111,31 @@ Windows Python `3.14.3` 上，工具批次闭环、ToolRegistry、工具观察�
 
 后续 HITL 可在同一 dispatch 边界返回显式 pending/control 状态，由 `_llm_tool_cycle()` 决定暂停，并保留原 Tool Call 为待处理状态；必须避免把 pending 转成终结 Tool Result。本阶段没有实现该状态，也没有持久化或 Resume。
 
+## 2026-10-10：显式维护主 Agent Run 与工具批次进度
+
+Commit: `PENDING`
+Commit Description: `refactor: 显式维护主 Agent Run 与工具批次状态`
+
+### Description
+
+主 Agent 在 `_llm_tool_cycle()` 中用局部变量维护模型轮次、无工具重试、当前 Tool Call、批次去重集合、已写回的调用 ID 和延迟的 REPLAN 消息。局部变量随调用栈结束而消失；若运行时需要在工具之间安全暂停，直接再次进入原循环会重置 Runtime Policy 和 Trace，并重新请求模型，不能可靠地从已有响应继续。
+
+本阶段新增进程内 `RunState` 和 `ToolBatchState`。Run 保存稳定的 Run ID、模型轮次预算、require-tool-call 与重试状态，并关联其 Trace task ID；当前批次保存原始有序 Tool Calls、原 Assistant 消息位置、执行游标、结果、重复签名及延迟重规划消息。公开 `run()` 仍表示新任务；内部 `_continue_run()` 只接受已暂停 Run，不追加用户消息、不重置 Todo / Runtime Policy / Trace，也不重新请求 LLM 来生成待处理调用。恢复批次时跳过压缩和工具链清理，按原顺序从游标继续，并在每次 dispatch 时沿用当前 Feature 能力校验。
+
+暂停信号只在调用结果写入后生效。暂停调用本身不被伪造成失败或 NOT_EXECUTED；已完成结果保留，尚未开始的原始调用仍挂在批次上。若最后一个调用刚好完成，Run 仍会停在下一次模型请求之前，继续时才进入新模型轮次。若 handler 已返回明确结果但消息 append 失败，终止闭环会补写该已知结果而不重跑工具；只有 handler 已进入执行阶段却未返回结果时才记为 UNKNOWN。运行中禁止开始新 Run；有活动 Run 时手动压缩和清空历史都会被拒绝，自动压缩在有待处理调用时不运行。HARD_STOP、取消和异常仍终止当前 Run；闭环会将已有和终止反馈写入批次结果，并将不可继续批次的游标收敛到末尾，避免终止状态暴露成可恢复的 pending 调用。
+
+本状态仅属于一个 Agent 实例的内存，不是跨进程 Checkpoint。RunState 的 Run ID 与 TraceManager 独立分配的 Trace task ID 分开保存，并通过 Session Recorder 事件关联；Session Recorder 另有自身 Session ID，只记录生命周期。Todo、消息、Runtime Policy 历史、压缩对象、ShellSession 和后台对象仍由现有模块持有，没有尝试序列化整个 Agent。
+
+### Result / Evidence
+
+Windows Python `3.14.3` 上，RunState 与工具批次定向测试 `28 passed`；扩展的 Runtime、CLI、ToolRegistry、Headless、Provider 输出限制及 Runtime Context 回归为 `121 passed`。测试覆盖三调用批次在 A 后暂停并从 B/C 继续、没有为恢复批次额外请求模型、A 不重放、保持 Todo / 执行预算 / AttemptHistory / Trace、压缩和清空保护、重复签名、运行时重新检查 Feature、最后一个调用后的暂停、独立 Run 的调用身份隔离、Tool Result 写入失败后保留 handler 已返回的真实结果，以及批次闭环和终止状态。未调用真实 Provider。
+
+最终完整 `tests/unit` 为 `310 passed, 12 skipped, 4 failed`。其中 Provider parse-error fixture 和 read_file schema 文本断言在未修改的 main 上也失败；两个 Reference Variant 测试在本 Worktree 受 CRLF 影响，main 上通过。Reference Variant helper 只在系统临时目录复制 fixture 并修改待测实现文件，任务目录中的 oracle 哈希在测试前后保持不变。
+
+### Decision / Limitation
+
+保留单个轻量 RunState 和当前 ToolBatchState，不抽象成工作流框架，也不落数据库。暂停只能由进程内控制信号在工具调用完成边界产生；没有实现审批等待、运行中断恢复、跨进程恢复、崩溃后副作用判定或持久化。本轮仍有控制流和工具后处理局部变量，但它们只服务于当前同步调用；终止异常不会被伪装成可继续状态。未来 SQLite Checkpoint 仍需定义原子保存边界和 UNKNOWN 恢复策略，不能直接将当前 Python 对象视为持久化格式。
+
 
 ## 2026-10-10：限定 ShellSession 持久 cwd 的确认边界
 
@@ -132,3 +157,31 @@ Windows Python `3.14.3` 上，新增 ShellSession 状态测试及 RuntimeContext
 ### Decision / Limitation
 
 本阶段为避免猜测而收紧兼容行为：`cd src && command` 仍会在同一次子 Shell 中正常执行，但不会把 `src` 写入跨调用逻辑 cwd；跨调用目录导航使用单独的纯 `cd`。ShellSession 的 cwd 仍不是 Shell 沙箱；它本身不授予 WorkspaceAuthority 权限。未来恢复必须依据当前 Runtime 的授权重新验证目录，不保存或恢复旧权限、进程环境和命令历史。 Windows CMD 的标记扫描现将 && 保持为双字符运算符，同时继续对独立 & 插入分段标记。
+
+
+## 2026-10-10：第四阶段审查修复六项执行边界问题
+
+Commit: `PENDING`
+Commit Description: `fix: 修复运行初始化、批次收尾与工具执行分类边界`
+
+### Description
+
+审查发现，最后一个工具调用完成后暂停时，批次已经没有待执行调用，但延后的重规划提示还没有进入消息历史；继续入口会直接请求模型，丢失提示。因此将“调用执行完成”与“批次收尾完成”分开记录，继续时先完成收尾再请求模型。收尾只消费已经实际追加的提示，写入前后中断都不会重复反馈。
+
+初始化原本位于循环异常处理之外，失败或中断可能遗留 RUNNING。现在新任务初始化失败后进入 FAILED，KeyboardInterrupt 等中断进入 CANCELLED；原异常继续向调用方传播。继续入口在 dispatch 前初始化失败时恢复 PAUSED，保留原调用和预算，不自动重试。保护只覆盖初始化，不将执行异常恢复成可继续状态。
+
+重复调用的异常闭合曾引用上一调用的结果文本，现在每次调用清空结果临时值，跳过反馈和异常补齐共用当前调用的文本。Registry 在 handler 调用前绑定可检查的 Python 签名，用专门的绑定错误区别尚未进入 handler 与 handler 内部 TypeError；后者仍为执行失败，前者的最终结果为 INVALID_ARGUMENTS。无法检查签名的外部 callable 不根据 TypeError 推测参数错误。
+
+Windows Bash 的 start 路由曾绕过 background Feature。后台队列和主 Agent 公共后台 API 现在复用当前能力映射进行启动前检查，保留正常返回形式；原始 BackgroundProcessor 仍是独立底层入口，没有获得 Main Agent 的策略所有权。POSIX cd 快捷路径对未引用 # 保守退回真实 Shell，不推断子 Shell 的持久 cwd；引用或转义的 # 和普通路径仍可按独立字面 cd 处理。
+
+### Result / Evidence
+
+先在未修复的第四阶段实现上复现六类问题，再修改生产代码。Windows Python 3.14.3 新增 55 个参数化回归用例，验证最后调用后暂停与重规划、收尾写入前后中断、初始化各入口、消息写入前后错误与取消、重复调用结果关联、参数绑定与 handler 内部错误、后台启动能力及 POSIX 注释/引用。扩展定向回归为 206 passed、12 skipped，包含 LoopController integration；最终完整 tests/unit 为 365 passed、12 skipped、4 failed。没有真实模型调用。
+
+四项失败逐一复核：Provider parse-error 测试的配置 fixture 缺少 provider 等字段，main 上也在初始化失败；read_file schema 文本断言在 main 上同样失败，真实 schema 仍有 start_line/end_line 参数和范围说明，未修改生产接口或断言。两个 Reference Variant 在 main 上通过，本 Worktree 的 oracle 为 CRLF，而提交文件及预期哈希对应 LF；仅归一化换行后内容一致。测试只复制 fixture 到系统临时目录并修改待测实现，测试前后 oracle 字节哈希保持不变，没有修改参考答案。
+
+4 项真实 Shell 对照在隔离目录使用 Windows Git Bash 通过，覆盖注释、未引用 #、引用 # 与普通路径；这不代表 Linux 全套验证已完成。其余平台相关跳过仍需 Linux/CI 环境补齐。
+
+### Decision / Limitation
+
+保留原 RunState、ToolBatchState 和同进程继续执行设计，只增加批次收尾标记及必要的小型辅助入口，没有持久化、审批或新的状态机。测试覆盖明确的同步故障注入边界，不证明任意字节码位置的异步中断、内存耗尽、持续日志/消息写入故障或跨进程恢复具备事务一致性；这些不能直接从当前测试通过推导出来。完整单测仍非全绿，四项既有/检出环境问题保持可见，未扩大到 Evaluation 或 schema 清理。

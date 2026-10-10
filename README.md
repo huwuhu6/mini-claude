@@ -260,7 +260,7 @@ CLI
 ## 已知问题与边界
 
 - 项目仍是单机、单进程为主的 runtime，不承诺生产级并发、分布式队列或多租户隔离。
-- 当前对话状态主要保存在进程内；进程异常退出后，完整 LLM 对话上下文不会自动恢复。
+- 当前暂停与继续执行仅限同一进程、同一 Agent 实例。`RunState` 未持久化，进程正常退出或崩溃后无法继续原 Run；尚未实现持久化 Checkpoint、跨进程 Resume 或 HITL 审批。Trace 与 Session Recorder 是诊断记录，不是可恢复的执行快照。
 - `s_full.py` 作为历史实现保留；当前正式 Agent Runtime 位于 `src/agent/mini_claude_agent.py`。
 - `src/core/compression.py` 使用 `tiktoken` 做 estimated token 估算；包未安装或编码资源初始化失败时会安全回退到粗略估算，不提供 provider-specific tokenizer。Provider 返回的 `usage.prompt_tokens` 才是实际请求用量。
 - 评测结果中的过程指标用于工程分析，不等同于通用 Agent 能力排名。

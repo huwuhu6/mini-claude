@@ -24,6 +24,7 @@ from core.loop_controller import (
 )
 from core.runtime_context.observation import ObservationNormalizer
 from core.tools.base_tools import ToolResult
+from models.todo import TodoManager
 from providers.base import Message
 from providers.deepseek import DeepseekProvider
 
@@ -229,7 +230,7 @@ def test_feature_disabled_after_model_response_is_blocked_with_closed_tool_resul
 
 
 def test_runtime_control_exception_reaches_loop_without_becoming_tool_failure(make_agent):
-    agent, _completions = make_agent([
+    agent, completions = make_agent([
         _response(tool_calls=[_call(
             "control-call", '{"command":"echo ok"}', name="bash",
         )]),
@@ -263,6 +264,12 @@ def test_runtime_control_exception_reaches_loop_without_becoming_tool_failure(ma
     events = [data for event, data in agent.recorded_events if event == "tool_result"]
     assert [event["outcome"] for event in events] == ["UNKNOWN"]
     assert agent.trace.end_task.call_args.args[0] == "CIRCUIT_BROKEN"
+    assert agent._run_state.status.value == "terminated"
+    assert agent._run_state.tool_batch.results["control-call"].outcome == "UNKNOWN"
+    assert len(completions.requests) == 1
+    assert "runtime stop" in agent._continue_run()
+    assert agent._run_state.tool_batch.results["control-call"].outcome == "UNKNOWN"
+    assert len(completions.requests) == 1
 
 
 def test_same_response_duplicate_is_skipped_with_its_own_result(make_agent):
@@ -589,6 +596,74 @@ def test_post_dispatch_exception_keeps_received_result_and_closes_remaining(
     )
     assert completed_result["outcome"] == "EXECUTED_SUCCESS"
     assert completed_result["result"] == "real tool result"
+    state = agent._run_state
+    assert state.status.value == "failed"
+    assert state.tool_batch.status.value == "failed"
+    assert state.tool_batch.next_call_index == 2
+    assert state.tool_batch.pending_call_ids == []
+    assert state.tool_batch.results["completed"].content == "real tool result"
+    assert state.tool_batch.results["completed"].outcome == "EXECUTED_SUCCESS"
+    assert state.tool_batch.results["later"].outcome == "NOT_EXECUTED"
+    assert agent._continue_run() == result
+    assert executed == ["needle"]
+    assert len(completions.requests) == 1
+
+
+def test_tool_result_append_failure_preserves_known_dispatch_result(
+    make_agent, monkeypatch,
+):
+    from agent.mini_claude_agent import Compressor
+
+    monkeypatch.setattr(
+        Compressor, "_clean_tool_chains", staticmethod(lambda messages: messages),
+    )
+    agent, completions = make_agent([
+        _response(tool_calls=[_call("completed"), _call("later", '{"patterns":["later"]}')]),
+        _response(content="must not be requested"),
+    ])
+
+    class FailFirstToolAppend(list):
+        def __init__(self, values):
+            super().__init__(values)
+            self.failed = False
+
+        def append(self, message):
+            if message.role == "tool" and not self.failed:
+                self.failed = True
+                raise OSError("injected Tool Result append failure")
+            super().append(message)
+
+    agent.messages = FailFirstToolAppend(agent.messages)
+    executed = []
+    agent._execute_tool = lambda _name, args: executed.append(
+        args["patterns"][0]
+    ) or "known result"
+
+    result = agent._llm_tool_cycle()
+
+    tool_messages = _tool_messages(agent)
+    state = agent._run_state
+    assert "injected Tool Result append failure" in result
+    assert executed == ["needle"]
+    assert len(completions.requests) == 1
+    assert [message.tool_call_id for message in tool_messages] == [
+        "completed", "later",
+    ]
+    assert tool_messages[0].content == "known result"
+    assert state.tool_batch.results["completed"].outcome == "EXECUTED_SUCCESS"
+    assert state.tool_batch.results["later"].outcome == "NOT_EXECUTED"
+    recovered_events = [
+        data for event, data in agent.recorded_events
+        if event == "tool_result" and data.get("call_id") == "completed"
+    ]
+    assert len(recovered_events) == 1
+    assert recovered_events[0]["outcome"] == "EXECUTED_SUCCESS"
+    assert state.tool_batch.next_call_index == 2
+    assert state.tool_batch.pending_call_ids == []
+    assert state.status.value == "failed"
+    assert agent._continue_run() == result
+    assert executed == ["needle"]
+    assert len(completions.requests) == 1
 
 
 def test_normal_calls_keep_order_and_next_openai_request_has_closed_batch(make_agent):
@@ -612,3 +687,681 @@ def test_normal_calls_keep_order_and_next_openai_request_has_closed_batch(make_a
     assert [call["id"] for call in assistant["tool_calls"]] == ["one", "two"]
     assert [result["tool_call_id"] for result in results] == ["one", "two"]
     assert [result["role"] for result in results] == ["tool", "tool"]
+
+
+def test_paused_batch_continues_from_next_call_without_restarting_run(make_agent, monkeypatch):
+    from agent.mini_claude_agent import Compressor
+
+    agent, completions = make_agent([
+        _response(content="I will use a tool."),
+        _response(tool_calls=[
+            _call("A", '{"label":"A"}'),
+            _call("B", '{"label":"B"}'),
+            _call("C", '{"label":"C"}'),
+        ]),
+        _response(content="done"),
+    ])
+    agent.messages = []
+    todo = TodoManager()
+    reset_calls = []
+    todo_reset = todo.reset
+
+    def count_reset():
+        reset_calls.append(True)
+        todo_reset()
+
+    todo.reset = count_reset
+    agent.todo = todo
+    note = SimpleNamespace(content="note before pause")
+    agent.agent_note = note
+    _queue_governance(agent, [
+        RuntimeDecision.REPLAN,
+        RuntimeDecision.ALLOW,
+        RuntimeDecision.ALLOW,
+    ])
+    executed = []
+    cleaned_batches = []
+    clean_tool_chains = Compressor._clean_tool_chains
+
+    def track_clean(messages):
+        for index, message in enumerate(messages):
+            if message.role != "assistant" or not message.tool_calls:
+                continue
+            call_ids = {call["id"] for call in message.tool_calls}
+            result_ids = {
+                item.tool_call_id
+                for item in messages[index + 1:]
+                if item.role == "tool" and item.tool_call_id
+            }
+            assert call_ids <= result_ids
+            cleaned_batches.append(call_ids)
+        return clean_tool_chains(messages)
+
+    monkeypatch.setattr(Compressor, "_clean_tool_chains", staticmethod(track_clean))
+
+    def execute(_name, args):
+        label = args["label"]
+        executed.append(label)
+        if label == "A":
+            note.content = "note preserved across pause"
+            todo.update([{
+                "content": "Keep this plan while paused",
+                "status": "in_progress",
+                "activeForm": "Keeping the plan",
+            }])
+            agent.runtime_policy.history.record(
+                turn=1,
+                tool_name="pause_marker",
+                intent_key="pause-marker",
+                args_fingerprint="pause-marker",
+                status=AttemptStatus.SUCCESS,
+            )
+            agent._request_run_pause()
+        return ToolResult(content=f"result-{label}", success=True)
+
+    agent._execute_tool = execute
+    pause_result = agent.run("test task", require_tool_call=True)
+
+    assert "暂停" in pause_result
+    state = agent._run_state
+    assert state.status.value == "paused"
+    assert state.model_turns_used == 2
+    assert state.no_tool_retry_count == 1
+    assert state.require_tool_call is True
+    assert state.tool_call_seen is True
+    assert state.tool_batch.next_call_index == 1
+    assert list(state.tool_batch.results) == ["A"]
+    assert executed == ["A"]
+    assert len(completions.requests) == 2
+    assert [message.tool_call_id for message in _tool_messages(agent)] == ["A"]
+    assert agent.todo.items[0]["content"] == "Keep this plan while paused"
+    assert agent.agent_note is note
+    assert agent.agent_note.content == "note preserved across pause"
+    assert reset_calls == [True]
+    assert cleaned_batches == []
+    assert agent.trace.end_task.call_count == 0
+    metrics_identity = id(agent.last_metrics)
+    attempt_history = agent.runtime_policy.history.all()
+    trace_task_identity = agent.trace.current_task
+
+    final_result = agent._continue_run()
+
+    assert final_result == "done"
+    assert executed == ["A", "B", "C"]
+    assert len(completions.requests) == 3
+    assert state.model_turns_used == 3
+    assert agent._run_state is state
+    assert id(agent.last_metrics) == metrics_identity
+    assert agent.todo.items[0]["content"] == "Keep this plan while paused"
+    assert agent.agent_note is note
+    assert agent.agent_note.content == "note preserved across pause"
+    assert reset_calls == [True]
+    assert agent.runtime_policy.history.all()[:len(attempt_history)] == attempt_history
+    assert agent.trace.start_task.call_count == 1
+    assert agent.trace.current_task is trace_task_identity
+    assert agent.trace.end_task.call_count == 1
+    assert state.run_id != state.trace_task_id
+    assert state.trace_task_id == "task-test"
+    assert agent.trace.start_task.call_args.kwargs.get("task_id") != state.run_id
+    assert state.tool_batch.status.value == "completed"
+    assert state.status.value == "completed"
+    assert len(cleaned_batches) == 2
+    user_messages = [message.content for message in agent.messages if message.role == "user"]
+    assert user_messages.count("test task") == 1
+    assert sum("不要只描述计划" in content for content in user_messages) == 1
+    assert sum("重新规划" in content for content in user_messages) == 1
+
+    payload = completions.requests[2]["messages"]
+    assistant_index = next(
+        index for index, message in enumerate(payload)
+        if message.get("role") == "assistant" and message.get("tool_calls")
+    )
+    assistant = payload[assistant_index]
+    results = payload[assistant_index + 1:assistant_index + 4]
+    assert [call["id"] for call in assistant["tool_calls"]] == ["A", "B", "C"]
+    assert [result["tool_call_id"] for result in results] == ["A", "B", "C"]
+    assert [result["content"] for result in results] == [
+        "result-A", "result-B", "result-C",
+    ]
+    assert payload[assistant_index + 4]["role"] == "user"
+    assert "重新规划" in payload[assistant_index + 4]["content"]
+
+    assert agent._continue_run() == "done"
+    assert len(completions.requests) == 3
+    assert executed == ["A", "B", "C"]
+    assert [event for event, _data in agent.recorded_events].count("run_started") == 1
+    assert [event for event, _data in agent.recorded_events].count("run_continued") == 1
+    assert [event for event, _data in agent.recorded_events].count("final") == 1
+    trace_link = next(
+        data for event, data in agent.recorded_events if event == "run_trace_link"
+    )
+    assert trace_link == {
+        "run_id": state.run_id,
+        "trace_task_id": state.trace_task_id,
+    }
+
+
+def test_pause_after_final_call_waits_before_next_model_request(make_agent):
+    agent, completions = make_agent([
+        _response(tool_calls=[_call("only")]),
+        _response(content="done"),
+    ])
+    agent.messages = []
+    agent.todo = TodoManager()
+    _queue_governance(agent, [RuntimeDecision.ALLOW])
+    executed = []
+
+    def execute(_name, _args):
+        executed.append("only")
+        agent._request_run_pause()
+        return "one result"
+
+    agent._execute_tool = execute
+
+    pause_result = agent.run("test task")
+
+    assert "暂停" in pause_result
+    assert len(completions.requests) == 1
+    assert executed == ["only"]
+    assert agent._run_state.status.value == "paused"
+    assert agent._run_state.tool_batch.status.value == "completed"
+    assert [message.tool_call_id for message in _tool_messages(agent)] == ["only"]
+
+    assert agent._continue_run() == "done"
+
+    assert len(completions.requests) == 2
+    assert executed == ["only"]
+    assert agent._run_state.status.value == "completed"
+
+
+def test_new_run_is_rejected_while_a_tool_batch_is_paused(make_agent):
+    agent, _completions = make_agent([
+        _response(tool_calls=[_call("A"), _call("B", '{"patterns":["second"]}')]),
+    ])
+    agent.messages = []
+    agent.todo = TodoManager()
+    _queue_governance(agent, [RuntimeDecision.ALLOW] * 2)
+    executed = []
+
+    def execute(_name, args):
+        executed.append(args["patterns"][0])
+        agent.todo.update([{
+            "content": "Preserve paused todo",
+            "status": "in_progress",
+            "activeForm": "Preserving paused todo",
+        }])
+        agent._request_run_pause()
+        return "ok"
+
+    agent._execute_tool = execute
+    agent.run("first task")
+    state = agent._run_state
+    message_count = len(agent.messages)
+    todo_items = list(agent.todo.items)
+
+    result = agent.run("second task")
+
+    assert "尚未完成" in result
+    assert agent._run_state is state
+    assert len(agent.messages) == message_count
+    assert agent.todo.items == todo_items
+    assert executed == ["needle"]
+
+
+def test_pending_batch_disables_automatic_and_manual_compression(make_agent):
+    from cli.commands import _clear, _compact
+
+    agent, _completions = make_agent([_response(tool_calls=[_call("A"), _call("B")])])
+    agent.messages = []
+    agent.todo = TodoManager()
+    _queue_governance(agent, [RuntimeDecision.ALLOW] * 2)
+    compress_calls = []
+    agent.feature_manager = SimpleNamespace(is_enabled=lambda _name: True)
+    agent.compressor = SimpleNamespace(
+        compress=lambda messages: compress_calls.append("manual") or messages,
+        estimate_tokens=lambda _messages: 0,
+        estimate_prompt_tokens=lambda *_args, **_kwargs: 0,
+        should_compress=lambda *_args, **_kwargs: True,
+        should_microcompact=lambda *_args, **_kwargs: False,
+        has_microcompact_work=lambda _messages: True,
+    )
+    agent._execute_tool = lambda *_args: (
+        agent._request_run_pause() or "A result"
+    )
+
+    agent.run("test task")
+    assert agent._check_auto_compress(999999) is False
+    assert "未完成" in _compact(agent, [], {})
+    messages_before_clear = list(agent.messages)
+    assert "未完成" in _clear(agent, [], {})
+    assert agent.messages == messages_before_clear
+    assert compress_calls == []
+    assert [message.tool_call_id for message in _tool_messages(agent)] == ["A"]
+
+
+def test_duplicate_signature_survives_pause_and_is_not_redispatched(make_agent):
+    agent, completions = make_agent([
+        _response(tool_calls=[
+            _call("A", '{"patterns":["same"]}'),
+            _call("B", '{"patterns":["same"]}'),
+        ]),
+        _response(content="done"),
+    ])
+    agent.messages = []
+    agent.todo = TodoManager()
+    _queue_governance(agent, [RuntimeDecision.ALLOW])
+    executed = []
+
+    def execute(_name, args):
+        executed.append(args["patterns"][0])
+        agent._request_run_pause()
+        return "first result"
+
+    agent._execute_tool = execute
+    agent.run("test task")
+    assert agent._run_state.tool_batch.seen_signatures
+    assert agent._run_state.tool_batch.pending_call_ids == ["B"]
+
+    assert agent._continue_run() == "done"
+
+    assert executed == ["same"]
+    assert len(completions.requests) == 2
+    assert [message.tool_call_id for message in _tool_messages(agent)] == ["A", "B"]
+    assert "[SKIPPED_DUPLICATE]" in _tool_messages(agent)[1].content
+    assert agent._run_state.tool_batch.results["B"].outcome == "SKIPPED_DUPLICATE"
+
+
+def test_resumed_calls_recheck_current_feature_capability(make_agent):
+    agent, completions = make_agent([
+        _response(tool_calls=[
+            _call("A", '{"command":"A"}', name="bash"),
+            _call("B", '{"command":"B"}', name="bash"),
+            _call("C", '{"command":"C"}', name="bash"),
+        ]),
+        _response(content="done"),
+    ])
+    agent.messages = []
+    agent.todo = TodoManager()
+    features = FeatureManager()
+    features.register_feature(FeatureDefinition(name="bash", enabled=True))
+    features.register_tool_for_feature("bash", "bash")
+    registry = ToolRegistry()
+    executed = []
+
+    def execute(command):
+        executed.append(command)
+        if command == "A":
+            features.disable("bash")
+            agent._request_run_pause()
+        return ToolResult(content=f"result-{command}", success=True)
+
+    registry.register(ToolSpec(
+        name="bash",
+        description="mock shell",
+        input_schema={
+            "type": "object",
+            "properties": {"command": {"type": "string"}},
+            "required": ["command"],
+        },
+        handler=execute,
+    ))
+    agent.feature_manager = features
+    agent.tool_registry = registry
+    agent._get_llm_tools = lambda: features.filter_tools(registry.definitions())
+    agent._execute_tool = MiniClaudeAgent._execute_tool.__get__(agent, MiniClaudeAgent)
+    _queue_governance(agent, [RuntimeDecision.ALLOW] * 3)
+
+    agent.run("test task")
+    assert executed == ["A"]
+    assert agent._run_state.tool_batch.pending_call_ids == ["B", "C"]
+
+    assert agent._continue_run() == "done"
+
+    assert executed == ["A"]
+    assert len(completions.requests) == 2
+    assert [message.tool_call_id for message in _tool_messages(agent)] == ["A", "B", "C"]
+    assert agent._run_state.tool_batch.results["A"].outcome == "EXECUTED_SUCCESS"
+    assert agent._run_state.tool_batch.results["B"].outcome == "BLOCKED_FEATURE_DISABLED"
+    assert agent._run_state.tool_batch.results["C"].outcome == "BLOCKED_FEATURE_DISABLED"
+
+
+def test_pending_batch_finishes_without_provider_before_next_model_turn(make_agent):
+    agent, completions = make_agent([
+        _response(tool_calls=[
+            _call("A", '{"label":"A"}'),
+            _call("B", '{"label":"B"}'),
+        ]),
+    ])
+    agent.messages = []
+    agent.todo = TodoManager()
+    _queue_governance(agent, [RuntimeDecision.ALLOW] * 2)
+    executed = []
+
+    def execute(_name, args):
+        executed.append(args["label"])
+        if args["label"] == "A":
+            agent._request_run_pause()
+        return f"result-{args['label']}"
+
+    agent._execute_tool = execute
+    agent.run("test task")
+    agent.provider_manager.get_primary_provider = lambda: None
+
+    result = agent._continue_run()
+
+    assert "没有可用的 LLM 提供者" in result
+    assert executed == ["A", "B"]
+    assert len(completions.requests) == 1
+    assert [message.tool_call_id for message in _tool_messages(agent)] == ["A", "B"]
+    assert agent._run_state.tool_batch.status.value == "completed"
+    assert agent._continue_run() == result
+    assert executed == ["A", "B"]
+
+
+def test_separate_runs_do_not_share_batch_cursor_or_tool_call_identity(make_agent):
+    agent, completions = make_agent([
+        _response(tool_calls=[_call("reused-id")]),
+        _response(content="first done"),
+        _response(tool_calls=[_call("reused-id")]),
+        _response(content="second done"),
+    ])
+    agent.messages = []
+    agent.todo = TodoManager()
+    _queue_governance(agent, [RuntimeDecision.ALLOW, RuntimeDecision.ALLOW])
+    executed = []
+    agent._execute_tool = lambda _name, _args: executed.append("call") or "ok"
+
+    assert agent.run("first task") == "first done"
+    first_state = agent._run_state
+    first_batch = first_state.tool_batch
+    assert first_batch.next_call_index == 1
+
+    assert agent.run("second task") == "second done"
+    second_state = agent._run_state
+
+    assert second_state.run_id != first_state.run_id
+    assert second_state.tool_batch is not first_batch
+    assert second_state.tool_batch.next_call_index == 1
+    assert first_batch.results["reused-id"].content == "ok"
+    assert second_state.tool_batch.results["reused-id"].content == "ok"
+    assert executed == ["call", "call"]
+    assert len(completions.requests) == 4
+
+
+@pytest.mark.parametrize("replan", [True, False])
+def test_last_call_pause_finishes_replan_before_next_request(make_agent, replan):
+    agent, completions = make_agent([
+        _response(tool_calls=[_call("last")]), _response(content="done"),
+    ])
+    _queue_governance(agent, [RuntimeDecision.REPLAN if replan else RuntimeDecision.ALLOW])
+    executions = []
+    def execute(_name, _args):
+        executions.append("last")
+        agent._request_run_pause()
+        return "last-result"
+    agent._execute_tool = execute
+    agent._llm_tool_cycle()
+    batch = agent._run_state.tool_batch
+    assert batch.next_call_index == 1
+    assert batch.results["last"].content == "last-result"
+    assert len(completions.requests) == 1
+    assert agent._continue_run() == "done"
+    assert agent._continue_run() == "done"
+    payload = completions.requests[1]["messages"]
+    tool_index = next(i for i, m in enumerate(payload) if m.get("tool_call_id") == "last")
+    replans = [m for m in payload if "Progress Governance" in (m.get("content") or "")]
+    assert len(replans) == int(replan)
+    if replan:
+        assert payload[tool_index + 1] == replans[0]
+    assert batch.pending_replan_messages == []
+    assert executions == ["last"]
+    assert len(completions.requests) == 2
+
+
+@pytest.mark.parametrize("entry", ["run", "cycle", "continue"])
+@pytest.mark.parametrize("error_type", [RuntimeError, KeyboardInterrupt])
+def test_initialization_failure_has_recoverable_lifecycle(make_agent, entry, error_type):
+    agent, completions = make_agent([
+        _response(tool_calls=[_call("A"), _call("B", '{"patterns":["B"]}')]),
+        _response(content="done"),
+    ])
+    agent.todo = TodoManager()
+    executed = []
+    def execute(_name, args):
+        executed.append(args["patterns"][0])
+        if len(executed) == 1:
+            agent._request_run_pause()
+        return "result"
+    agent._execute_tool = execute
+    if entry == "continue":
+        agent._llm_tool_cycle()
+        original = agent._run_state
+        before = list(agent.messages)
+    def fail():
+        raise error_type("initialization interrupted")
+    agent._get_llm_tools = fail
+    with pytest.raises(error_type, match="initialization interrupted"):
+        if entry == "run":
+            agent.run("new task")
+        elif entry == "cycle":
+            agent._llm_tool_cycle()
+        else:
+            agent._continue_run()
+    state = agent._run_state
+    assert state.status.value == ("paused" if entry == "continue" else
+                                  "cancelled" if error_type is KeyboardInterrupt else "failed")
+    if entry == "continue":
+        assert state is original
+        assert state.tool_batch.next_call_index == 1
+        assert state.tool_batch.status.value == "paused"
+        assert agent.messages == before
+        agent._get_llm_tools = lambda: []
+        assert agent._continue_run() == "done"
+        assert executed == ["needle", "B"]
+        assert len(completions.requests) == 2
+    else:
+        assert not agent.has_active_run
+        assert len(completions.requests) == 0
+
+
+@pytest.mark.parametrize("error_type", [OSError, KeyboardInterrupt])
+@pytest.mark.parametrize("duplicate", [True, False])
+@pytest.mark.parametrize("after_append", [False, True])
+def test_append_failure_preserves_only_current_call_result(make_agent, monkeypatch, error_type, duplicate, after_append):
+    from agent.mini_claude_agent import Compressor
+    monkeypatch.setattr(Compressor, "_clean_tool_chains", staticmethod(lambda messages: messages))
+    calls = [_call("A"), _call("B", '{"patterns":["needle"]}' if duplicate else '{"patterns":["B"]}'),
+             _call("C", '{"patterns":["C"]}')]
+    agent, completions = make_agent([_response(tool_calls=calls)])
+    class FailAppend(list):
+        failed = False
+        def append(self, message):
+            if message.role == "tool" and message.tool_call_id == "B" and not self.failed:
+                self.failed = True
+                if after_append:
+                    super().append(message)
+                raise error_type("append interrupted")
+            super().append(message)
+    agent.messages = FailAppend(agent.messages)
+    executed = []
+    agent._execute_tool = lambda _name, args: executed.append(args["patterns"][0]) or f"actual-{args['patterns'][0]}"
+    agent._llm_tool_cycle()
+    state = agent._run_state
+    messages = _tool_messages(agent)
+    assert [m.tool_call_id for m in messages] == ["A", "B", "C"]
+    assert messages[0].content == "actual-needle"
+    assert messages[1].content.startswith("[SKIPPED_DUPLICATE]") if duplicate else messages[1].content == "actual-B"
+    assert state.tool_batch.results["B"].content == messages[1].content
+    assert state.tool_batch.results["B"].outcome == ("SKIPPED_DUPLICATE" if duplicate else "EXECUTED_SUCCESS")
+    assert state.tool_batch.results["C"].outcome == "NOT_EXECUTED"
+    assert executed == (["needle"] if duplicate else ["needle", "B"])
+    assert state.status.value == ("cancelled" if error_type is KeyboardInterrupt else "failed")
+    assert len(completions.requests) == 1
+    agent._continue_run()
+    assert len(_tool_messages(agent)) == 3
+
+
+@pytest.mark.parametrize("inside_handler", [True, False])
+def test_type_error_preserves_handler_entry_outcome(make_agent, inside_handler):
+    arguments = '{"path":"sample"}' if inside_handler else '{"unexpected":1}'
+    agent, completions = make_agent([
+        _response(tool_calls=[_call("read", arguments, "read_file")]),
+        _response(content="done"),
+    ])
+    calls = []
+    def handler(path):
+        calls.append(path)
+        raise TypeError("handler failed after entry")
+    agent.feature_manager = FeatureManager()
+    agent.tool_registry = ToolRegistry()
+    agent.tool_registry.register(ToolSpec("read_file", "", {}, handler))
+    agent._llm_tool_cycle()
+    assert calls == (["sample"] if inside_handler else [])
+    result = agent._run_state.tool_batch.results["read"]
+    assert result.outcome == ("EXECUTED_FAILURE" if inside_handler else "INVALID_ARGUMENTS")
+    assert ("参数无效" in result.content) is (not inside_handler)
+    assert len(_tool_messages(agent)) == 1
+    assert len(completions.requests) == 2
+
+
+@pytest.mark.parametrize("entry,site", [
+    ("run", "todo"), ("run", "run_started"), ("cycle", "trace_start"),
+    ("cycle", "policy_reset"), ("continue", "run_continued"),
+])
+@pytest.mark.parametrize("error_type", [RuntimeError, KeyboardInterrupt])
+def test_initialization_guards_cover_other_bootstrap_operations(make_agent, entry, site, error_type):
+    agent, completions = make_agent([
+        _response(tool_calls=[_call("A"), _call("B", '{"patterns":["B"]}')]),
+        _response(content="done"),
+    ])
+    agent.todo = TodoManager()
+    executed = []
+    def execute(_name, args):
+        executed.append(args["patterns"][0])
+        if len(executed) == 1:
+            agent._request_run_pause()
+        return "real-result"
+    agent._execute_tool = execute
+    if entry == "continue":
+        agent._llm_tool_cycle()
+        state = agent._run_state
+        budget = state.model_turns_used
+    def fail(*_args, **_kwargs):
+        raise error_type("bootstrap fault")
+    if site == "todo":
+        agent.todo.reset = fail
+    elif site == "trace_start":
+        agent.trace.start_task.side_effect = fail
+    elif site == "policy_reset":
+        agent.runtime_policy.reset = fail
+    else:
+        original_record = agent.session_recorder.record
+        def record(event, **data):
+            if event == site:
+                fail()
+            original_record(event, **data)
+        agent.session_recorder.record = record
+    with pytest.raises(error_type, match="bootstrap fault"):
+        if entry == "run":
+            agent.run("new task")
+        elif entry == "cycle":
+            agent._llm_tool_cycle()
+        else:
+            agent._continue_run()
+    state = agent._run_state
+    if entry == "continue":
+        assert state.status.value == "paused"
+        assert state.model_turns_used == budget
+        assert state.tool_batch.next_call_index == 1
+        assert executed == ["needle"]
+        agent.session_recorder.record = original_record
+        assert agent._continue_run() == "done"
+        assert executed == ["needle", "B"]
+        assert agent.trace.start_task.call_count == 1
+    else:
+        assert state.status.value == ("failed" if error_type is RuntimeError else "cancelled")
+        assert not agent.has_active_run
+        assert executed == []
+        assert len(completions.requests) == 0
+        assert agent.trace.end_task.call_count == int(site == "policy_reset")
+
+
+@pytest.mark.parametrize("after_append", [True, False])
+def test_replan_finalization_write_fault_does_not_duplicate_feedback(make_agent, after_append):
+    agent, completions = make_agent([
+        _response(tool_calls=[_call("A")]), _response(content="done"),
+    ])
+    _queue_governance(agent, [RuntimeDecision.REPLAN])
+    executions = []
+    def execute(_name, _args):
+        executions.append("A")
+        agent._request_run_pause()
+        return "result-A"
+    agent._execute_tool = execute
+    agent._llm_tool_cycle()
+    batch = agent._run_state.tool_batch
+    assert batch.status.value == "completed"
+    assert batch.finalized is False
+    class FaultOnReplan(list):
+        failed = False
+        def append(self, message):
+            if message.role == "user" and not self.failed:
+                self.failed = True
+                if after_append:
+                    super().append(message)
+                raise KeyboardInterrupt("replan append")
+            super().append(message)
+    agent.messages = FaultOnReplan(agent.messages)
+    with pytest.raises(KeyboardInterrupt, match="replan append"):
+        agent._continue_run()
+    assert agent._run_state.status.value == "paused"
+    assert len(batch.pending_replan_messages) == int(not after_append)
+    assert len(completions.requests) == 1
+    assert agent._continue_run() == "done"
+    assert batch.finalized is True
+    assert sum("Progress Governance" in (m.content or "") for m in agent.messages) == 1
+    assert len(_tool_messages(agent)) == 1
+    assert executions == ["A"]
+    assert agent._continue_run() == "done"
+
+
+@pytest.mark.parametrize("error_type", [OSError, KeyboardInterrupt])
+def test_duplicate_call_recorder_fault_retains_current_skipped_result(make_agent, error_type):
+    agent, completions = make_agent([_response(tool_calls=[_call("A"), _call("B"), _call("C")])])
+    executions = []
+    agent._execute_tool = lambda _name, _args: executions.append("A") or "real-A"
+    original = agent.session_recorder.record
+    failed = False
+    def record(event, **data):
+        nonlocal failed
+        if event == "tool_call" and data.get("call_id") == "B" and not failed:
+            failed = True
+            raise error_type("duplicate record fault")
+        original(event, **data)
+    agent.session_recorder.record = record
+    agent._llm_tool_cycle()
+    results = agent._run_state.tool_batch.results
+    assert results["A"].content == "real-A"
+    assert results["B"].outcome == "SKIPPED_DUPLICATE"
+    assert results["B"].content.startswith("[SKIPPED_DUPLICATE]")
+    assert results["C"].outcome == "NOT_EXECUTED"
+    assert [m.tool_call_id for m in _tool_messages(agent)] == ["A", "B", "C"]
+    assert executions == ["A"]
+    assert len(completions.requests) == 1
+
+
+@pytest.mark.parametrize("error_type", [RuntimeError, KeyboardInterrupt])
+def test_new_run_can_start_after_bootstrap_failure(make_agent, error_type):
+    agent, completions = make_agent([_response(content="done")])
+    agent.todo = TodoManager()
+    agent.trace.start_task.side_effect = [error_type("trace bootstrap"), "new-trace"]
+    with pytest.raises(error_type, match="trace bootstrap"):
+        agent.run("failed task")
+    previous = agent._run_state
+    assert previous.status.value == ("failed" if error_type is RuntimeError else "cancelled")
+    assert agent._continue_run() == previous.terminal_result
+    assert len(completions.requests) == 0
+    assert agent.run("new task") == "done"
+    assert agent._run_state.run_id != previous.run_id
+    assert agent._run_state.status.value == "completed"
+    assert len(completions.requests) == 1

@@ -243,3 +243,64 @@ def test_posix_expanded_cd_is_executed_but_not_persisted(shell_workspace, monkey
 
     assert result["success"] is True
     assert session.cwd == shell_workspace.resolve()
+
+
+@pytest.mark.parametrize("command", ["cd #dir", "cd src # comment", "cd src#dir"])
+def test_posix_unquoted_hash_is_delegated_without_guessing_cwd(shell_workspace, monkeypatch, command):
+    monkeypatch.setattr("core.runtime_context.shell_session.sys.platform", "linux")
+    (shell_workspace / "#dir").mkdir()
+    (shell_workspace / "src#dir").mkdir()
+    session = ShellSession(shell_workspace)
+    received = []
+    def execute_child(command, **kwargs):
+        received.append(command)
+        return subprocess.CompletedProcess(command, 0, b"shell-result", b"")
+    monkeypatch.setattr("core.runtime_context.shell_session.subprocess.run", execute_child)
+    result = session.execute(command)
+    assert received == [command]
+    assert result["stdout"] == "shell-result"
+    assert session.cwd == shell_workspace.resolve()
+
+
+@pytest.mark.parametrize("argument", ['"#dir"', "'#dir'", r"\#dir", "src"])
+def test_posix_quoted_hash_and_normal_cd_remain_literal(shell_workspace, monkeypatch, argument):
+    monkeypatch.setattr("core.runtime_context.shell_session.sys.platform", "linux")
+    (shell_workspace / "#dir").mkdir()
+    session = ShellSession(shell_workspace)
+    def unexpected_spawn(*_args, **_kwargs):
+        raise AssertionError("literal cd should not spawn")
+    monkeypatch.setattr("core.runtime_context.shell_session.subprocess.run", unexpected_spawn)
+    result = session.execute(f"cd {argument}")
+    assert result["success"] is True
+    assert session.cwd == (shell_workspace / ("src" if argument == "src" else "#dir")).resolve()
+
+
+@pytest.mark.parametrize("command,child_directory,persistent_directory", [
+    ("cd #dir", "home", None), ("cd src # comment", "src", None),
+    ("cd src#dir", "src#dir", None), ('cd "#dir"', "#dir", "#dir"),
+])
+def test_hash_cd_matches_real_posix_shell(shell_workspace, monkeypatch, command,
+                                        child_directory, persistent_directory):
+    if os.name == "nt":
+        shell = Path(os.environ.get("ProgramFiles", "C:/Program Files")) / "Git/bin/bash.exe"
+        if not shell.is_file():
+            pytest.skip("requires Git Bash for real POSIX shell on Windows")
+        prefix = [str(shell), "--noprofile", "--norc", "-c"]
+    else:
+        prefix = ["/bin/sh", "-c"]
+    for name in ("#dir", "src#dir", "home"):
+        (shell_workspace / name).mkdir()
+    env = dict(os.environ, HOME=str(shell_workspace / "home"))
+    child = subprocess.run(prefix + [command + "\npwd"], cwd=shell_workspace,
+                           env=env, capture_output=True, check=True)
+    assert child.stdout.decode().strip().replace("\\", "/").endswith("/" + child_directory)
+    original_run = subprocess.run
+    def run_in_posix(command, **kwargs):
+        return original_run(prefix + [command], env=env, **kwargs)
+    monkeypatch.setattr("core.runtime_context.shell_session.sys.platform", "linux")
+    monkeypatch.setattr("core.runtime_context.shell_session.subprocess.run", run_in_posix)
+    session = ShellSession(shell_workspace)
+    result = session.execute(command)
+    assert result["success"] is True
+    expected = shell_workspace / persistent_directory if persistent_directory else shell_workspace
+    assert session.cwd == expected.resolve()

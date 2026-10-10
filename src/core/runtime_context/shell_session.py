@@ -270,6 +270,23 @@ class ShellSession:
         match = re.fullmatch(r"cd[ \t]+(.+)", stripped)
         if not match:
             return None
+        # Conservatively delegate unquoted hashes to the shell. At a word
+        # boundary they begin a comment; inside a word they may be literal.
+        # Quoted/escaped hashes remain safe standalone directory arguments.
+        quote = None
+        escaped = False
+        for char in match.group(1):
+            if escaped:
+                escaped = False
+            elif char == "\\" and quote != "'":
+                escaped = True
+            elif quote:
+                if char == quote:
+                    quote = None
+            elif char in "\"'":
+                quote = char
+            elif char == "#":
+                return None
         try:
             parts = shlex.split(match.group(1), comments=False, posix=True)
         except ValueError:

@@ -36,7 +36,7 @@ from providers.bootstrap import configure_primary_provider
 from providers.manager import ProviderManager
 
 from core.tools.base_tools import BaseTools, ToolResult
-from core.tools.registry import ToolRegistry, ToolSpec
+from core.tools.registry import ToolArgumentBindingError, ToolRegistry, ToolSpec
 from core.tools.definitions import (
     bash_spec,
     edit_file_spec,
@@ -59,6 +59,14 @@ from core.loop_controller import (
 )
 from core.tracing import TraceManager
 from core.runtime_data import RuntimeDataPaths
+from core.run_state import (
+    RunState,
+    RunStatus,
+    ToolBatchAdvance,
+    ToolBatchStatus,
+    ToolBatchState,
+    ToolCallResultState,
+)
 from core.session_recorder import SessionLogHandler, SessionRecorder
 from core.failure_intelligence import FailureAnalyzer
 from core.runtime_context import (
@@ -279,6 +287,7 @@ class MiniClaudeAgent:
 
         # Tracks current user prompt for trace recording
         self._current_user_prompt: str = ""
+        self._run_state: Optional[RunState] = None
         # Workspace confirmation state for trace schema
         self._workspace_confirmed = workspace_confirmed
 
@@ -381,10 +390,122 @@ class MiniClaudeAgent:
 
     def run(self, user_input: str, require_tool_call: bool = False) -> str:
         """Process user input and return agent response."""
-        self.todo.reset()
-        self._current_user_prompt = user_input
-        self.messages.append(Message(role='user', content=user_input))
+        current = getattr(self, "_run_state", None)
+        if current and current.status in {RunStatus.RUNNING, RunStatus.PAUSED}:
+            return "错误: 当前运行尚未完成；请先继续或终止该运行。"
+        self._run_state = RunState(require_tool_call=require_tool_call)
+        try:
+            self.todo.reset()
+            self._current_user_prompt = user_input
+            self.messages.append(Message(role='user', content=user_input))
+            recorder = getattr(self, "session_recorder", None)
+            if recorder is not None:
+                recorder.record("run_started", run_id=self._run_state.run_id)
+        except BaseException as exc:
+            self._abort_run_initialization(self._run_state, exc)
+            raise
         return self._llm_tool_cycle(require_tool_call=require_tool_call)
+
+    @property
+    def has_pending_tool_batch(self) -> bool:
+        state = getattr(self, "_run_state", None)
+        return bool(state and state.has_pending_tool_batch)
+
+    @property
+    def has_active_run(self) -> bool:
+        state = getattr(self, "_run_state", None)
+        return bool(state and state.status in {RunStatus.RUNNING, RunStatus.PAUSED})
+
+    def _request_run_pause(self) -> None:
+        """Set an internal pause signal; the loop observes it after a call completes."""
+        state = getattr(self, "_run_state", None)
+        if state is None:
+            raise RuntimeError("当前没有可暂停的运行")
+        state.request_pause()
+
+    def _continue_run(self) -> str:
+        """Continue the active in-memory run without adding input or resetting state."""
+        state = getattr(self, "_run_state", None)
+        if state is None:
+            return "错误: 当前没有可继续的运行。"
+        if state.status in {
+            RunStatus.COMPLETED,
+            RunStatus.TERMINATED,
+            RunStatus.FAILED,
+            RunStatus.CANCELLED,
+        }:
+            return state.terminal_result or ""
+        if state.status is not RunStatus.PAUSED:
+            return "错误: 当前运行未处于可继续的暂停状态。"
+
+        try:
+            state.resume()
+            self.session_recorder.record(
+                "run_continued",
+                run_id=state.run_id,
+                next_tool_call_id=(
+                    state.tool_batch.pending_call_ids[0]
+                    if state.tool_batch and state.tool_batch.pending_call_ids
+                    else ""
+                ),
+            )
+        except BaseException as exc:
+            # The recorder failed before entering the cycle or dispatching.
+            self._abort_run_initialization(state, exc, continuing=True)
+            raise
+        result = self._llm_tool_cycle(
+            max_iterations=state.max_iterations,
+            require_tool_call=state.require_tool_call,
+            _continuing=True,
+        )
+        if state.status is not RunStatus.PAUSED:
+            self.session_recorder.record(
+                "final",
+                status="RESPONSE",
+                run_id=state.run_id,
+                content=result,
+            )
+        return result
+
+    def _abort_run_initialization(
+        self, state: RunState, error: BaseException, *, continuing: bool = False,
+    ) -> None:
+        """Bootstrap has not dispatched a tool; preserve or end its lifecycle."""
+        if continuing:
+            state.status = RunStatus.PAUSED
+            if state.has_pending_tool_batch and state.tool_batch is not None:
+                state.tool_batch.status = ToolBatchStatus.PAUSED
+            return
+        status = RunStatus.FAILED if isinstance(error, Exception) else RunStatus.CANCELLED
+        state.finish(status, f"运行初始化失败: {error}")
+        if state.trace_started:
+            try:
+                self.trace.end_task(status.value.upper())
+            except Exception:
+                logger.exception("运行初始化失败后的 Trace 收尾失败")
+
+    def _finalize_tool_batch(self, batch: ToolBatchState) -> None:
+        """Close deferred feedback separately from completing the last call."""
+        if batch.has_pending_calls or batch.finalized:
+            return
+        while batch.pending_replan_messages:
+            message = Message(role="user", content=batch.pending_replan_messages[0])
+            try:
+                self.messages.append(message)
+            finally:
+                # An interrupt may arrive after append actually succeeded.
+                # Consume only feedback whose exact message is already present.
+                if any(item is message for item in self.messages):
+                    batch.pending_replan_messages.pop(0)
+        batch.finalized = True
+
+    def _finish_run(self, status: RunStatus, result: str) -> str:
+        state = getattr(self, "_run_state", None)
+        if state is not None:
+            if state.has_pending_tool_batch and state.tool_batch is not None:
+                state.tool_batch.mark_terminal(failed=status is RunStatus.FAILED)
+            state.finish(status, result)
+        return result
 
     def set_ui_event_handler(
         self, handler: Optional[Callable[[str, Dict[str, Any]], None]]
@@ -736,13 +857,21 @@ class MiniClaudeAgent:
         return result
 
     def _handle_run_background(self, command: str, description: str = "",
-                               timeout: int = 3600) -> str:
+                               timeout: int = 3600) -> str | ToolResult:
         """Queue a long-lived command without blocking the LLM turn."""
         return self._queue_background_command(command, description, timeout)
 
+    def _background_capability_error(self) -> Optional[str]:
+        if not self.feature_manager.is_tool_enabled("run_background"):
+            return "错误: 后台执行功能当前未启用"
+        return None
+
     def _queue_background_command(self, command: str, description: str = "",
-                                  timeout: int = 3600) -> str:
+                                  timeout: int = 3600) -> str | ToolResult:
         """Submit a command to the shared background executor."""
+        capability_error = self._background_capability_error()
+        if capability_error:
+            return ToolResult(content=capability_error, success=False, execution_success=False)
         block_msg = self.command_policy.check(command)
         if block_msg:
             return block_msg
@@ -1077,7 +1206,7 @@ class MiniClaudeAgent:
         except RuntimeEscalationException:
             # Runtime control signals must reach the loop's control handler.
             raise
-        except TypeError as e:
+        except ToolArgumentBindingError as e:
             logger.error(f"工具 '{name}' 参数错误: {e}")
             return ToolDispatchResult(
                 ToolDispatchStatus.INVALID_ARGUMENTS,
@@ -1443,6 +1572,8 @@ class MiniClaudeAgent:
         Returns:
             True if compression (full or micro) was actually triggered.
         """
+        if self.has_pending_tool_batch:
+            return False
         if self.feature_manager.is_enabled('compression'):
             if not self._compression_notice_pending:
                 if ((len(self.messages) > 17 and self.compressor.should_compress(
@@ -1602,118 +1733,169 @@ class MiniClaudeAgent:
 
     def _llm_tool_cycle(
         self, max_iterations: int = 50, require_tool_call: bool = False,
+        *, _continuing: bool = False,
     ) -> str:
         """Core LLM + tool execution cycle, looping tools back to LLM (s_full.py s02 pattern).
 
         Args:
             max_iterations: Maximum number of LLM calls to prevent infinite loops.
         """
-        provider = self.provider_manager.get_primary_provider()
-        if not provider:
-            return "错误: 没有可用的 LLM 提供者。请配置 API 密钥。"
+        state = getattr(self, "_run_state", None)
+        is_new_run = state is None or state.status in {
+            RunStatus.COMPLETED,
+            RunStatus.TERMINATED,
+            RunStatus.FAILED,
+            RunStatus.CANCELLED,
+        }
+        if is_new_run:
+            state = RunState(
+                max_iterations=max_iterations,
+                require_tool_call=require_tool_call,
+            )
+            self._run_state = state
+        elif state.status is RunStatus.PAUSED:
+            return "错误: 当前运行已暂停，请通过继续入口恢复原工具批次。"
+        elif state.status is not RunStatus.RUNNING:
+            return "错误: 当前运行状态不允许继续执行。"
+        else:
+            max_iterations = state.max_iterations
+            require_tool_call = state.require_tool_call
 
-        tools = self._get_llm_tools()
-        tool_defs = [ProviderToolDef(**t) for t in tools]
+        try:
+            provider = self.provider_manager.get_primary_provider()
+            if not provider and not state.has_pending_tool_batch:
+                return self._finish_run(
+                    RunStatus.FAILED,
+                    "错误: 没有可用的 LLM 提供者。请配置 API 密钥。",
+                )
 
-        # ── Reset benchmark metrics ──
-        self.last_metrics = self._empty_usage_metrics()
+            tools = self._get_llm_tools()
+            tool_defs = [ProviderToolDef(**t) for t in tools]
 
-        # ── Start task-level trace for this agent.chat() call ──
-        tid = self.trace.start_task(
-            user_prompt=self._current_user_prompt,
-            workspace_root=str(self.runtime_context.workspace_root),
-            workspace_confirmed=self._workspace_confirmed,
-            require_tool_call=require_tool_call,
-            environment=self.preflight.to_dict(),
-            request_config={
-                "provider": self.config.llm.provider,
-                "model": self.config.llm.model,
-                "max_tokens": self.config.llm.max_tokens,
-                "temperature": self.config.llm.temperature,
-                "stream": self.config.llm.stream,
-            },
-        )
-        self.runtime_context.current_task_id = tid
-        self.runtime_policy.reset()
-        self.workspace_state_guard.reset()
-        self.runtime_observer.reset()
-        self.completion_guard.reset()
+            if not state.trace_started:
+                # New Run initialization happens once. Continuing an in-memory batch
+                # keeps its Trace task and governance history alive.
+                self.last_metrics = self._empty_usage_metrics()
+                tid = self.trace.start_task(
+                    user_prompt=self._current_user_prompt,
+                    workspace_root=str(self.runtime_context.workspace_root),
+                    workspace_confirmed=self._workspace_confirmed,
+                    require_tool_call=state.require_tool_call,
+                    environment=self.preflight.to_dict(),
+                    request_config={
+                        "provider": self.config.llm.provider,
+                        "model": self.config.llm.model,
+                        "max_tokens": self.config.llm.max_tokens,
+                        "temperature": self.config.llm.temperature,
+                        "stream": self.config.llm.stream,
+                    },
+                )
+                state.trace_task_id = tid
+                state.trace_started = True
+                self.session_recorder.record(
+                    "run_trace_link",
+                    run_id=state.run_id,
+                    trace_task_id=tid,
+                )
+                self.runtime_context.current_task_id = tid
+                self.runtime_policy.reset()
+                self.workspace_state_guard.reset()
+                self.runtime_observer.reset()
+                self.completion_guard.reset()
+                self._last_assistant_note = None
+            if state.tool_batch is not None and not state.has_pending_tool_batch:
+                self._finalize_tool_batch(state.tool_batch)
+        except BaseException as exc:
+            self._abort_run_initialization(state, exc, continuing=_continuing)
+            raise
 
-        no_tool_retry_count = 0
-        tool_call_seen = False
-        self._last_assistant_note = None
         active_tool_calls: List[Dict[str, Any]] = []
         resolved_tool_call_ids: set[str] = set()
-        pending_replan_messages: List[Message] = []
         active_batch_assistant_index = -1
         current_tool_call_id = ""
         current_tool_execution_started = False
         current_tool_result_received = False
-        for iteration in range(max_iterations):
+        current_tool_result_available = False
+        tool_call_outcome = ""
+        while state.model_turns_used < max_iterations or state.has_pending_tool_batch:
+            resuming_batch = state.has_pending_tool_batch
             try:
-                self._emit_ui_event("model_request_started", iteration=iteration + 1)
-                self.session_recorder.record("model_request_started", turn=iteration + 1)
-                logger.info("LLM_TURN_START: iteration=%s messages=%s", iteration + 1, len(self.messages))
-                # ── Start turn-level trace for this iteration ──
-                self.trace.start_turn(iteration)
-                # ── Pre-LLM: compression pipeline (s_full.py s06) ──
-                # (safe inside the loop — only modifies existing messages)
-                self.messages = Compressor._clean_tool_chains(self.messages)
-                hot_text = self._get_dynamic_hot_context(
-                    iteration=iteration,
-                    max_iterations=max_iterations,
-                )
-                msgs_for_llm = self._build_request_messages(hot_text)
-                estimated_prompt_tokens = self.compressor.estimate_prompt_tokens(
-                    msgs_for_llm,
-                    system_prompt=self.system_prompt,
-                    tools=tools,
-                )
-                if self._check_auto_compress(estimated_prompt_tokens):
-                    self.trace.record_compression()
-                hot_text = self._sync_compression_warning(hot_text)
-
-                # ── Safety net: normalize tool chains before API call ──
-                # Ensures no orphaned tool messages or broken tool_calls
-                self.messages = Compressor._clean_tool_chains(self.messages)
-
-                # Rebuild after compression.  Hot context remains transient
-                # and is counted exactly once as part of the request list.
-                msgs_for_llm = self._build_request_messages(hot_text)
-                estimated_prompt_tokens = self.compressor.estimate_prompt_tokens(
-                    msgs_for_llm,
-                    system_prompt=self.system_prompt,
-                    tools=tools,
-                )
-
-                # ── Log message structure for debugging ──
-                role_counts = Counter(m.role for m in self.messages)
-                logger.debug(f"[LLM#{iteration}] 发送 {len(self.messages)} 条消息: {dict(role_counts)}")
-
-                # ── Update trace with current message count ──
-                self.trace.set_message_count(len(self.messages))
-
-                # ── LLM call with system prompt ──
-                self.trace.record_provider_stream(getattr(provider, 'stream', False))
-                response = provider.create_message(
-                    msgs_for_llm,
-                    tool_defs,
-                    system=self.system_prompt,
-                    max_tokens=self.config.llm.max_tokens,
-                    temperature=self.config.llm.temperature,
-                )
-                parsed = self._parse_response(provider, response)
-                self.trace.record_reasoning_content_chars(
-                    parsed.get('reasoning_content_chars')
-                )
-                content = parsed.get('content', '')
-                tool_calls = parsed.get('tool_calls', [])
-                finish_reason = parsed.get('finish_reason')
-                self.last_metrics["turns"] = iteration + 1
+                if resuming_batch:
+                    batch = state.tool_batch
+                    assert batch is not None
+                    iteration = batch.model_iteration
+                    content = batch.assistant_content
+                    tool_calls = batch.tool_calls
+                    finish_reason = None
+                    estimated_prompt_tokens = 0
+                    usage = {}
+                else:
+                    if not provider:
+                        self.trace.end_task("FAILED", "NO_PROVIDER")
+                        return self._finish_run(
+                            RunStatus.FAILED,
+                            "错误: 没有可用的 LLM 提供者。请配置 API 密钥。",
+                        )
+                    iteration = state.model_turns_used
+                    self._emit_ui_event("model_request_started", iteration=iteration + 1)
+                    self.session_recorder.record(
+                        "model_request_started", turn=iteration + 1,
+                        run_id=state.run_id,
+                    )
+                    logger.info(
+                        "LLM_TURN_START: iteration=%s messages=%s",
+                        iteration + 1, len(self.messages),
+                    )
+                    self.trace.start_turn(iteration)
+                    # Pending tool batches bypass this entire pre-LLM pipeline.
+                    self.messages = Compressor._clean_tool_chains(self.messages)
+                    hot_text = self._get_dynamic_hot_context(
+                        iteration=iteration,
+                        max_iterations=max_iterations,
+                    )
+                    msgs_for_llm = self._build_request_messages(hot_text)
+                    estimated_prompt_tokens = self.compressor.estimate_prompt_tokens(
+                        msgs_for_llm,
+                        system_prompt=self.system_prompt,
+                        tools=tools,
+                    )
+                    if self._check_auto_compress(estimated_prompt_tokens):
+                        self.trace.record_compression()
+                    hot_text = self._sync_compression_warning(hot_text)
+                    self.messages = Compressor._clean_tool_chains(self.messages)
+                    msgs_for_llm = self._build_request_messages(hot_text)
+                    estimated_prompt_tokens = self.compressor.estimate_prompt_tokens(
+                        msgs_for_llm,
+                        system_prompt=self.system_prompt,
+                        tools=tools,
+                    )
+                    role_counts = Counter(m.role for m in self.messages)
+                    logger.debug(
+                        f"[LLM#{iteration}] 发送 {len(self.messages)} 条消息: {dict(role_counts)}"
+                    )
+                    self.trace.set_message_count(len(self.messages))
+                    self.trace.record_provider_stream(getattr(provider, 'stream', False))
+                    response = provider.create_message(
+                        msgs_for_llm,
+                        tool_defs,
+                        system=self.system_prompt,
+                        max_tokens=self.config.llm.max_tokens,
+                        temperature=self.config.llm.temperature,
+                    )
+                    parsed = self._parse_response(provider, response)
+                    self.trace.record_reasoning_content_chars(
+                        parsed.get('reasoning_content_chars')
+                    )
+                    content = parsed.get('content', '')
+                    tool_calls = parsed.get('tool_calls', [])
+                    finish_reason = parsed.get('finish_reason')
+                    usage = parsed.get('usage', {})
+                    state.model_turns_used = iteration + 1
+                    self.last_metrics["turns"] = state.model_turns_used
 
                 # A truncated response may contain incomplete text or tool
                 # calls. Never publish or execute either as a complete turn.
-                if finish_reason in {'length', 'max_tokens', 'limit'}:
+                if not resuming_batch and finish_reason in {'length', 'max_tokens', 'limit'}:
                     self._record_provider_usage(
                         parsed.get('usage', {}),
                         estimated_prompt_tokens=estimated_prompt_tokens,
@@ -1721,10 +1903,14 @@ class MiniClaudeAgent:
                     )
                     self.trace.record_provider_finish_reason(finish_reason)
                     self.trace.end_task("FAILED", "PROVIDER_OUTPUT_LIMIT")
-                    return "错误: 模型输出达到上限，本轮回复可能不完整，任务未完成。"
-                self.trace.record_provider_finish_reason(finish_reason)
+                    return self._finish_run(
+                        RunStatus.FAILED,
+                        "错误: 模型输出达到上限，本轮回复可能不完整，任务未完成。",
+                    )
+                if not resuming_batch:
+                    self.trace.record_provider_finish_reason(finish_reason)
 
-                if content and tool_calls:
+                if not resuming_batch and content and tool_calls:
                     logger.info("LLM_NOTE[%s]: %s", iteration + 1, content)
                     self.session_recorder.record("assistant_note", turn=iteration + 1, content=content)
                     self._last_assistant_note = content
@@ -1736,25 +1922,29 @@ class MiniClaudeAgent:
                 )
 
                 # ── Trace: record assistant content ──
-                self.trace.record_assistant_content(content)
+                if not resuming_batch:
+                    self.trace.record_assistant_content(content)
 
                 # ── Accumulate benchmark metrics ──
-                usage = parsed.get('usage', {})
-                self._record_provider_usage(
-                    usage,
-                    estimated_prompt_tokens=estimated_prompt_tokens,
-                    source="main",
-                )
+                if not resuming_batch:
+                    self._record_provider_usage(
+                        usage,
+                        estimated_prompt_tokens=estimated_prompt_tokens,
+                        source="main",
+                    )
                 if not tool_calls and not content.strip():
                     self.trace.end_task("FAILED", "EMPTY_PROVIDER_RESPONSE")
-                    return "错误: 模型未返回可见回复或工具调用，任务未完成。"
+                    return self._finish_run(
+                        RunStatus.FAILED,
+                        "错误: 模型未返回可见回复或工具调用，任务未完成。",
+                    )
 
                 if not tool_calls:
                     self.messages.append(Message(role='assistant', content=content))
-                    if require_tool_call and not tool_call_seen:
-                        if no_tool_retry_count == 0:
-                            no_tool_retry_count += 1
-                            self.trace.record_no_tool_retry(no_tool_retry_count)
+                    if require_tool_call and not state.tool_call_seen:
+                        if state.no_tool_retry_count == 0:
+                            state.no_tool_retry_count += 1
+                            self.trace.record_no_tool_retry(state.no_tool_retry_count)
                             self.messages.append(Message(
                                 role='user',
                                 content=(
@@ -1765,7 +1955,7 @@ class MiniClaudeAgent:
                             logger.warning("首轮未产生工具调用，已追加一次执行纠偏")
                             continue
                         self.trace.end_task("FAILED")
-                        return content
+                        return self._finish_run(RunStatus.FAILED, content)
                     completion_decision = self.completion_guard.check(self.runtime_observer)
                     latest_event = self.runtime_policy.history.all()[-1:]
                     if latest_event:
@@ -1792,7 +1982,10 @@ class MiniClaudeAgent:
                             "BLOCKED_ENVIRONMENT",
                             "UNRESOLVED_BLOCKER_COMPLETION",
                         )
-                        return self.completion_guard.message(completion_decision)
+                        return self._finish_run(
+                            RunStatus.TERMINATED,
+                            self.completion_guard.message(completion_decision),
+                        )
                     if completion_decision.action.value == "REPLAN":
                         self.trace.record_completion_guard(
                             completion_decision.reason,
@@ -1805,41 +1998,58 @@ class MiniClaudeAgent:
                         ))
                         continue
                     self.trace.end_task("SUCCESS")
-                    return content
+                    return self._finish_run(RunStatus.COMPLETED, content)
 
                 # ── Store assistant message with tool calls ──
-                tool_call_seen = True
-                # Provider response IDs are preserved. The fallback only
-                # protects the message chain if a compatible provider omits it.
-                for call_index, tc in enumerate(tool_calls, start=1):
-                    if not isinstance(tc.get("id"), str) or not tc["id"].strip():
-                        tc["id"] = f"local_{iteration + 1}_{call_index}"
-                call_ids = [tc["id"] for tc in tool_calls]
-                if len(call_ids) != len(set(call_ids)):
-                    raise ValueError("同一工具批次包含重复 Tool Call ID，拒绝执行以避免结果关联错误")
-                self.messages.append(Message(
-                    role='assistant',
-                    content=content,
-                    tool_calls=tool_calls,
-                ))
-                active_batch_assistant_index = len(self.messages) - 1
-                active_tool_calls = tool_calls
-                resolved_tool_call_ids = set()
-                pending_replan_messages = []
+                state.tool_call_seen = True
+                if resuming_batch:
+                    batch = state.tool_batch
+                    assert batch is not None
+                    active_batch_assistant_index = batch.assistant_message_index
+                else:
+                    # Provider response IDs are preserved. The fallback only
+                    # protects the message chain if a compatible provider omits it.
+                    for call_index, tc in enumerate(tool_calls, start=1):
+                        if not isinstance(tc.get("id"), str) or not tc["id"].strip():
+                            tc["id"] = f"local_{iteration + 1}_{call_index}"
+                    call_ids = [tc["id"] for tc in tool_calls]
+                    if len(call_ids) != len(set(call_ids)):
+                        raise ValueError("同一工具批次包含重复 Tool Call ID，拒绝执行以避免结果关联错误")
+                    self.messages.append(Message(
+                        role='assistant',
+                        content=content,
+                        tool_calls=tool_calls,
+                    ))
+                    batch = ToolBatchState(
+                        tool_calls=tool_calls,
+                        assistant_message_index=len(self.messages) - 1,
+                        model_iteration=iteration,
+                        assistant_content=content,
+                    )
+                    batch.start()
+                    state.tool_batch = batch
+                    active_batch_assistant_index = batch.assistant_message_index
+                active_tool_calls = batch.tool_calls
+                resolved_tool_call_ids = batch.resolved_call_ids
 
                 def append_tool_result(tool_call: Dict[str, Any], result_text: str) -> None:
                     call_id = tool_call.get("id", "")
-                    if call_id in resolved_tool_call_ids:
+                    if call_id in batch.resolved_call_ids:
                         raise RuntimeError(f"Tool Call {call_id} 已有结果，拒绝重复写入")
                     self.messages.append(Message(
                         role="tool", content=result_text, tool_call_id=call_id,
                     ))
-                    resolved_tool_call_ids.add(call_id)
+                    batch.resolved_call_ids.add(call_id)
 
                 def defer_replan(message: str) -> None:
-                    pending_replan_messages.append(Message(role="user", content=message))
+                    batch.pending_replan_messages.append(message)
 
-                def finish_tool_batch(reason: str, *, unknown_call_id: str = "") -> None:
+                def finish_tool_batch(
+                    reason: str,
+                    *,
+                    unknown_call_id: str = "",
+                    failed: bool = False,
+                ) -> None:
                     nonlocal active_batch_assistant_index
                     # A KeyboardInterrupt may arrive after appending a result
                     # message but before recording its ID in the local set.
@@ -1849,15 +2059,75 @@ class MiniClaudeAgent:
                             for message in self.messages[active_batch_assistant_index + 1:]
                             if message.role == "tool" and message.tool_call_id
                         )
+                    current_message_ids = {
+                        message.tool_call_id
+                        for message in self.messages[active_batch_assistant_index + 1:]
+                        if message.role == "tool" and message.tool_call_id
+                    } if active_batch_assistant_index >= 0 else set()
+                    if (
+                        current_tool_result_available
+                        and current_tool_call_id
+                        and current_tool_call_id not in current_message_ids
+                    ):
+                        # Dispatch already returned a definite result. If only
+                        # the message append failed, preserve that result rather
+                        # than misclassifying the executed call as UNKNOWN.
+                        self.messages.append(Message(
+                            role="tool",
+                            content=result_text,
+                            tool_call_id=current_tool_call_id,
+                        ))
+                        resolved_tool_call_ids.add(current_tool_call_id)
+                        batch.resolved_call_ids.add(current_tool_call_id)
+                        record_tool_result_event(
+                            tname,
+                            result_text,
+                            success=tool_call_outcome == "EXECUTED_SUCCESS",
+                            blocked=(
+                                tool_call_outcome.startswith("BLOCKED_")
+                                or tool_call_outcome == "SKIPPED_DUPLICATE"
+                            ),
+                            outcome=tool_call_outcome,
+                            cancelled=tool_call_outcome == "CANCELLED",
+                        )
+                        unknown_call_id = ""
                     self._close_tool_call_batch(
                         active_tool_calls,
                         resolved_tool_call_ids,
                         reason,
                         unknown_call_id=unknown_call_id,
                     )
-                    self.messages.extend(pending_replan_messages)
-                    pending_replan_messages.clear()
-                    active_tool_calls.clear()
+                    for message in self.messages[active_batch_assistant_index + 1:]:
+                        if (
+                            message.role != "tool"
+                            or not message.tool_call_id
+                            or message.tool_call_id in batch.results
+                        ):
+                            continue
+                        if (
+                            message.tool_call_id == current_tool_call_id
+                            and current_tool_result_available
+                            and tool_call_outcome
+                        ):
+                            outcome = tool_call_outcome
+                        elif message.content.startswith("[UNKNOWN]"):
+                            outcome = "UNKNOWN"
+                        elif message.content.startswith("[NOT_EXECUTED]"):
+                            outcome = "NOT_EXECUTED"
+                        else:
+                            outcome = "RECORDED_BEFORE_TERMINAL"
+                        batch.results[message.tool_call_id] = ToolCallResultState(
+                            message.tool_call_id, outcome, message.content,
+                        )
+                    ordered_call_ids = [
+                        str(call.get("id", "")) for call in batch.tool_calls
+                    ]
+                    if all(call_id in batch.results for call_id in ordered_call_ids):
+                        # This batch is terminal and every protocol call now has
+                        # a recorded result; expose no stale resumable cursor.
+                        batch.next_call_index = len(batch.tool_calls)
+                    self._finalize_tool_batch(batch)
+                    batch.mark_terminal(failed=failed)
                     active_batch_assistant_index = -1
 
                 def record_tool_result_event(
@@ -1884,13 +2154,37 @@ class MiniClaudeAgent:
                         event["output_visibility"] = output_visibility
                     self.session_recorder.record("tool_result", **event)
 
+                def advance_current_call(outcome: str, result_text: str) -> bool:
+                    advance = state.record_tool_result(
+                        current_tool_call_id,
+                        outcome,
+                        result_text,
+                    )
+                    if advance is ToolBatchAdvance.PAUSED or state.status is RunStatus.PAUSED:
+                        self.session_recorder.record(
+                            "run_paused",
+                            run_id=state.run_id,
+                            next_tool_call_id=(
+                                batch.pending_call_ids[0]
+                                if batch.pending_call_ids else ""
+                            ),
+                            completed_tool_call_ids=list(batch.results),
+                        )
+                        return True
+                    return False
+
                 # ── Deduplicate: skip identical tool+args in the same response ──
-                seen_tool_sigs: set = set()
+                seen_tool_sigs = batch.seen_signatures
                 # ── Execute each tool and store results ──
-                for tc in tool_calls:
+                while batch.has_pending_calls:
+                    call_index = batch.next_call_index
+                    tc = batch.tool_calls[call_index]
                     current_tool_call_id = tc["id"]
                     current_tool_execution_started = False
                     current_tool_result_received = False
+                    current_tool_result_available = False
+                    tool_call_outcome = ""
+                    result_text = ""  # Never reuse the preceding call's fallback result.
                     fn = tc.get('function', {})
                     tname = fn.get('name', '')
                     args_raw = fn.get('arguments', '{}')
@@ -1910,21 +2204,25 @@ class MiniClaudeAgent:
                             failure_category="", block_reason="SAME_RESPONSE_DUPLICATE",
                         )
                         self.trace.record_attempt_event(event.to_dict())
-                        duplicate_result = (
+                        result_text = (
                             "[SKIPPED_DUPLICATE] 同一模型响应中相同工具和参数已处理；"
                             "本次未重复执行。"
                         )
+                        tool_call_outcome = "SKIPPED_DUPLICATE"
+                        current_tool_result_available = True
                         self.session_recorder.record(
                             "tool_call", call_id=tc["id"], tool=tname,
                             args={"raw_arguments": str(args_raw)},
                             outcome="SKIPPED_DUPLICATE",
                         )
-                        append_tool_result(tc, duplicate_result)
+                        append_tool_result(tc, result_text)
                         self.session_recorder.record(
                             "tool_result", call_id=tc["id"], tool=tname,
                             success=False, blocked=True,
-                            outcome="SKIPPED_DUPLICATE", result=duplicate_result,
+                            outcome="SKIPPED_DUPLICATE", result=result_text,
                         )
+                        if advance_current_call("SKIPPED_DUPLICATE", result_text):
+                            return "任务已在安全工具边界暂停，可在同一进程继续。"
                         continue
                     seen_tool_sigs.add(sig)
                     logger.info("TOOL_REQUEST: name=%s raw_args=%s", tname, args_raw)
@@ -1935,6 +2233,8 @@ class MiniClaudeAgent:
                         # A malformed model argument should become tool feedback,
                         # not terminate the entire agent task.
                         result_text = f"工具参数 JSON 无效，请重新生成合法 JSON: {exc}"
+                        tool_call_outcome = "INVALID_ARGUMENTS"
+                        current_tool_result_available = True
                         args_hash = canonicalize_args({"raw_arguments": str(args_raw)})
                         intent = CommandNormalizer.normalize(
                             tname, {"raw_arguments": str(args_raw)}
@@ -1976,6 +2276,8 @@ class MiniClaudeAgent:
                             result=result_text,
                         )
                         logger.warning(f"工具参数解析失败【{tname}】，已反馈给 Agent: {exc}")
+                        if advance_current_call("INVALID_ARGUMENTS", result_text):
+                            return "任务已在安全工具边界暂停，可在同一进程继续。"
                         continue
 
                     self._emit_ui_event(
@@ -2002,6 +2304,7 @@ class MiniClaudeAgent:
                     v3_block_msg = None
                     failure_sig = None
                     observation_text = ""
+                    tool_call_outcome = "BLOCKED_NOT_EXECUTED"
 
                     try:
                         # ── V3 Layer 2+3: intent-based dedup → circuit breaker ──
@@ -2043,16 +2346,27 @@ class MiniClaudeAgent:
                                 workspace_after_digest=decision.event.workspace_after_digest,
                                 changed_paths=list(decision.event.changed_paths),
                             )
+                            tool_call_outcome = "BLOCKED_PRECHECK"
+                            current_tool_result_available = True
                             append_tool_result(tc, result_text)
+                            current_tool_result_received = True
                             if decision.should_terminate:
+                                state.pause_requested = False
+                                state.record_tool_result(
+                                    tc["id"], "BLOCKED_PRECHECK", result_text,
+                                )
                                 finish_tool_batch("Runtime Policy HARD_STOP")
                                 self.trace.end_task("CIRCUIT_BROKEN", decision.reason)
-                                return result_text
+                                return self._finish_run(
+                                    RunStatus.TERMINATED, result_text,
+                                )
                             if decision.should_replan:
                                 defer_replan(
                                     "请重新规划：当前阻断仍只是证据，先寻找合法替代或验证其是否可恢复，"
                                     "不要重复同一失败策略。"
                                 )
+                            if advance_current_call("BLOCKED_PRECHECK", result_text):
+                                return "任务已在安全工具边界暂停，可在同一进程继续。"
                             continue
 
                         state_stall_preblock = None
@@ -2067,6 +2381,8 @@ class MiniClaudeAgent:
                         if v3_block_msg:
                             result_text = v3_block_msg
                             observation_text = result_text
+                            tool_call_outcome = "BLOCKED_NOT_EXECUTED"
+                            current_tool_result_available = True
                             tool_result = ToolResult(
                                 content=result_text, success=False,
                                 execution_success=False,
@@ -2103,11 +2419,17 @@ class MiniClaudeAgent:
                             not_dispatched = dispatch_status in {
                                 ToolDispatchStatus.FEATURE_DISABLED,
                                 ToolDispatchStatus.UNKNOWN_TOOL,
+                                ToolDispatchStatus.INVALID_ARGUMENTS,
                             }
                             cancelled = False
                             if not_dispatched:
                                 current_tool_execution_started = False
                                 v3_block_msg = result_text
+                                tool_call_outcome = (
+                                    "INVALID_ARGUMENTS"
+                                    if dispatch_status is ToolDispatchStatus.INVALID_ARGUMENTS
+                                    else f"BLOCKED_{dispatch_status.value.upper()}"
+                                )
                             else:
                                 cancelled = (
                                     tool_result.cancelled
@@ -2117,7 +2439,15 @@ class MiniClaudeAgent:
                                     result_text += (
                                         "\n[执行取消；取消前是否产生部分副作用未知。]"
                                     )
+                                    tool_call_outcome = "CANCELLED"
+                                else:
+                                    tool_call_outcome = (
+                                        "EXECUTED_SUCCESS"
+                                        if tool_result.execution_success
+                                        else "EXECUTED_FAILURE"
+                                    )
 
+                            current_tool_result_available = True
                             append_tool_result(tc, result_text)
                             current_tool_result_received = True
                             if not_dispatched:
@@ -2177,6 +2507,10 @@ class MiniClaudeAgent:
                                 # derived from the shared AttemptHistory below.
 
                                 if cancelled:
+                                    state.pause_requested = False
+                                    state.record_tool_result(
+                                        tc["id"], "CANCELLED", result_text,
+                                    )
                                     finish_tool_batch("用户取消当前工具")
                                     t_end = time.time()
                                     self.trace.record_tool_call(
@@ -2206,7 +2540,10 @@ class MiniClaudeAgent:
                                         tool=tname,
                                     )
                                     self.trace.end_task("CANCELLED")
-                                    return "已取消当前任务。"
+                                    return self._finish_run(
+                                        RunStatus.CANCELLED,
+                                        "已取消当前任务。",
+                                    )
 
                                 # ── Failure Intelligence Analysis ──
                                 if (
@@ -2254,7 +2591,7 @@ class MiniClaudeAgent:
                         )
                         # Hard terminate the loop
                         self.trace.end_task("CIRCUIT_BROKEN")
-                        return str(e)
+                        return self._finish_run(RunStatus.TERMINATED, str(e))
 
                     t_end = time.time()
 
@@ -2374,6 +2711,10 @@ class MiniClaudeAgent:
 
                     # Store structured tool result (s_full.py style)
                     if progress_decision.should_terminate:
+                        state.pause_requested = False
+                        state.record_tool_result(
+                            tc["id"], tool_call_outcome, result_text,
+                        )
                         finish_tool_batch(
                             "Runtime Policy HARD_STOP",
                             unknown_call_id=(
@@ -2383,23 +2724,27 @@ class MiniClaudeAgent:
                             ),
                         )
                         self.trace.end_task("CIRCUIT_BROKEN", progress_decision.reason)
-                        return result_text
+                        return self._finish_run(
+                            RunStatus.TERMINATED, result_text,
+                        )
                     if progress_decision.should_replan:
                         defer_replan(
                             "[Progress Governance] 最近的策略没有产生新的有效 Observation 或 State Progress。"
                             "请重新规划，改变解决路径；不要继续重复同一失败或振荡操作。"
                         )
+                    if advance_current_call(tool_call_outcome, result_text):
+                        return "任务已在安全工具边界暂停，可在同一进程继续。"
 
                 # Keep all results from this response adjacent. Replan prompts
                 # become ordinary conversation messages only after the batch.
-                self.messages.extend(pending_replan_messages)
-                pending_replan_messages.clear()
+                self._finalize_tool_batch(batch)
                 active_tool_calls = []
                 resolved_tool_call_ids = set()
                 active_batch_assistant_index = -1
                 current_tool_call_id = ""
                 current_tool_execution_started = False
                 current_tool_result_received = False
+                iteration = state.model_turns_used
 
             except KeyboardInterrupt:
                 if active_tool_calls:
@@ -2421,7 +2766,7 @@ class MiniClaudeAgent:
                 )
                 self.trace.record_runtime_error("用户中断当前任务")
                 self.trace.end_task("CANCELLED")
-                return "已停止当前任务。"
+                return self._finish_run(RunStatus.CANCELLED, "已停止当前任务。")
             except Exception as e:
                 if active_tool_calls:
                     finish_tool_batch(
@@ -2431,6 +2776,7 @@ class MiniClaudeAgent:
                             if current_tool_execution_started and not current_tool_result_received
                             else ""
                         ),
+                        failed=True,
                     )
                 self.last_metrics["api_errors"] += 1
                 logger.exception("LLM_TURN_ERROR: iteration=%s", iteration + 1)
@@ -2453,11 +2799,14 @@ class MiniClaudeAgent:
                 logger.error(f"LLM 循环出错: {error_message}")
                 self.trace.record_runtime_error(error_message)
                 self.trace.end_task("FAILED")
-                return f"错误: {error_message}"
+                return self._finish_run(RunStatus.FAILED, f"错误: {error_message}")
 
         logger.warning(f"模型调用轮次已达最大次数 ({max_iterations})，强制终止")
         self.trace.end_task("LOOP_ABORTED", "GLOBAL_ITERATION_LIMIT")
-        return f"错误: 模型调用已达 {max_iterations} 轮上限，任务未完成。"
+        return self._finish_run(
+            RunStatus.FAILED,
+            f"错误: 模型调用已达 {max_iterations} 轮上限，任务未完成。",
+        )
 
     def _parse_response(self, provider, response: Any) -> Dict[str, Any]:
         """Parse provider response safely."""
@@ -2471,14 +2820,21 @@ class MiniClaudeAgent:
 
     def chat(self, message: str, require_tool_call: bool = False) -> str:
         """Submit a user instruction to the Agent Runtime."""
+        state = getattr(self, "_run_state", None)
+        if state and state.status in {RunStatus.RUNNING, RunStatus.PAUSED}:
+            return "错误: 当前运行尚未完成；请先继续或终止该运行。"
         self.session_recorder.start_round()
         logger.info("USER_INPUT: %s", message)
         self.session_recorder.record("user_input", content=message)
         result = self.run(message, require_tool_call=require_tool_call)
+        state = getattr(self, "_run_state", None)
         logger.info("AGENT_RESPONSE: %s", result)
         # A final model response only means the conversation turn ended; the
         # benchmark trace remains the authority for task success.
-        final_event = {"status": "RESPONSE"}
+        final_event = {
+            "status": "PAUSED" if state and state.status is RunStatus.PAUSED else "RESPONSE",
+            "run_id": state.run_id if state else "",
+        }
         if result == self._last_assistant_note:
             final_event["content_reused"] = True
         else:
@@ -2503,7 +2859,10 @@ class MiniClaudeAgent:
 
     def run_background(self, command: str, description: str = "",
                        timeout: int = 120) -> str:
-        """Execute a command in the background. Returns task ID."""
+        """Execute a command in the background. Returns task ID or an error."""
+        capability_error = self._background_capability_error()
+        if capability_error:
+            return capability_error
         return self.background.run(
             command,
             description,

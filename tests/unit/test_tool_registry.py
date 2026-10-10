@@ -350,3 +350,63 @@ def test_main_agent_feature_flags_gate_production_tool_wiring():
         assert main.feature_manager.enable(feature_name)
         visible = {tool["name"] for tool in main._get_llm_tools()}
         assert feature_tools <= visible
+
+
+@pytest.mark.parametrize("enabled", [False, True])
+@pytest.mark.parametrize("entry", ["bash_start", "queue", "public", "tool"])
+def test_all_main_background_start_entries_check_capability(monkeypatch, enabled, entry):
+    from unittest.mock import MagicMock
+    monkeypatch.setattr("agent.mini_claude_agent.sys.platform", "win32")
+    agent = object.__new__(MiniClaudeAgent)
+    agent.config = SimpleNamespace(features=FeaturesConfig(background=enabled))
+    agent.feature_manager = FeatureManager()
+    agent.tool_registry = ToolRegistry()
+    agent._register_features()
+    agent._register_tools()
+    agent.runtime_context = SimpleNamespace(cwd=Path("."))
+    agent.command_policy = SimpleNamespace(check=lambda _command: None)
+    task = SimpleNamespace(id="job", pid=42, started_at="now", cwd=".", stdout_file="out",
+                           stderr_file="err", status=SimpleNamespace(value="running"), error="")
+    agent.background = SimpleNamespace(launch=MagicMock(return_value=task), run=MagicMock(return_value="job"))
+    if entry == "bash_start":
+        result = agent._execute_tool("bash", {"command": "start server"}).value
+    elif entry == "queue":
+        result = agent._queue_background_command("server")
+    elif entry == "public":
+        result = agent.run_background("server")
+    else:
+        result = agent._execute_tool("run_background", {"command": "server"}).value
+    assert agent.background.launch.call_count + agent.background.run.call_count == int(enabled)
+    if not enabled:
+        assert "当前未启用" in (result.content if isinstance(result, ToolResult) else result)
+    elif entry == "public":
+        assert result == "job"
+
+
+def test_internal_type_error_is_execution_failure_not_binding_error():
+    calls = []
+    def handler(path):
+        calls.append(path)
+        raise TypeError("after entry")
+    agent, _features = _feature_gated_agent(handler)
+    binding = agent._execute_tool("read_file", {"wrong": "argument"})
+    assert binding.status is ToolDispatchStatus.INVALID_ARGUMENTS
+    assert calls == []
+    internal = agent._execute_tool("read_file", {"path": "sample"})
+    assert internal.status is ToolDispatchStatus.EXECUTION_FAILED
+    assert calls == ["sample"]
+
+
+
+def test_uninspectable_handler_does_not_guess_type_error_is_binding_failure():
+    calls = []
+    class NativeLike:
+        @property
+        def __signature__(self):
+            raise ValueError("no signature")
+        def __call__(self, **_args):
+            calls.append("entered")
+            raise TypeError("inside uninspectable handler")
+    agent, _features = _feature_gated_agent(NativeLike())
+    assert agent._execute_tool("read_file", {}).status is ToolDispatchStatus.EXECUTION_FAILED
+    assert calls == ["entered"]

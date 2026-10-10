@@ -168,6 +168,8 @@ def _features(agent: Any, args: list[str], _context: dict[str, Any]) -> str:
 
 
 def _compact(agent: Any, _args: list[str], _context: dict[str, Any]) -> str:
+    if getattr(agent, "has_active_run", False):
+        return "当前运行尚未完成；请继续执行后再压缩消息。"
     if len(agent.messages) < 4:
         return "消息数量不足以进行压缩（至少需要 4 条）。"
     old_count = len(agent.messages)
@@ -223,6 +225,8 @@ def _skills(agent: Any, args: list[str], _context: dict[str, Any]) -> str:
 
 
 def _clear(agent: Any, _args: list[str], _context: dict[str, Any]) -> str:
+    if getattr(agent, "has_active_run", False):
+        return "当前运行尚未完成；请继续执行后再清除消息历史。"
     agent.messages.clear()
     if hasattr(agent, '_last_assistant_note'):
         agent._last_assistant_note = None

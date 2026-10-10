@@ -1,4 +1,19 @@
 
+## 2026-10-10 第四阶段六项审查修复
+
+- 在 `codex/explicit-run-state` Worktree 完成六项审查缺陷修复，基线/HEAD 仍为 `bf874d9`；保留第四阶段原有未提交改动，未提交、整合或推送。
+- 最后调用完成与批次收尾分开，继续前补齐 REPLAN；初始化异常传播且终结/恢复生命周期；重复调用反馈按当前 ID 关联；绑定错误与 handler 内 TypeError 分开；后台启动入口重新检查 Feature；POSIX 未引用 # 交给真实 Shell。取舍与证据见 `docs/evolution/tool_registry.md` 最新记录。
+- 新增 55 个回归用例。扩展定向回归 `206 passed, 12 skipped`；最终完整 `tests/unit` 为 `365 passed, 12 skipped, 4 failed`。前两项失败在 main 同样存在；两项 Reference Variant 是本 Worktree CRLF 与 LF oracle 哈希差异，main 同测试通过，oracle 未修改。4 项 Git Bash 注释/引用对照通过，Linux 全套验证仍待补齐。
+- 六项修复的确定性回归通过；完整单测仍非全绿。尚未跟踪的 `src/core/run_state.py`、`tests/unit/test_run_state.py` 必须在获准提交时一并纳入，Evolution Commit 保持 `PENDING`。
+
+## 2026-10-10 当前现场：第四阶段进程内 Run 状态
+
+- 第四阶段在独立 Worktree `D:\02_study\code\AgentProject\mini-claude-worktrees\explicit-run-state-resume` 的 `codex/explicit-run-state` 分支上进行，基于包含前三阶段的 main `bf874d921ad6f5b3c8c1cca93db52e60fa540598`。尚未提交、未整合、未推送。
+- 主 Agent 新增轻量 `RunState` / `ToolBatchState`。`run()` 创建新 Run，内部 `_continue_run()` 只继续内存中的 PAUSED Run；多工具批次保留有序调用、结果和游标，继续时跳过 LLM 重新生成和压缩清理，并在执行时重新检查 Feature。消息、Todo、治理历史、预算和 Trace 不因继续而重置。
+- 同进程安全暂停仅在工具结果边界触发；已完成调用不会重放，剩余调用保留原始 ID 与参数。HARD_STOP、取消和异常仍然终止；未实现持久化、跨进程 Resume 或 HITL。详情见 `docs/evolution/tool_registry.md` 新增的 2026-10-10 记录，Commit 暂记 PENDING。
+- 最终 Windows Python 3.14.3 定向回归：RunState / Tool Call closure `28 passed`；扩展 Runtime / CLI / ToolRegistry / Headless / Runtime Context 回归 `121 passed`；完整 `tests/unit` 为 `310 passed, 12 skipped, 4 failed`。两个失败（Provider fixture 缺配置字段、read_file schema 固定文本断言）在未修改 main 上也复现；两个 Reference Variant 在该 Worktree 因 CRLF 文件字节哈希不符失败，而 main 上通过。Reference 测试只操作系统临时目录，oracle 源文件测试前后哈希相同。没有真实 Provider 调用。
+- 下一步只需审阅最终 diff、确认 `git diff --check` 与所有未跟踪文件；本阶段要求停在不提交、不合并、不推送。POSIX Shell 实测仍按第三阶段 HANDOFF 待后续 Linux / GitHub Actions 验证。
+
 ## 2026-10-10 当前现场
 
 - Checkpoint / Resume / HITL 前置整理前三阶段已整合到本地 `main`：工具批次消息闭环（`c158978`）、dispatch 前 Feature 能力校验（`3f61cee`）、ShellSession cwd/env 状态语义（`123586a`）。本地改动尚未推送。
