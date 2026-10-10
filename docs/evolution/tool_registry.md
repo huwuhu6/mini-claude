@@ -114,8 +114,8 @@ Windows Python `3.14.3` 上，工具批次闭环、ToolRegistry、工具观察�
 
 ## 2026-10-10：限定 ShellSession 持久 cwd 的确认边界
 
-Commit: `PENDING`
-Commit Description: `fix: 只持久化可确认的 ShellSession cwd`
+Commit: `123586a`
+Commit Description: `fix: 修正 ShellSession cwd 与环境状态语义`
 
 ### Description
 
