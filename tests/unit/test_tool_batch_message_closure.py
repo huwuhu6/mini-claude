@@ -23,6 +23,7 @@ from core.loop_controller import (
     RuntimePolicyAdapter,
 )
 from core.runtime_context.observation import ObservationNormalizer
+from core.runtime_context.workspace_authority import WorkspaceAuthority
 from core.tools.base_tools import ToolResult
 from models.todo import TodoManager
 from providers.base import Message
@@ -97,6 +98,7 @@ def make_agent():
             shell_session=SimpleNamespace(session_id="shell-test"),
         )
         agent.preflight = SimpleNamespace(to_dict=lambda: {})
+        agent.workspace_authority = WorkspaceAuthority(Path("."))
         agent.runtime_policy = policy
         agent.loop_controller = LoopController(policy=policy)
         agent.runtime_observer = RuntimePolicyAdapter(policy)

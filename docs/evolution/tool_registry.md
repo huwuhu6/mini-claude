@@ -196,3 +196,56 @@ Windows Bash 的 start 路由曾绕过 background Feature。后台队列和主 A
 对已提交代码重新运行定向回归为 163 passed、2 skipped。另运行 7 项不写源码的独立内存故障注入：Tool Result 已写入后的游标推进前/后普通异常及 KeyboardInterrupt、下一模型请求前 finalized 与 REPLAN 写回检查，以及新 Run/继续入口的 SystemExit 原对象传播，均通过。未发现此次限定范围内的阻塞项；这不代表任意异步中断或持续写入故障具有事务保证。
 
 决定冻结第四阶段功能实现，暂缓合并 main，不推送。此前完整单测的四项基线/检出环境失败继续保留，跨平台验证可以后续独立处理，不混入 RunState 功能提交。Checkpoint 持久化和 HITL 审批留待后续获准的阶段。
+
+
+## 2026-10-10：暂停 Run 的 JSON 快照与新实例继续执行
+
+Commit: `PENDING`
+Commit Description: `feat: 增加暂停 Run 快照契约与跨实例继续执行`
+
+### Description
+
+第四阶段能在工具调用之间暂停，但继续执行仍依赖同一 Agent 内的消息、Todo、Note、治理历史和 Trace。本阶段在已经整合四阶段的 main `a3cbd53` 上建立显式 JSON 数据契约；没有增加另一套运行状态模型，也没有数据库或自动崩溃恢复。
+
+入口为 `export_run_snapshot()`、`restore_run_snapshot(snapshot)` 和已有 `_continue_run()`。导出只接受 PAUSED Run：当前批次的下一调用尚未 dispatch，或全部调用完成、下一模型请求尚未开始。恢复只安装暂停状态，不执行工具或请求模型；随后由调用方显式继续。仍然禁止在未完成 Run 上开始新任务或覆盖状态。
+
+Schema 版本为 1，顶层字段如下：
+
+| 字段 | 内容与所有权 |
+| --- | --- |
+| schema_version | 格式版本；当前无自动迁移 |
+| workspace | 规范绝对 root、cwd，以及 WorkspaceStateGuard 可观察范围的内容摘要 |
+| compatibility | 当前工具 schema / handler 源码标识、相关 Runtime 源码摘要、平台、Python 主次版本、非凭据 LLM 配置、压缩阈值与治理窗口 |
+| run | 现有 RunState；包含原始 ToolBatchState、模型预算、重试、原调用 ID / 参数、游标、结果、去重集合、延后的 REPLAN 与 finalized |
+| messages | Message 原字段；消息结果和批次结果必须一致 |
+| history | AttemptHistory 的有限窗口、所有事件字段和下一个序号，保持原精度 |
+| todo / agent_note | 有序 Todo 条目及有效 Note 文本；不保存旧 Note 文件路径 |
+| memory | rebuild 策略；不传递 Recent Files、观察或指纹缓存 |
+| context | 原任务文本、压缩提醒标志、最后 Assistant Note |
+| diagnostics | 原 Session / Trace ID 和累计用量；不传递活 Trace、客户端或锁 |
+
+恢复先复制并验证全部 JSON 数据，再准备新的 Trace 片段和 Note 文件，最后建立 Agent 状态。校验失败不会覆盖接收实例的消息、Todo、Note、治理历史或 Trace；准备阶段 IO 失败和中断也保留原状态。恢复的 history 被绑定到当前唯一 RuntimePolicy，LoopController、observer 和 completion gate 继续使用这同一个 policy，不重置旧历史。
+
+原始 Assistant 与批次必须逐项匹配；结果必须恰好对应游标前缀，内容与消息一致，结果连续且按原调用顺序。禁止缺结果、重复 / 孤立结果、错误 ID、额外模型批次以及 UNKNOWN 等终止闭合状态伪装成可恢复暂停。恢复不猜测结果、不调用清理器修补数据。最后调用后暂停仍先消费延后的 REPLAN，再请求下一轮模型；pending 批次沿用第四阶段的压缩和清理隔离。
+
+初版检查发现，仅匹配 workspace 路径无法发现导出后用户修改文件，旧的待执行覆盖写入仍可能覆盖新内容。最终复用 WorkspaceStateGuard 的现有文件观察生成摘要：可观察内容变化时拒绝导入。导入后、首次继续前再校验该摘要；一次性前置条件保存在 RunState 的 `workspace_checkpoint_digest` 中，初始化失败不会消费它，首个调用完成才清除。已执行工具自身的写入不会与旧摘要反复比较；再次暂停并导出时生成新的摘要。这不是文件系统锁或并发事务。
+
+cwd 在恢复及每次继续前按当前 WorkspaceAuthority 校验其授权和目录存在性。旧 additional_roots 不被继承；当前实例明确授权的根仍可使用。Feature 在实际 dispatch 时重新判断；前台 Bash 保留 BaseTools 的 CommandPolicy，后台路由保留 Agent 的独立 CommandPolicy。快照不传递旧授权、完整环境、Shell 进程、command_history 或后台任务表。有后台任务表的实例不支持本契约的导出 / 导入；没有实现子 Agent 执行栈恢复。
+
+新 Trace 是新的执行片段，request_config 关联同一 run_id 和原 trace_task_id；有 pending 调用时建立原模型轮次的部分 turn，记录 B/C，不增加模型请求或预算。SessionRecorder 使用新 Session ID，通过 run_snapshot_restored 关联原 Session / Trace。Todo 和 Note 内容保留；文件观察缓存清空，所以后续模型少了 Recent Files / 观察摘要，需要重新读取，历史 Tool Result 仍保留为历史消息。Compressor 沿用新实例，压缩提醒保留；旧归档文件、长输出文件和缓存不被搬运。
+
+### Result / Evidence
+
+新增测试使用真实 MiniClaudeAgent 构造、独立 Runtime 组件、Mock Provider / handler 和临时工作区。测试先确认旧实现没有快照入口，再覆盖 JSON round-trip、A 后暂停的新实例 B/C 执行、结果顺序和唯一性、模型请求次数、Todo / Note / 预算 / 重试 / 有界治理历史、准备失败、当前能力 / 命令 / 路径拒绝、文件内容与 cwd 变化、取消 UNKNOWN、批次收尾、重复导入 / 继续，以及合法写入后的再次跨实例恢复。
+
+Windows Python 3.14.3 上，快照专项为 `54 passed`；扩展定向回归（含 LoopController integration）为 `260 passed, 12 skipped`；最终完整 `tests/unit` 为 `419 passed, 12 skipped, 4 failed`。54 项新增测试全部通过，12 项跳过为既有平台相关用例，未运行真实 Provider 或 Terminal-Bench。
+
+未修改 main 上的同四项复核为 `2 failed, 2 passed`：Provider parse-error fixture 缺少 provider 等初始化字段，read_file description 不含断言所需原文，二者在 main 同样失败，未将其简单认定为失效断言。Node / Java Reference Variant 在 main 通过，新 Worktree 的 oracle 分别含 7 / 13 个 CRLF，归一化 LF 后与 HEAD 字节完全一致；测试只在 TemporaryDirectory 的副本修改实现。测试前后原 oracle 哈希不变，未修改 oracle、harness 或有效断言。
+
+### Decision / Limitation
+
+只支持受控暂停数据的移交，调用方必须安排一个有效继续者：导出不会撤销旧实例，同一快照复制给多个全新实例仍可能重复副作用。实例内用已见 Run ID 拒绝重复安装或回退；完成 / 终止 Run 的继续入口仍不会重跑调用。这不是全局去重、租约或任意历史回滚。
+
+源码和配置匹配采用保守拒绝策略，包括注释 / 格式等源码变化；不可检查源码的 handler 不能导出快照。指纹检查覆盖当前列明的模块和 handler，不证明动态 monkeypatch、闭包配置、插件依赖或所有外部工具版本相同。Workspace 摘要仅覆盖现有 guard 可观察的主根文件；忽略目录、不可读文件、额外根、远程服务和 Shell 外部资源不因此被锁定或证明不变。首次继续检查与实际文件操作之间仍有外部修改竞态。Shell cwd 也不是 Shell 沙箱。
+
+SQLite 阶段可以复用版本契约、验证器和安全边界；仍需原子保存 / 事务、唯一继续者、工具特定前置条件、外部产物归属、审批状态和副作用 UNKNOWN 的人工处理协议。本阶段未处理进程在 handler 内退出、工具成功但结果未保存、任意字节码位置中断或数据库加载。快照内容包含任务消息 / Note / 结果，未做加密或真实性签名；格式验证不证明其中历史事实真实。

@@ -76,6 +76,12 @@ class WorkspaceStateGuard:
                 continue
         return result
 
+    def content_digest(self) -> str:
+        """Checkpoint compatibility for the existing observable workspace scope."""
+        import json
+        payload = json.dumps(self.snapshot(), sort_keys=True, separators=(",", ":"))
+        return hashlib.sha256(payload.encode("utf-8")).hexdigest()
+
     @staticmethod
     def mutation(before: Dict[str, str], after: Dict[str, str]) -> WorkspaceMutation:
         changed = tuple(sorted(

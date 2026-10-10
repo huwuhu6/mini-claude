@@ -67,6 +67,10 @@ from core.run_state import (
     ToolBatchState,
     ToolCallResultState,
 )
+from core.run_snapshot import (
+    SCHEMA_VERSION, SNAPSHOT_FIELDS, decode_messages, decode_run, encode_run,
+    fields as snapshot_fields, json_copy, require as snapshot_require, text as snapshot_text,
+)
 from core.session_recorder import SessionLogHandler, SessionRecorder
 from core.failure_intelligence import FailureAnalyzer
 from core.runtime_context import (
@@ -288,6 +292,8 @@ class MiniClaudeAgent:
         # Tracks current user prompt for trace recording
         self._current_user_prompt: str = ""
         self._run_state: Optional[RunState] = None
+        # Instance-local replay guard; this is not a durable or cross-instance lease.
+        self._seen_run_ids: set[str] = set()
         # Workspace confirmation state for trace schema
         self._workspace_confirmed = workspace_confirmed
 
@@ -395,6 +401,8 @@ class MiniClaudeAgent:
             return "错误: 当前运行尚未完成；请先继续或终止该运行。"
         self._run_state = RunState(require_tool_call=require_tool_call)
         try:
+            self._seen_run_ids = getattr(self, "_seen_run_ids", set())
+            self._seen_run_ids.add(self._run_state.run_id)
             self.todo.reset()
             self._current_user_prompt = user_input
             self.messages.append(Message(role='user', content=user_input))
@@ -405,6 +413,185 @@ class MiniClaudeAgent:
             self._abort_run_initialization(self._run_state, exc)
             raise
         return self._llm_tool_cycle(require_tool_call=require_tool_call)
+
+    def _snapshot_compatibility(self) -> dict:
+        """Strict local implementation/config identity; credentials and grants excluded."""
+        from dataclasses import asdict
+        runtime_root = Path(__file__).resolve().parents[1]
+        # Fail closed after relevant implementation changes, including delegated helpers.
+        sources = ["agent/mini_claude_agent.py", "core/run_state.py", "core/run_snapshot.py",
+                   "core/loop_controller.py", "core/tools/base_tools.py", "core/tools/registry.py",
+                   "core/runtime_context/shell_session.py", "core/runtime_context/command_policy.py",
+                   "core/runtime_context/workspace_authority.py", "core/runtime_context/path_resolver.py",
+                   "core/features/manager.py", "core/compression.py",
+                   "core/runtime_context/workspace_state.py", "core/runtime_context/observation.py",
+                   "core/failure_intelligence/analyzer.py", "core/failure_intelligence/signatures.py",
+                   "core/failure_intelligence/models.py", "core/agent_note.py", "models/todo.py"]
+        source_hash = hashlib.sha256()
+        for relative in sources:
+            source_hash.update(relative.encode("utf-8"))
+            source_hash.update((runtime_root / relative).read_text(encoding="utf-8").encode("utf-8"))
+        return {
+            "runtime_source_hash": source_hash.hexdigest(),
+            "platform": sys.platform,
+            "python_version": list(sys.version_info[:2]),
+            "tools": self.tool_registry.execution_contract(),
+            "llm": {key: getattr(self.config.llm, key) for key in
+                    ("provider", "model", "max_tokens", "temperature", "stream")},
+            "compression": asdict(self.config.compression),
+            "history_maxlen": self.attempt_history.maxlen,
+            "loop_horizon": self.runtime_policy.loop_detector.intent_horizon,
+            "failure_horizon": self.runtime_policy.failure_detector.horizon,
+        }
+
+    def _validate_run_snapshot(self, raw: dict):
+        """Pure preparation: no live state, files, trace or authorization is overwritten."""
+        snapshot = json_copy(raw)
+        snapshot_fields(snapshot, SNAPSHOT_FIELDS, "Snapshot")
+        snapshot_require(type(snapshot["schema_version"]) is int
+                         and snapshot["schema_version"] == SCHEMA_VERSION, "快照版本不兼容")
+        snapshot_require(snapshot["compatibility"] == self._snapshot_compatibility(),
+                         "工具实现、Schema 或关键运行配置不兼容")
+        workspace = snapshot["workspace"]
+        snapshot_fields(workspace, {"root", "cwd", "content_digest"}, "Workspace")
+        for key in ("root", "cwd"):
+            snapshot_text(workspace[key], key, nonempty=True)
+            path = Path(workspace[key])
+            snapshot_require(path.is_absolute() and str(path.resolve()) == workspace[key],
+                             f"{key} 必须为当前有效的绝对规范路径")
+        snapshot_require(Path(workspace["root"]) == self.runtime_context.workspace_root
+                         and Path(workspace["root"]) == self.workspace_authority.primary_root,
+                         "Workspace 身份变化")
+        cwd = Path(workspace["cwd"])
+        snapshot_require(cwd.is_dir() and self.workspace_authority.is_authorized(cwd),
+                         "cwd 已不存在或不在当前授权范围")
+        snapshot_text(workspace["content_digest"], "工作区内容摘要")
+        snapshot_require(workspace["content_digest"] == self.workspace_state_guard.content_digest(),
+                         "工作区内容在导出后发生变化，无法安全继续原调用")
+        state = decode_run(snapshot["run"])
+        snapshot_require(state.workspace_checkpoint_digest in {None, workspace["content_digest"]},
+                         "Run 的工作区前置条件与快照冲突")
+        messages = decode_messages(snapshot["messages"], state)
+        snapshot_require(type(snapshot["history"]) is dict
+                         and snapshot["history"].get("maxlen") == self.attempt_history.maxlen,
+                         "历史窗口不兼容")
+        history = AttemptHistory.from_state(snapshot["history"])
+        snapshot_require(all(0 < e.turn <= state.model_turns_used for e in history),
+                         "治理历史轮次不属于已执行模型轮次")
+        todo = TodoManager()
+        snapshot_require(type(snapshot["todo"]) is list, "Todo 必须为列表")
+        for item in snapshot["todo"]:
+            snapshot_fields(item, {"content", "status", "activeForm"}, "Todo")
+            for key, value in item.items():
+                snapshot_text(value, f"Todo {key}", nonempty=True)
+        todo.update(snapshot["todo"])
+        snapshot_require(todo.items == snapshot["todo"], "Todo 数据不得被隐式修补")
+        snapshot_text(snapshot["agent_note"], "Agent Note")
+        snapshot_require(len(snapshot["agent_note"]) <= AgentNote.MAX_CHARS, "Note 超出上限")
+        snapshot_require(snapshot["memory"] == {"strategy": "rebuild"}, "文件记忆策略不兼容")
+        context = snapshot["context"]
+        snapshot_fields(context, {"user_prompt", "compression_notice_pending", "last_assistant_note"}, "Context")
+        snapshot_text(context["user_prompt"], "用户任务")
+        snapshot_require(type(context["compression_notice_pending"]) is bool, "压缩提示类型错误")
+        snapshot_require(context["last_assistant_note"] is None
+                         or type(context["last_assistant_note"]) is str, "Assistant Note 类型错误")
+        diagnostics = snapshot["diagnostics"]
+        snapshot_fields(diagnostics, {"source_session_id", "source_trace_task_id", "metrics"}, "Diagnostics")
+        snapshot_text(diagnostics["source_session_id"], "原 Session ID", nonempty=True)
+        snapshot_require(diagnostics["source_trace_task_id"] == state.trace_task_id, "原 Trace ID 不一致")
+        metrics = diagnostics["metrics"]
+        snapshot_fields(metrics, set(self._empty_usage_metrics()), "Metrics")
+        snapshot_require(all(type(v) in {int, float} and v >= 0 for v in metrics.values())
+                         and metrics["turns"] == state.model_turns_used, "用量指标不一致")
+        return snapshot, state, messages, todo, history, cwd
+
+    def export_run_snapshot(self) -> dict:
+        """Export only a controlled PAUSED boundary; never an executing handler."""
+        state = self._run_state
+        snapshot_require(state is not None and state.status is RunStatus.PAUSED,
+                         "只能导出安全边界暂停中的 Run")
+        snapshot_require(not self.background.list(), "后台任务表不属于本快照契约")
+        from dataclasses import asdict
+        snapshot = json_copy({
+            "schema_version": SCHEMA_VERSION,
+            "workspace": {"root": str(self.runtime_context.workspace_root),
+                          "cwd": str(self.runtime_context.cwd.resolve()),
+                          "content_digest": self.workspace_state_guard.content_digest()},
+            "compatibility": self._snapshot_compatibility(),
+            "run": encode_run(state),
+            "messages": [asdict(message) for message in self.messages],
+            "history": self.attempt_history.export_state(),
+            "todo": self.todo.items,
+            "agent_note": self.agent_note.read(),
+            "memory": {"strategy": "rebuild"},
+            "context": {"user_prompt": self._current_user_prompt,
+                        "compression_notice_pending": self._compression_notice_pending,
+                        "last_assistant_note": self._last_assistant_note},
+            "diagnostics": {"source_session_id": self.session_recorder.session_id,
+                            "source_trace_task_id": state.trace_task_id,
+                            "metrics": self.last_metrics},
+        })
+        self._validate_run_snapshot(snapshot)  # Refuse inconsistent live state, never repair it.
+        return snapshot
+
+    def restore_run_snapshot(self, snapshot: dict) -> None:
+        """Install validated detached state; caller explicitly continues the paused Run."""
+        snapshot_require(not self.has_active_run, "已有未完成 Run，不能被快照覆盖")
+        snapshot_require(not self.background.list(), "恢复目标有独立后台任务")
+        data, state, messages, todo, history, cwd = self._validate_run_snapshot(snapshot)
+        seen_ids = getattr(self, "_seen_run_ids", set())
+        snapshot_require(state.run_id not in seen_ids
+                         and (self._run_state is None or self._run_state.run_id != state.run_id),
+                         "本实例已经持有或执行过该 Run，拒绝回退重放")
+        # Prepare fallible components before publishing; old state survives IO failure.
+        trace = TraceManager(trace_dir=self.data_paths.traces)
+        source_trace_id = state.trace_task_id
+        state.trace_task_id = self._create_run_trace(
+            trace, state, data["context"]["user_prompt"], resumed_from=source_trace_id)
+        state.trace_started = True
+        state.workspace_checkpoint_digest = data["workspace"]["content_digest"]
+        if state.has_pending_tool_batch:
+            # This is a partial diagnostic turn, not another model request.
+            trace.start_turn(state.tool_batch.model_iteration)
+            trace.set_message_count(len(messages))
+        note = AgentNote(self.data_paths.root)
+        note.replace(data["agent_note"])
+        memory = StructuredContextMemory(max_recent_files=self.memory.max_recent_files,
+            max_observations=self.memory.max_observations, max_render_chars=self.memory.max_render_chars)
+        restored_seen_ids = seen_ids | {state.run_id}
+        # No handler, observer reset or user-input append occurs in this commit section.
+        self.messages = messages
+        self.todo = todo
+        self.agent_note = note
+        self.attempt_history = history
+        self.runtime_policy.history = history
+        self.memory = memory
+        self._memory_file_fingerprints = {}
+        self.runtime_context.shell_session.cwd = cwd
+        self.trace = trace
+        self.runtime_context.current_task_id = state.trace_task_id
+        self._current_user_prompt = data["context"]["user_prompt"]
+        self._compression_notice_pending = data["context"]["compression_notice_pending"]
+        self._last_assistant_note = data["context"]["last_assistant_note"]
+        self.last_metrics = data["diagnostics"]["metrics"]
+        self._seen_run_ids = restored_seen_ids
+        self._run_state = state
+        self.session_recorder.record("run_snapshot_restored", run_id=state.run_id,
+            trace_task_id=state.trace_task_id, source_trace_task_id=source_trace_id,
+            source_session_id=data["diagnostics"]["source_session_id"])
+
+    def _create_run_trace(self, trace, state, prompt: str, *, resumed_from: str | None = None) -> str:
+        """Create a diagnostic segment without resetting execution/governance state."""
+        request_config = {key: getattr(self.config.llm, key) for key in
+                          ("provider", "model", "max_tokens", "temperature", "stream")}
+        request_config["run_id"] = state.run_id
+        if resumed_from is not None:
+            request_config["resumed_from_trace_task_id"] = resumed_from
+        return trace.start_task(user_prompt=prompt,
+            workspace_root=str(self.runtime_context.workspace_root),
+            workspace_confirmed=self._workspace_confirmed,
+            require_tool_call=state.require_tool_call, environment=self.preflight.to_dict(),
+            request_config=request_config)
 
     @property
     def has_pending_tool_batch(self) -> bool:
@@ -439,6 +626,13 @@ class MiniClaudeAgent:
             return "错误: 当前运行未处于可继续的暂停状态。"
 
         try:
+            # Grants and directories can change after snapshot validation or a pause.
+            cwd = self.workspace_authority.check(str(self.runtime_context.cwd.resolve()))
+            if not cwd.is_dir():
+                raise ValueError("继续运行的 cwd 已不存在或不是目录")
+            if state.workspace_checkpoint_digest is not None:
+                snapshot_require(state.workspace_checkpoint_digest == self.workspace_state_guard.content_digest(),
+                                 "工作区内容在导入后发生变化，无法安全继续原调用")
             state.resume()
             self.session_recorder.record(
                 "run_continued",
@@ -450,7 +644,7 @@ class MiniClaudeAgent:
                 ),
             )
         except BaseException as exc:
-            # The recorder failed before entering the cycle or dispatching.
+            # Continue preparation failed before entering the cycle or dispatching.
             self._abort_run_initialization(state, exc, continuing=True)
             raise
         result = self._llm_tool_cycle(
@@ -1762,6 +1956,9 @@ class MiniClaudeAgent:
             require_tool_call = state.require_tool_call
 
         try:
+            if is_new_run:
+                self._seen_run_ids = getattr(self, "_seen_run_ids", set())
+                self._seen_run_ids.add(state.run_id)
             provider = self.provider_manager.get_primary_provider()
             if not provider and not state.has_pending_tool_batch:
                 return self._finish_run(
@@ -1776,20 +1973,7 @@ class MiniClaudeAgent:
                 # New Run initialization happens once. Continuing an in-memory batch
                 # keeps its Trace task and governance history alive.
                 self.last_metrics = self._empty_usage_metrics()
-                tid = self.trace.start_task(
-                    user_prompt=self._current_user_prompt,
-                    workspace_root=str(self.runtime_context.workspace_root),
-                    workspace_confirmed=self._workspace_confirmed,
-                    require_tool_call=state.require_tool_call,
-                    environment=self.preflight.to_dict(),
-                    request_config={
-                        "provider": self.config.llm.provider,
-                        "model": self.config.llm.model,
-                        "max_tokens": self.config.llm.max_tokens,
-                        "temperature": self.config.llm.temperature,
-                        "stream": self.config.llm.stream,
-                    },
-                )
+                tid = self._create_run_trace(self.trace, state, self._current_user_prompt)
                 state.trace_task_id = tid
                 state.trace_started = True
                 self.session_recorder.record(

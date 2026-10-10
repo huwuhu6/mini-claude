@@ -132,6 +132,8 @@ class RunState:
     trace_task_id: str | None = None
     tool_batch: ToolBatchState | None = None
     terminal_result: str | None = None
+    # Imported workspace precondition, retained through preparation failures.
+    workspace_checkpoint_digest: str | None = None
 
     @property
     def has_pending_tool_batch(self) -> bool:
@@ -172,6 +174,9 @@ class RunState:
             content,
             pause_requested=self.pause_requested,
         )
+        # The first completed call consumes the import boundary. Later tool writes
+        # are ordinary run effects and must not be compared to the old workspace.
+        self.workspace_checkpoint_digest = None
         if advance is ToolBatchAdvance.PAUSED:
             self.pause_requested = False
             self.status = RunStatus.PAUSED

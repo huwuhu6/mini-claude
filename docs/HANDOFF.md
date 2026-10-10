@@ -1,16 +1,13 @@
+## 2026-10-10 当前现场：第五阶段暂停快照契约
 
-## 2026-10-10 第四阶段最终审查与冻结
-
-- 功能分支 `codex/explicit-run-state` 已提交第四阶段：`a3ef6b3`，提交说明为 `refactor: 显式维护主 Agent Run 与进程内工具批次继续执行`；基于 main `bf874d9`，Worktree 为 `D:\02_study\code\AgentProject\mini-claude-worktrees\explicit-run-state-resume`。两个原未跟踪文件 `src/core/run_state.py`、`tests/unit/test_run_state.py` 已确认在功能提交中入库。
-- 提交后进行限定范围的独立最终审查：批次 finalized 在反馈写回后设置；继续入口在下一模型请求前完成收尾；初始化中断原样传播且不留下不可恢复 RUNNING；异常闭合按当前 Call ID 保留真实结果。未发现审查范围内的阻塞项。机制、证据和限制以 `docs/evolution/tool_registry.md` 为准。
-- 已提交代码本轮定向回归为 `163 passed, 2 skipped`，另有 7 项独立内存故障注入通过。上轮完整 `tests/unit` 为 `365 passed, 12 skipped, 4 failed`；两项 main 已有失败及两项 CRLF oracle 哈希差异保持可见，未改 oracle 或断言。完整单测本轮未重复运行。
-- 按用户最终决定冻结第四阶段，暂缓合并 main，不推送、不扩展功能。Evolution 已回填真实功能提交 SHA；本次仅用单独文档提交记录审查状态。Linux 全套验证可后续独立处理，持久化 Checkpoint 和 HITL 审批留待后续阶段。
-
-## 2026-10-10 当前现场
-
-- Checkpoint / Resume / HITL 前置整理前三阶段已整合到本地 `main`：工具批次消息闭环（`c158978`）、dispatch 前 Feature 能力校验（`3f61cee`）、ShellSession cwd/env 状态语义（`123586a`）。本地改动尚未推送。
-- ShellSession 只在成功校验的纯 `cd` 调用中持久更新逻辑 cwd；复合命令的 cwd 仅作用于该子进程，`cwd_override` 不改变会话 cwd。环境变量继承当前进程环境，不提供跨调用持久环境覆盖。
-- Windows Python 3.14.3 定向回归为 113 passed、12 skipped。10 项 POSIX Shell 测试和 2 项 symlink 测试因平台条件跳过；POSIX 实测待后续 Linux/GitHub Actions 补齐，不阻塞第四阶段。第三阶段 Worktree 保留且干净。
+- 前四阶段已经整合到本地 main，HEAD 为 `a3cbd530631fdd9d54616624bcc6de0b6eccf512`；第四阶段功能提交为 `a3ef6b3`。之前“暂缓合并”的现场记录已经被后续安全 fast-forward 整合取代。
+- 第五阶段在分支 `codex/run-snapshot-contract`、Worktree `D:\02_study\code\AgentProject\mini-claude-worktrees\run-snapshot-contract` 开发；基线 / 当前 HEAD 仍为 `a3cbd53`，本轮未提交、合并或推送，没有修改其他 Worktree。
+- 新增 JSON schema v1：export_run_snapshot() 只导出受控 PAUSED 状态；restore_run_snapshot() 先完整验证，再装入新实例，随后显式 _continue_run()。消息、原 Call ID / 参数、结果前缀 / 游标、预算、重试、Todo、Note 内容及有界 AttemptHistory 恢复。没有 SQLite、跨进程崩溃恢复或 HITL。
+- 当前工具 / 关键配置 / Workspace 不兼容时拒绝；可观察工作区内容变化时拒绝导入或首次继续。该前置条件保存在 RunState，在首个完成调用后消费。cwd 在恢复与继续时用当前授权重新检查。执行仍使用当前 Feature / CommandPolicy / WorkspaceAuthority；旧授权和环境不被复制。
+- 新实例建立新 Trace / Session 片段并关联原 Run。文件观察与 Recent Files 重建，不把陈旧观察当当前事实。后台任务表、子 Agent 栈、旧 Shell / 客户端 / 锁不恢复。
+- 最终 Windows Python 3.14.3 验证：快照专项 54 passed；扩展 Runtime / Tools / CLI / LoopController 定向回归 260 passed、12 skipped；完整 tests/unit 419 passed、12 skipped、4 failed。main 同四项复核 2 failed、2 passed，仍为 Provider fixture / schema 文本断言两项基线问题与两项 Worktree CRLF oracle 哈希差异；原 oracle 未改。Linux 全套验证仍未执行。
+- 当前新增的 `src/core/run_snapshot.py`、`tests/unit/test_run_snapshot.py` 尚未跟踪，后续提交必须明确 git add；Evolution 的本阶段 Commit 为 PENDING，获得真实实现 SHA 后再回填。完整契约、取舍及限制以 docs/evolution/tool_registry.md 为准。
+- 快照复制给多个新实例没有全局去重保证；调用方需要唯一继续者。本轮只支持受控暂停边界，不支持副作用成功后结果未落盘、handler 内退出或任意异步中断。
 
 ## 2026-10-01 当前现场
 

@@ -586,6 +586,62 @@ class AttemptHistory:
         self._events.clear()
         self._next_sequence = 1
 
+    def export_state(self) -> dict:
+        """Lossless bounded facts; reporting to_dict intentionally rounds timings."""
+        from dataclasses import asdict
+        events = []
+        for event in self._events:
+            data = asdict(event)
+            data["status"] = event.status.value
+            for key, value in data.items():
+                if isinstance(value, tuple):
+                    data[key] = list(value)
+            events.append(data)
+        return {"maxlen": self.maxlen, "next_sequence": self._next_sequence, "events": events}
+
+    @classmethod
+    def from_state(cls, data: dict) -> "AttemptHistory":
+        """Validate before constructing a fresh window, preserving the global sequence."""
+        import math
+        from core.run_snapshot import fields, integer, require
+        fields(data, {"maxlen", "next_sequence", "events"}, "AttemptHistory")
+        integer(data["maxlen"], "历史窗口", 1)
+        integer(data["next_sequence"], "下一历史序号", 1)
+        require(type(data["events"]) is list and len(data["events"]) <= data["maxlen"],
+                "历史窗口大小无效")
+        template = AttemptEvent(0, 0, "", "", "", AttemptStatus.SUCCESS)
+        history = cls(maxlen=data["maxlen"])
+        for raw in data["events"]:
+            fields(raw, set(AttemptEvent.__dataclass_fields__), "AttemptEvent")
+            values = dict(raw)
+            for key, value in raw.items():
+                expected = getattr(template, key)
+                if key == "status":
+                    require(type(value) is str and value in {s.value for s in AttemptStatus},
+                            "历史状态错误")
+                    values[key] = AttemptStatus(value)
+                elif key == "exit_code":
+                    require(value is None or type(value) is int, "历史退出码错误")
+                elif isinstance(expected, tuple):
+                    item_type = int if key == "segment_exit_codes" else str
+                    require(type(value) is list and all(type(v) is item_type for v in value),
+                            f"历史 {key} 错误")
+                    values[key] = tuple(value)
+                elif type(expected) is float:
+                    require(type(value) in {float, int} and math.isfinite(value) and value >= 0,
+                            f"历史 {key} 错误")
+                else:
+                    require(type(value) is type(expected), f"历史 {key} 类型错误")
+            integer(raw["sequence"], "历史序号", 1)
+            integer(raw["turn"], "历史轮次")
+            history._events.append(AttemptEvent(**values))
+        sequence = data["next_sequence"]
+        require([e.sequence for e in history] == list(range(sequence - len(history), sequence))
+                and (bool(history.all()) or sequence == 1)
+                and sequence > len(history), "历史序号不连续")
+        history._next_sequence = sequence
+        return history
+
 
 @dataclass(frozen=True)
 class LoopEvidence:
