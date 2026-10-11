@@ -253,7 +253,7 @@ SQLite 阶段可以复用版本契约、验证器和安全边界；仍需原子�
 
 ## 2026-10-11：SQLite Checkpoint 与保守故障恢复
 
-Commit: `PENDING`
+Commit: `d892ed3d27c3269bc6843d959634a0e4b11c80d2`
 Commit Description: `feat: 引入 SQLite Checkpoint 与保守故障恢复`
 
 ### Description
