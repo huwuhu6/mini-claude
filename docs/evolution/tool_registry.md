@@ -327,7 +327,7 @@ Windows Python 3.14.3 上新增权限 25 项、审批 41 项，合计 66 项全�
 
 ## 2026-10-11：第七阶段 B：主 Agent 的持久化审批等待与原批次继续
 
-Commit: `PENDING`
+Commit: `f069085c9f072f8fd97511e05eb6b41f33e6aa29`
 Commit Description: `feat: 接入持久化 HITL 暂停与审批后工具继续`
 
 ### Description
@@ -353,6 +353,8 @@ REJECTED 不运行当前调用和剩余依赖调用；为它们按原 ID 写连�
 Windows Python 3.14.3 最终冻结代码的完整 tests/unit 为 601 passed、12 skipped、4 failed；新增 HITL 58 项全部通过，其中 52 项非进程测试、6 项真正独立 Python 进程测试。LoopController integration 35 passed。确定性覆盖实际 ALLOW / DENY / ASK、前缀保存、连续审批、批准 / 拒绝、去重、参数形态、Todo / Note / cwd / 预算、手动 / 自动压缩保护、审批身份损坏、上下文失效、请求 / 消费 / 结果事务提交前后故障、迁移及回滚、正常关闭模式回归，以及真实进程的等待 / 决策 / 原批次继续、活 handler 竞争与死亡。没有付费 Provider、危险 Shell 或 Terminal-Bench；12 项跳过沿用平台限制，Linux 实测尚未进行。
 
 首轮完整测试期间源码仍在修改，有一项真实进程恢复被源码指纹检查拒绝，该次结果不作为最终验收；冻结生产代码和测试后重新完整运行，最终只剩四项历史失败。审批后的 cwd / 参数 / Feature 等校验，以及等待返回后诊断错误和中断的传播均有回归；测试通过不表示可以自动恢复 UNKNOWN 副作用。
+
+提交前再次运行 HITL Runtime、审批、权限、Checkpoint Store / Runtime、Snapshot、RunState、工具消息闭环与 LoopController integration 定向集：333 passed。显式设置 PYTHONPATH=src；首次未设置时仅出现模块导入收集错误，不作为代码回归。完整单测未在本次整合操作重跑，上述 601 passed、12 skipped、4 failed 为此前冻结代码的验收记录。
 
 本轮未修改 main `899fa3c` 上同四项历史失败复核为 2 failed、2 passed：Provider fixture 缺 provider 字段、read_file 描述原文字串断言仍失败；Node / Java Reference Variant 在 main 通过，本 Worktree 保留 CRLF oracle 字节哈希差异。原 oracle SHA256 与 7A 一致，不修改 oracle 或删除有效断言。
 
