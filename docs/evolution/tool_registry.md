@@ -291,7 +291,7 @@ POSIX flock 和真实 Linux shell 尚待 Linux 环境验证，Windows 核心故�
 
 ## 2026-10-11：第七阶段 A：权限决策与持久化审批契约
 
-Commit: `PENDING`
+Commit: `2518787fe6b4531ab8055774e3ae65373186700b`
 Commit Description: `feat: 建立 HITL 权限决策与持久化审批契约`
 
 ### Description
