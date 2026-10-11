@@ -287,3 +287,39 @@ Windows Python 3.14.3 最终完整 tests/unit 为 477 passed、12 skipped、4 fa
 恢复沿用现有源码 / 配置兼容检查、WorkspaceStateGuard 摘要、cwd 存在及当前路径授权检查，实际 dispatch 重查当前 Feature / CommandPolicy。它不扩大旧权限，也不是文件系统锁或 Shell 沙箱。工作区摘要观察范围、外部根 / 资源、动态依赖与执行前的外部修改竞态仍有第五阶段的限制。运行数据可能包含任务文本 / Note / 输出；未实现加密、真实性签名、数据库迁移或自动清理。
 
 POSIX flock 和真实 Linux shell 尚待 Linux 环境验证，Windows 核心故障协议已用真实子进程测试。未来 HITL 可以复用 PREPARED 安全边界、Run 锁、版本 CAS 与投影原子提交，但审批身份 / 授权有效期 / ASK 状态尚未设计。UNKNOWN 不提供自动清除、补偿或重试接口；本阶段也不支持任意历史回滚、分布式执行或跨机器共享数据库。
+
+
+## 2026-10-11：第七阶段 A：权限决策与持久化审批契约
+
+Commit: `PENDING`
+Commit Description: `feat: 建立 HITL 权限决策与持久化审批契约`
+
+### Description
+
+第六阶段确认了工具是否已经开始执行，却没有表达“此操作是否需要人的决定”。本阶段只增加数据契约和独立 Store API，没有让 Agent Loop 等待审批、调用新策略或执行获批工具，也没有 CLI approve/reject。
+
+PermissionDecision 表达 ALLOW / DENY / ASK，并包含完整操作绑定、策略版本、规则 ID 与可展示原因。ALLOW 不是执行成功，DENY 不是 handler 失败，ASK 不是 UNKNOWN 或 NOT_EXECUTED；这些对象不会写 Tool Result 或进入 AttemptHistory。未知风险保守采用 ASK。当前 Feature、注册状态、参数绑定、路径授权、CommandPolicy 硬拒绝优先，审批不能扩充这些能力。Windows Bash start 的后台能力也先检查。
+
+默认策略只自动允许核实过的内置 handler 身份：BaseTools 的 read_file、list_files、search_code、count_occurrences，以及主 Agent 对应包装和 get_background_status。同名工具被替换为自定义 handler 后不因此 ALLOW。搜索通配符降为 ASK，真正执行时仍须按 BaseTools 原规则逐项校验目标。write_file/edit_file、Shell、后台启动、网络 health_check、停止进程、Todo、Agent Note、skills 和未知风险的已注册工具采用 ASK：其中 Todo/Note 修改 Runtime 状态，health_check 有外部请求，不能凭工具名当成纯查询。日志格式化可能写诊断文件，本契约的只读指向工作区 / 外部业务操作，不承诺进程完全没有诊断 IO。
+
+ToolOperation 使用规范 JSON 保存原始 Provider 调用，完整参数可独立取得规范摘要；批次身份由 run_id / turn 派生，内部调用身份由 run_id / turn / ordinal / Provider ID 派生。绑定还包括规范 workspace / 有效 cwd、Workspace 摘要、工具 schema / 实现指纹、有效能力 / 当前授权根 / CommandPolicy 摘要、Runtime 兼容摘要和策略版本。MainAgent 策略工厂每次评估重新观察当前 Workspace / Runtime 摘要，通用独立策略的调用方负责提供新鲜观察；不持久化旧授权根作为新的授权，也不复制环境或凭据。
+
+SQLite user_version 从 1 升级为 2，新增 approvals 表；runs / calls 的字段和既有记录不改写。初始化持 BEGIN IMMEDIATE，版本检查、建表和版本更新同一事务；失败回滚，没有不受控的 executescript 隐式提交。升级后的旧记录可以按原 Journal 协议加载与继续；Schema 升级不解除既有 Snapshot 的源码 / 配置兼容门槛，旧程序生成的 Run 如果源码摘要不兼容仍会被 Agent 拒绝恢复，不能伪造历史摘要来放行。
+
+审批表保存 approval_id、run_id / turn / ordinal、完整权限决策 JSON、绑定摘要、状态、创建 / 到期时间、用户决定 / 决策者 / 决定时间、消费时间与失效原因。外键直接关联 calls 的主键，唯一约束使一个具体调用只有一个审批记录；Provider ID、工具、参数和上下文保存在决策 JSON 中并逐项核对。审批不是第二套执行日志，创建或批准都保持 calls 为 PREPARED。
+
+合法转换为 PENDING→APPROVED / REJECTED / INVALIDATED，APPROVED→CONSUMED / INVALIDATED；REJECTED / INVALIDATED / CONSUMED 不重新激活。相同请求返回原记录，同一用户的同一决定保留原时间，冲突用户或相反决定拒绝；重复操作不推进 Run 版本，真实审批变更推进版本以隔离旧内存继续者。过期与上下文改变时提交 INVALIDATED 后再向调用方报错；失效记录要求重新规划为新调用，本阶段不循环复用审批 ID。
+
+ApprovalStore 使用既有 Checkpoint Store 的连接、Run 内核锁、事务、版本与提交异常核验，不引入另一个数据库服务。consume_and_mark_running() 是事务契约测试入口：持锁检查当前策略、绑定、未消费批准、当前 PREPARED 位置与 Run 版本，同一事务写 CONSUMED 和 RUNNING；不调用 handler、推进游标或伪造结果。存在审批记录的调用不能通过普通 mark_running() 绕过消费。消费事务后退出仍按第六阶段规则恢复为 UNKNOWN，不拿原批准重试。
+
+### Result / Evidence
+
+Windows Python 3.14.3 上新增权限 25 项、审批 41 项，合计 66 项全部通过。权限 / 审批 / Store 定向集为 87 passed、1 deselected；最终完整 tests/unit 为 543 passed、12 skipped、4 failed（包含 Checkpoint 的独立进程测试与 Snapshot 回归）；LoopController integration 35 passed。测试覆盖三类决策与真实 handler 分类、硬拒绝不可伪装为 ASK、JSON / SQLite round-trip、重复请求 / 决定、冲突决定、错 Run / 调用 / 参数 / Workspace、过期 / 失效 / 消费、双 Store 竞争、请求 / 决策 / 消费事务失败及提交后异常、v1 迁移保持旧投影和 Journal，以及迁移回滚。审批测试不执行 handler；既有 Checkpoint 真实子进程回归另行验证执行协议未破坏。
+
+本轮在未修改 main `c97f917` 上复核同四项，得到 2 failed / 2 passed。Provider fixture 缺 provider 初始化字段、read_file 描述原文字串断言仍在 main 失败；Node / Java Reference Variant 在 main 通过，在本 Worktree 因 CRLF oracle 哈希差异失败。原 oracle 的 SHA256 与第六阶段记录一致，未修改评测数据或有效断言。12 项跳过沿用平台限制；没有付费 Provider 或 Terminal-Bench，Linux 实测仍未进行。
+
+### Decision / Limitation
+
+7B 的准确接入点在 _execute_tool() 已确认注册 / 当前 Feature 后、_checkpoint_dispatch() 提交 RUNNING 和 Registry.execute() 调用 handler 前。ASK 的持久化等待必须保持当前调用 PREPARED，不生成终结 Tool Result、不消耗批次游标、不计失败；需要由下一阶段增加明确暂停 / 审批恢复协调。获批继续时要重新绑定当前上下文并原子消费，不能先标 RUNNING 再请求批准。
+
+目前全部 Agent、SubAgent、公开 run_background/run_subagent、直接 Registry / BaseTools 入口仍未使用新权限策略；第六阶段持久化模式原有后台 / SubAgent 拒绝继续有效。没有通知、用户身份认证、审批 UI、自动 Resume、RBAC、Shell AST / 沙箱或 UNKNOWN 补偿。actor 是调用方提供的审计身份，不是认证机制；数据库按受信任本地存储处理，JSON 验证 / 摘要不是真实性签名。Policy 检查也不是文件系统事务，外部修改竞态及 Workspace 摘要观察范围沿用既有限制。审批参数可能包含敏感内容，Store 不把它们额外写入诊断日志。

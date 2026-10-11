@@ -265,6 +265,8 @@ CLI
 - `src/core/compression.py` 使用 `tiktoken` 做 estimated token 估算；包未安装或编码资源初始化失败时会安全回退到粗略估算，不提供 provider-specific tokenizer。Provider 返回的 `usage.prompt_tokens` 才是实际请求用量。
 - 评测结果中的过程指标用于工程分析，不等同于通用 Agent 能力排名。
 
+HITL 的权限决策与持久化审批记录目前仅提供开发契约，尚未接入 Agent 执行、暂停或 CLI 交互；默认运行不会请求或消费审批。详见 [工具与 Runtime 演进](docs/evolution/tool_registry.md)。
+
 ## 工程讨论主题
 
 这个项目最适合用来讨论 Agent runtime 的工程问题：workspace 边界、工具调用循环、失败恢复、循环防护、trace/evaluation、模块化 provider，以及从单文件原型迁移到分层架构时的取舍。

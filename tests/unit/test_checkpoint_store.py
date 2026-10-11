@@ -9,7 +9,7 @@ import sys
 
 import pytest
 
-from core.checkpoint_store import CheckpointError, CheckpointCommitError, RunBusyError, SqliteCheckpointStore
+from core.checkpoint_store import CheckpointError, CheckpointCommitError, RunBusyError, SqliteCheckpointStore, DB_VERSION
 from core.run_state import RunState, RunStatus, ToolBatchState, ToolBatchStatus
 from core.run_snapshot import encode_run
 from providers.base import Message
@@ -60,13 +60,13 @@ def test_schema_and_snapshot_roundtrip(ready):
     assert row["snapshot"] == data and row["revision"] == revision
     assert [r["state"] for r in row["journal"]] == ["PREPARED", "PREPARED"]
     with sqlite3.connect(store.path) as connection:
-        assert connection.execute("PRAGMA user_version").fetchone()[0] == 1
+        assert connection.execute("PRAGMA user_version").fetchone()[0] == DB_VERSION
         assert connection.execute("PRAGMA journal_mode").fetchone()[0] == "wal"
     with store._connection() as connection:
         assert connection.execute("PRAGMA synchronous").fetchone()[0] == 2
 
 
-@pytest.mark.parametrize("version", [2, 999])
+@pytest.mark.parametrize("version", [3, 999])
 def test_incompatible_schema_refused(tmp_path, version):
     path = tmp_path / "db"
     with sqlite3.connect(path) as connection:

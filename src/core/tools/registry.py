@@ -57,6 +57,10 @@ class ToolRegistry:
             }
         return contracts
 
+    def get_spec(self, name: str) -> ToolSpec | None:
+        """Inspect a registered contract without dispatching its handler."""
+        return self._tools.get(name)
+
     def has_handler(self, name: str) -> bool:
         return name in self._tools
 

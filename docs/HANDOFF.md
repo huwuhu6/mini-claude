@@ -1,3 +1,12 @@
+## 2026-10-11 当前现场：第七阶段 A 权限与审批契约
+
+- 基线 / main 为 `c97f917a8ac591c1bc76c322824f422842e46107`，第六阶段功能提交 `d892ed3` 已整合。当前分支 `codex/hitl-permission-contract`，Worktree `D:\02_study\code\AgentProject\mini-claude-worktrees\hitl-permission-contract`，尚未提交；不合并、不推送、不进入 7B。
+- 新增 PermissionDecision / ToolOperation 与 DefaultPermissionPolicy。已有硬拒绝优先，只核实过的内置只读 handler ALLOW；写入、Shell、网络 / 状态变更与未知风险 ASK。本阶段未调用新策略改变正常 Agent 流程。
+- 新增 ApprovalStore / ApprovalRecord，复用 Checkpoint 数据库及 Run 锁。SQLite v1→v2 事务迁移新增 approvals，保持 runs / calls 不变；原 Snapshot 源码兼容约束仍然有效。
+- 创建 / 用户决定只保留审批事实，调用仍 PREPARED。消费 API 在同一事务写 CONSUMED + RUNNING，不执行 handler；重复消费拒绝，遗留 RUNNING 仍 UNKNOWN。失效批准不复活，重规划为新调用。
+- Windows Python 3.14.3：新增权限 / 审批 66 项全部通过；定向集 87 passed、1 deselected；完整 tests/unit 543 passed、12 skipped、4 failed；LoopController integration 35 passed。main 同四项复核 2 failed、2 passed，未出现新增回归。完整单测原有 Provider fixture / schema 文本断言及 Worktree CRLF oracle 两项问题的归因保留，禁止修改 oracle 或断言掩盖失败。
+- 精确字段、合法转换、验证证据及接入边界以 docs/evolution/tool_registry.md 第七阶段 A 记录为准，Commit 标记 PENDING。下一阶段才协调 ASK 暂停、用户交互、当前上下文重新核验与恢复；权限记录不承担用户认证、沙箱或副作用补偿。
+
 ## 2026-10-11 当前现场：第六阶段 SQLite Checkpoint
 
 - 第六阶段整合基线是已包含前五阶段的本地 main `9f6a313cfe75e3c1d9a07db109cdf4d83d50a383`；第五阶段实现为 `f6ff2571fa2a8f0d826a7a83a1a8ea6b21bfd8a1`。

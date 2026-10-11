@@ -12,7 +12,7 @@ import uuid
 
 from core.run_snapshot import SCHEMA_VERSION, CHECKPOINT_SNAPSHOT_VERSION, SNAPSHOT_FIELDS, decode_messages, decode_run, fields, json_copy, require, call_ids, PAUSED_RESULT_OUTCOMES
 
-DB_VERSION = 1
+DB_VERSION = 2
 TERMINAL = {"completed", "terminated", "failed", "cancelled", "unknown"}
 
 
@@ -77,38 +77,55 @@ class SqliteCheckpointStore:
         self._closed = False
         with self._connection() as connection:
             connection.execute("PRAGMA journal_mode=WAL")
-            version = connection.execute("PRAGMA user_version").fetchone()[0]
-            if version not in {0, DB_VERSION}:
-                raise CheckpointError(f"Checkpoint 数据库版本不兼容: {version}")
-            tables = connection.execute("SELECT name FROM sqlite_master WHERE type='table'").fetchall()
-            if version == 0 and tables:
-                raise CheckpointError("拒绝将未知数据库当作新的 Checkpoint Store")
-            if version == DB_VERSION:
-                expected = {"runs": {"run_id", "status", "revision", "payload", "payload_hash", "final_result", "last_operation", "boundary", "journal_hash"},
-                            "calls": {"run_id", "turn", "ordinal", "call_id", "call_json", "state", "result_json"}}
-                run_columns = {r[1] for r in connection.execute("PRAGMA table_info(runs)")}
-                call_columns = {r[1] for r in connection.execute("PRAGMA table_info(calls)")}
-                if run_columns != expected["runs"] or call_columns != expected["calls"]:
-                    raise CheckpointError("Checkpoint 数据库结构损坏或不兼容")
-                return
-            connection.executescript("""
-                BEGIN IMMEDIATE;
-                CREATE TABLE IF NOT EXISTS runs (
+            connection.execute("BEGIN IMMEDIATE")
+            try:
+                version = connection.execute("PRAGMA user_version").fetchone()[0]
+                if version not in {0, 1, DB_VERSION}:
+                    raise CheckpointError(f"Checkpoint 数据库版本不兼容: {version}")
+                tables = connection.execute("SELECT name FROM sqlite_master WHERE type='table'").fetchall()
+                if version == 0 and tables:
+                    raise CheckpointError("拒绝将未知数据库当作新的 Checkpoint Store")
+                if version == 0:
+                    connection.execute("""
+                    CREATE TABLE IF NOT EXISTS runs (
                     run_id TEXT PRIMARY KEY, status TEXT NOT NULL CHECK(status IN
-                      ('started','active','paused','completed','terminated','failed','cancelled','unknown')),
+                    ('started','active','paused','completed','terminated','failed','cancelled','unknown')),
                     revision INTEGER NOT NULL CHECK(revision > 0),
                     payload TEXT, payload_hash TEXT, final_result TEXT,
-                    last_operation TEXT NOT NULL, journal_hash TEXT NOT NULL DEFAULT '', boundary TEXT NOT NULL DEFAULT 'tools' CHECK(boundary IN ('tools','before_model','terminal')));
-                CREATE TABLE IF NOT EXISTS calls (
+                    last_operation TEXT NOT NULL, journal_hash TEXT NOT NULL DEFAULT '', boundary TEXT NOT NULL DEFAULT 'tools' CHECK(boundary IN ('tools','before_model','terminal')))
+                    """)
+                    connection.execute("""
+                    CREATE TABLE IF NOT EXISTS calls (
                     run_id TEXT NOT NULL REFERENCES runs(run_id), turn INTEGER NOT NULL,
                     ordinal INTEGER NOT NULL, call_id TEXT NOT NULL, call_json TEXT NOT NULL,
                     state TEXT NOT NULL CHECK(state IN
-                      ('PREPARED','RUNNING','COMPLETED','UNKNOWN','NOT_EXECUTED')),
+                    ('PREPARED','RUNNING','COMPLETED','UNKNOWN','NOT_EXECUTED')),
                     result_json TEXT,
-                    PRIMARY KEY(run_id,turn,ordinal), UNIQUE(run_id,turn,call_id));
-                PRAGMA user_version=1;
-                COMMIT;
-            """)
+                    PRIMARY KEY(run_id,turn,ordinal), UNIQUE(run_id,turn,call_id))
+                    """)
+                expected = {"runs": {"run_id", "status", "revision", "payload", "payload_hash", "final_result", "last_operation", "boundary", "journal_hash"},
+                            "calls": {"run_id", "turn", "ordinal", "call_id", "call_json", "state", "result_json"}}
+                for table, columns in expected.items():
+                    # Names are fixed schema constants, never user input.
+                    actual = {r[1] for r in connection.execute("PRAGMA table_info(" + table + ")")}
+                    if actual != columns:
+                        raise CheckpointError("Checkpoint 数据库结构损坏或不兼容")
+                if version < DB_VERSION:
+                    self._upgrade_approvals(connection)
+                from core.approvals import APPROVAL_COLUMNS
+                if {r[1] for r in connection.execute("PRAGMA table_info(approvals)")} != APPROVAL_COLUMNS:
+                    raise CheckpointError("审批数据库结构损坏或不兼容")
+                connection.commit()
+            except BaseException:
+                if connection.in_transaction:
+                    connection.rollback()
+                raise
+
+    @staticmethod
+    def _upgrade_approvals(connection):
+        from core.approvals import APPROVAL_DDL
+        connection.execute(APPROVAL_DDL)
+        connection.execute("PRAGMA user_version=2")
 
     @contextmanager
     def _connection(self):
@@ -280,20 +297,24 @@ class SqliteCheckpointStore:
             return revision + 1
         return self._write(run_id, operation)
 
+    def _start_call(self, connection, token, run_id, revision, turn, ordinal, call_id, *, call=None, approval_id=None):
+        row = self._current(connection, run_id, revision)
+        require(row["payload"] is not None, "尚未提交完整工具批次")
+        snapshot = json.loads(row["payload"])
+        batch = snapshot["run"]["tool_batch"]
+        require(batch is not None and batch["model_iteration"] == turn and batch["next_call_index"] == ordinal, "只能启动当前调用")
+        require(call is None or batch["tool_calls"][ordinal] == call, "实际 dispatch 与已提交原调用冲突")
+        approval = connection.execute("SELECT approval_id,state FROM approvals WHERE run_id=? AND turn=? AND ordinal=?", (run_id, turn, ordinal)).fetchone()
+        require(approval is None or (approval["approval_id"] == approval_id and approval["state"] == "CONSUMED"), "存在审批记录，必须通过原子消费入口执行")
+        changed = connection.execute("UPDATE calls SET state='RUNNING' WHERE run_id=? AND turn=? AND ordinal=? AND call_id=? AND state='PREPARED'",
+            (run_id, turn, ordinal, call_id)).rowcount
+        require(changed == 1, "调用不能重复启动")
+        connection.execute("UPDATE runs SET revision=revision+1,last_operation=? WHERE run_id=?", (token, run_id))
+        return revision + 1
+
     def mark_running(self, run_id, revision, turn, ordinal, call_id, *, call=None):
-        def operation(connection, token):
-            row = self._current(connection, run_id, revision)
-            require(row["payload"] is not None, "尚未提交完整工具批次")
-            snapshot = json.loads(row["payload"])
-            batch = snapshot["run"]["tool_batch"]
-            require(batch["model_iteration"] == turn and batch["next_call_index"] == ordinal, "只能启动当前调用")
-            require(call is None or batch["tool_calls"][ordinal] == call, "实际 dispatch 与已提交原调用冲突")
-            changed = connection.execute("UPDATE calls SET state='RUNNING' WHERE run_id=? AND turn=? AND ordinal=? AND call_id=? AND state='PREPARED'",
-                (run_id, turn, ordinal, call_id)).rowcount
-            require(changed == 1, "调用不能重复启动")
-            connection.execute("UPDATE runs SET revision=revision+1,last_operation=? WHERE run_id=?", (token, run_id))
-            return revision + 1
-        return self._write(run_id, operation)
+        return self._write(run_id, lambda connection, token: self._start_call(
+            connection, token, run_id, revision, turn, ordinal, call_id, call=call))
 
     def load(self, run_id):
         with self._connection() as connection:
