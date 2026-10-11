@@ -26,7 +26,7 @@ Agent 集成用例在创建 task 时因 Windows ACL 拒绝写入仓库外既有 
 
 ## 2026-10-11：第七阶段 C，本地 HITL 终端与跨进程操作
 
-Commit: `PENDING`
+Commit: `342a5232611a1db268f2351ef5f4d48dc1ee6676`
 Commit Description: `feat: 接入本地 HITL 审批 CLI 与端到端恢复验收`
 
 ### Description

@@ -1,6 +1,6 @@
 ## 2026-10-11 当前现场：第七阶段 C 本地 HITL CLI
 
-- 基线 main 为 `f0de996d71e28922edffd29471216eb7aa30844e`，已包含 7B 功能 `f069085` 和文档 `f0de996`。独立分支 `codex/hitl-cli-interaction`；Worktree `D:\02_study\code\AgentProject\mini-claude-worktrees\hitl-cli-interaction`。本阶段未提交、合并或推送。
+- 基线 main 为 `f0de996d71e28922edffd29471216eb7aa30844e`，已包含 7B 功能 `f069085` 和文档 `f0de996`。独立分支 `codex/hitl-cli-interaction`；Worktree `D:\02_study\code\AgentProject\mini-claude-worktrees\hitl-cli-interaction`。功能提交为 `342a5232611a1db268f2351ef5f4d48dc1ee6676`；用户已授权仅 fast-forward 整合至本地 main，不推送、不删除 Worktree。
 - 首次 --hitl --init-checkpoints；重启 --hitl 要求已有数据库，--checkpoint-db 明确指定原库，--resume <Run ID> 为启动恢复。所有决定 / 执行都走原 Runtime API；新增只读查询，未改 SQLite Schema 或原子审批消费协议。
 - /runs、/approval <Run ID>、/approve 或 /reject <Run ID> <Approval ID>、/resume <Run ID>。决定与执行分开，普通输入、压缩和清空不能覆盖等待 Run。UNKNOWN 无重试入口，INVALIDATED 无重新授权提示。固定拒绝理由沿用 7B；不支持自由文本理由。
 - 展示及诊断脱敏不改变授权绑定；审批详情不写命令历史 / 结果日志，必要持久化执行事实仍含原参数。敏感字符串不能保证全部识别，可信本地库不提供认证或加密。
