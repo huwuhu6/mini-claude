@@ -11,12 +11,13 @@ from providers.base import Message
 
 SCHEMA_VERSION = 1
 CHECKPOINT_SNAPSHOT_VERSION = 2  # Bound projections cannot use standalone JSON resume.
+HITL_SNAPSHOT_VERSION = 3  # Approval-bound projections require the SQLite authority.
 SNAPSHOT_FIELDS = {"schema_version", "workspace", "compatibility", "run", "messages",
                    "history", "todo", "agent_note", "memory", "context", "diagnostics"}
 # UNKNOWN/cancellation/not-executed terminal closures are never resumable pauses.
 PAUSED_RESULT_OUTCOMES = {"EXECUTED_SUCCESS", "EXECUTED_FAILURE", "SKIPPED_DUPLICATE",
     "INVALID_ARGUMENTS", "BLOCKED_PRECHECK", "BLOCKED_NOT_EXECUTED",
-    "BLOCKED_FEATURE_DISABLED", "BLOCKED_UNKNOWN_TOOL"}
+    "BLOCKED_FEATURE_DISABLED", "BLOCKED_UNKNOWN_TOOL", "BLOCKED_PERMISSION_DENIED"}
 
 
 def require(condition: bool, reason: str) -> None:
@@ -85,14 +86,21 @@ def call_ids(calls: Any) -> list[str]:
     return ids
 
 
-def decode_run(data: Any, *, _terminal: bool = False, _pre_model: bool = False) -> RunState:
+def decode_run(data: Any, *, _terminal: bool = False, _pre_model: bool = False, _approval: bool = False) -> RunState:
+    # v1/v2 snapshots produced before HITL have no approval field.
+    if type(data) is dict and set(data) == set(RunState.__dataclass_fields__) - {"approval_id"}:
+        data = {**data, "approval_id": None}
     fields(data, set(RunState.__dataclass_fields__), "RunState")
     text(data["run_id"], "Run ID", nonempty=True)
+    waiting = data["status"] == RunStatus.WAITING_APPROVAL.value
+    require(not waiting or (_approval and not _terminal and not _pre_model), "审批等待只能通过持久化审批边界恢复")
+    require(data["approval_id"] is None or (_approval and type(data["approval_id"]) is str and bool(data["approval_id"])), "审批身份无效或不能独立恢复")
+    require(not waiting or data["approval_id"] is not None, "等待状态缺少审批身份")
     if _terminal:
         require(data["status"] in {"completed", "terminated", "failed", "cancelled"}, "Checkpoint 终结状态错误")
         text(data["terminal_result"], "终结结果")
     else:
-        require(data["status"] == RunStatus.PAUSED.value, "只恢复安全暂停中的 Run")
+        require(data["status"] == RunStatus.PAUSED.value or waiting, "只恢复安全暂停中的 Run")
         require(data["terminal_result"] is None, "暂停 Run 不得含终结结果")
     integer(data["max_iterations"], "模型预算", 1)
     integer(data["model_turns_used"], "已用模型轮次", 0 if _terminal or _pre_model else 1)
@@ -115,6 +123,7 @@ def decode_run(data: Any, *, _terminal: bool = False, _pre_model: bool = False) 
     ids = call_ids(raw["tool_calls"])
     cursor = raw["next_call_index"]
     integer(cursor, "批次游标")
+    require(not waiting or cursor < len(ids), "等待审批没有当前未执行调用")
     integer(raw["assistant_message_index"], "Assistant 位置")
     integer(raw["model_iteration"], "批次模型轮次")
     text(raw["assistant_content"], "Assistant 内容")

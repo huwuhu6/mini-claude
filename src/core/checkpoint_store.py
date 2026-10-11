@@ -10,9 +10,9 @@ import sqlite3
 import threading
 import uuid
 
-from core.run_snapshot import SCHEMA_VERSION, CHECKPOINT_SNAPSHOT_VERSION, SNAPSHOT_FIELDS, decode_messages, decode_run, fields, json_copy, require, call_ids, PAUSED_RESULT_OUTCOMES
+from core.run_snapshot import SCHEMA_VERSION, CHECKPOINT_SNAPSHOT_VERSION, HITL_SNAPSHOT_VERSION, SNAPSHOT_FIELDS, decode_messages, decode_run, fields, json_copy, require, call_ids, PAUSED_RESULT_OUTCOMES
 
-DB_VERSION = 2
+DB_VERSION = 3
 TERMINAL = {"completed", "terminated", "failed", "cancelled", "unknown"}
 
 
@@ -77,10 +77,13 @@ class SqliteCheckpointStore:
         self._closed = False
         with self._connection() as connection:
             connection.execute("PRAGMA journal_mode=WAL")
+            # Parent CHECK constraints require a transactional table rebuild.
+            # Foreign keys are rechecked before commit; child rows are never rewritten.
+            connection.execute("PRAGMA foreign_keys=OFF")
             connection.execute("BEGIN IMMEDIATE")
             try:
                 version = connection.execute("PRAGMA user_version").fetchone()[0]
-                if version not in {0, 1, DB_VERSION}:
+                if version not in {0, 1, 2, DB_VERSION}:
                     raise CheckpointError(f"Checkpoint 数据库版本不兼容: {version}")
                 tables = connection.execute("SELECT name FROM sqlite_master WHERE type='table'").fetchall()
                 if version == 0 and tables:
@@ -110,12 +113,17 @@ class SqliteCheckpointStore:
                     actual = {r[1] for r in connection.execute("PRAGMA table_info(" + table + ")")}
                     if actual != columns:
                         raise CheckpointError("Checkpoint 数据库结构损坏或不兼容")
-                if version < DB_VERSION:
+                if version < 2:
                     self._upgrade_approvals(connection)
+                if version < 3:
+                    self._upgrade_waiting(connection)
+                if connection.execute("PRAGMA foreign_key_check").fetchone() is not None:
+                    raise CheckpointError("Checkpoint 外键关系损坏")
                 from core.approvals import APPROVAL_COLUMNS
                 if {r[1] for r in connection.execute("PRAGMA table_info(approvals)")} != APPROVAL_COLUMNS:
                     raise CheckpointError("审批数据库结构损坏或不兼容")
                 connection.commit()
+                connection.execute("PRAGMA foreign_keys=ON")
             except BaseException:
                 if connection.in_transaction:
                     connection.rollback()
@@ -126,6 +134,20 @@ class SqliteCheckpointStore:
         from core.approvals import APPROVAL_DDL
         connection.execute(APPROVAL_DDL)
         connection.execute("PRAGMA user_version=2")
+
+    @staticmethod
+    def _upgrade_waiting(connection):
+        connection.execute("""CREATE TABLE runs_upgrade (
+            run_id TEXT PRIMARY KEY, status TEXT NOT NULL CHECK(status IN
+            ('started','active','paused','waiting_approval','completed','terminated','failed','cancelled','unknown')),
+            revision INTEGER NOT NULL CHECK(revision > 0), payload TEXT, payload_hash TEXT, final_result TEXT,
+            last_operation TEXT NOT NULL, journal_hash TEXT NOT NULL DEFAULT '',
+            boundary TEXT NOT NULL DEFAULT 'tools' CHECK(boundary IN ('tools','before_model','approval','terminal')))
+        """)
+        connection.execute("INSERT INTO runs_upgrade(run_id,status,revision,payload,payload_hash,final_result,last_operation,journal_hash,boundary) SELECT run_id,status,revision,payload,payload_hash,final_result,last_operation,journal_hash,boundary FROM runs")
+        connection.execute("DROP TABLE runs")
+        connection.execute("ALTER TABLE runs_upgrade RENAME TO runs")
+        connection.execute("PRAGMA user_version=3")
 
     @contextmanager
     def _connection(self):
@@ -218,14 +240,14 @@ class SqliteCheckpointStore:
 
     @staticmethod
     def validate_snapshot(data, run_id, *, terminal=False, boundary="tools"):
-        linked = type(data) is dict and data.get("schema_version") == CHECKPOINT_SNAPSHOT_VERSION
+        linked = type(data) is dict and data.get("schema_version") in {CHECKPOINT_SNAPSHOT_VERSION, HITL_SNAPSHOT_VERSION}
         fields(data, SNAPSHOT_FIELDS | ({"checkpoint_binding"} if linked else set()), "Snapshot")
-        require(type(data["schema_version"]) is int and data["schema_version"] in {SCHEMA_VERSION, CHECKPOINT_SNAPSHOT_VERSION}, "快照版本不兼容")
+        require(type(data["schema_version"]) is int and data["schema_version"] in {SCHEMA_VERSION, CHECKPOINT_SNAPSHOT_VERSION, HITL_SNAPSHOT_VERSION}, "快照版本不兼容")
         if linked:
             fields(data["checkpoint_binding"], {"database", "run_id"}, "Checkpoint 归属")
             require(data["checkpoint_binding"]["run_id"] == run_id
                     and type(data["checkpoint_binding"]["database"]) is str, "Checkpoint 归属不一致")
-        state = decode_run(data["run"], _terminal=terminal, _pre_model=boundary == "before_model")
+        state = decode_run(data["run"], _terminal=terminal, _pre_model=boundary == "before_model", _approval=boundary == "approval" and data["schema_version"] == HITL_SNAPSHOT_VERSION)
         require(state.run_id == run_id, "数据库 Run ID 与快照不一致")
         decode_messages(data["messages"], state, _pre_model=boundary == "before_model")
         return state
@@ -245,8 +267,8 @@ class SqliteCheckpointStore:
             raise CheckpointError("终结 Run 不允许回退或继续")
         return row
 
-    def save_snapshot(self, run_id, revision, snapshot, *, paused=False, boundary="tools"):
-        require(boundary in {"tools", "before_model"}, "Checkpoint 安全边界错误")
+    def save_snapshot(self, run_id, revision, snapshot, *, paused=False, boundary="tools", _transaction=None):
+        require(boundary in {"tools", "before_model", "approval"}, "Checkpoint 安全边界错误")
         state = self.validate_snapshot(json_copy(snapshot), run_id, boundary=boundary)
         require(snapshot.get("checkpoint_binding", {}).get("database", str(self.path)) == str(self.path), "Checkpoint 数据库归属冲突")
         payload = self._json(snapshot)
@@ -293,8 +315,11 @@ class SqliteCheckpointStore:
             if boundary == "before_model":
                 require(not connection.execute("SELECT 1 FROM calls WHERE run_id=? AND state IN ('PREPARED','RUNNING','UNKNOWN')", (run_id,)).fetchone(), "模型边界仍有未终结执行")
             connection.execute("UPDATE runs SET status=?,revision=revision+1,payload=?,payload_hash=?,last_operation=?,boundary=? WHERE run_id=?",
-                ("paused" if paused else "active", payload, digest, token, boundary, run_id))
+                ("waiting_approval" if boundary == "approval" else "paused" if paused else "active", payload, digest, token, boundary, run_id))
             return revision + 1
+        if _transaction is not None:
+            self._owns(run_id)
+            return operation(*_transaction)
         return self._write(run_id, operation)
 
     def _start_call(self, connection, token, run_id, revision, turn, ordinal, call_id, *, call=None, approval_id=None):
@@ -309,7 +334,7 @@ class SqliteCheckpointStore:
         changed = connection.execute("UPDATE calls SET state='RUNNING' WHERE run_id=? AND turn=? AND ordinal=? AND call_id=? AND state='PREPARED'",
             (run_id, turn, ordinal, call_id)).rowcount
         require(changed == 1, "调用不能重复启动")
-        connection.execute("UPDATE runs SET revision=revision+1,last_operation=? WHERE run_id=?", (token, run_id))
+        connection.execute("UPDATE runs SET status='active',revision=revision+1,last_operation=? WHERE run_id=?", (token, run_id))
         return revision + 1
 
     def mark_running(self, run_id, revision, turn, ordinal, call_id, *, call=None):
@@ -324,6 +349,7 @@ class SqliteCheckpointStore:
                 raise CheckpointError("Checkpoint Run 不存在")
             result = dict(row)
             journal = [dict(r) for r in connection.execute("SELECT * FROM calls WHERE run_id=? ORDER BY turn,ordinal", (run_id,))]
+            approval_rows = {r["approval_id"]: dict(r) for r in connection.execute("SELECT * FROM approvals WHERE run_id=?", (run_id,))}
         try:
             require(hashlib.sha256(self._json(journal).encode("utf-8")).hexdigest() == result["journal_hash"], "执行日志校验摘要不符")
             snapshot = json.loads(result["payload"]) if result["payload"] else None
@@ -350,7 +376,28 @@ class SqliteCheckpointStore:
             if result["status"] in TERMINAL - {"unknown"}:
                 require(snapshot["run"]["terminal_result"] == result["final_result"]
                         and snapshot["run"]["status"] == result["status"], "终结元数据与快照冲突")
-            require(result["revision"] > 0 and result["status"] in TERMINAL | {"started", "active", "paused"}, "Run 元数据错误")
+            if result["boundary"] == "approval":
+                require(snapshot["schema_version"] == HITL_SNAPSHOT_VERSION and state.status.value == "waiting_approval", "审批边界 / 快照状态冲突")
+                opcall = batch.tool_calls[batch.next_call_index]
+                approval_row = approval_rows.get(state.approval_id)
+                from core.approvals import ApprovalRecord
+                require(approval_row is not None, "等待 Run 缺少审批记录")
+                approval = ApprovalRecord.from_dict(dict(approval_row))
+                op = approval.decision.operation
+                require((op.run_id, op.turn, op.ordinal, op.call) == (run_id, batch.model_iteration, batch.next_call_index, opcall), "审批与当前调用不一致")
+                require(op.workspace == snapshot["workspace"]["root"] and op.cwd == snapshot["workspace"]["cwd"], "审批工作区冲突")
+                context = json.loads(op.context_json)
+                require(context["workspace_digest"] == snapshot["workspace"]["content_digest"], "审批工作区摘要冲突")
+                from core.permissions import digest as permission_digest
+                require(context["runtime_digest"] == permission_digest(snapshot["compatibility"]), "审批 Runtime 摘要冲突")
+                current = journal[sum(r["turn"] < batch.model_iteration for r in journal) + batch.next_call_index]
+                if approval.state.value == "CONSUMED":
+                    require(current["state"] in {"RUNNING", "UNKNOWN"} and result["status"] in {"active", "unknown"}, "消费与执行事实冲突")
+                else:
+                    require(current["state"] == "PREPARED" and result["status"] == "waiting_approval", "等待审批调用已经执行")
+            else:
+                require(result["status"] != "waiting_approval", "等待状态缺少审批边界")
+            require(result["revision"] > 0 and result["status"] in TERMINAL | {"started", "active", "paused", "waiting_approval"}, "Run 元数据错误")
             require(snapshot is not None or (result["status"] == "started" and not journal), "活动 Run 缺少一致快照")
             current_turn = snapshot["run"]["tool_batch"]["model_iteration"] if snapshot and snapshot["run"]["tool_batch"] else None
             for item in journal:

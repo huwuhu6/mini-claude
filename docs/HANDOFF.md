@@ -1,3 +1,12 @@
+## 2026-10-11 当前现场：第七阶段 B 持久化 HITL Runtime
+
+- 开发基线 / 本地 main 为 `899fa3c247e0d021af2ee752b5b4a3dbc3be5f85`，已包含第 7A 功能 `2518787` 和文档 `899fa3c`。独立分支 `codex/hitl-runtime-integration`，Worktree `D:\02_study\code\AgentProject\mini-claude-worktrees\hitl-runtime-integration`；本阶段尚未提交、合并或推送。
+- 主 Agent 显式 `enable_checkpoints()` 后可 `enable_hitl()`，或构造时同时启用二者。默认关闭；不提供 CLI 审批交互，不进入 7C。
+- Runtime API：`get_pending_approval(run_id)`、`decide_approval(run_id, approval_id, approved=..., actor=...)`、`resume_checkpoint(run_id)`。等待期间新输入及普通压缩被阻止；新实例恢复 PENDING 也安装 WAITING 生命周期。
+- ASK 在同一事务创建审批并保存 WAITING_APPROVAL，当前调用保持 PREPARED，不生成结果 / 不推进游标 / 不计失败，立即释放锁。批准后沿原循环原子消费并标 RUNNING，拒绝则关闭当前及剩余调用后重新规划。
+- SQLite v3 事务扩展 runs 的状态 / 边界 CHECK，保留旧 calls 与 approvals；HITL 绑定投影 v3 只能通过 SQLite 恢复。普通 JSON v1 暂停入口继续支持，但不接受审批等待；旧源码指纹兼容门槛不放宽。
+- 核心实现与限制见 docs/evolution/tool_registry.md 第七阶段 B；功能提交 SHA 仍 PENDING。最终测试结果以该记录为准，保留四项历史失败及平台限制。
+
 ## 2026-10-11 当前现场：第七阶段 A 权限与审批契约
 
 - 本阶段开发基线为 `c97f917a8ac591c1bc76c322824f422842e46107`，第六阶段功能提交 `d892ed3` 已整合。第七阶段 A 功能提交为 `2518787fe6b4531ab8055774e3ae65373186700b`；分支 `codex/hitl-permission-contract`，Worktree `D:\02_study\code\AgentProject\mini-claude-worktrees\hitl-permission-contract`。本轮仅采用 fast-forward 整合到本地 main；不推送、不删除 Worktree、不进入 7B。

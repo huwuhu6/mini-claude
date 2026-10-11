@@ -323,3 +323,41 @@ Windows Python 3.14.3 上新增权限 25 项、审批 41 项，合计 66 项全�
 7B 的准确接入点在 _execute_tool() 已确认注册 / 当前 Feature 后、_checkpoint_dispatch() 提交 RUNNING 和 Registry.execute() 调用 handler 前。ASK 的持久化等待必须保持当前调用 PREPARED，不生成终结 Tool Result、不消耗批次游标、不计失败；需要由下一阶段增加明确暂停 / 审批恢复协调。获批继续时要重新绑定当前上下文并原子消费，不能先标 RUNNING 再请求批准。
 
 目前全部 Agent、SubAgent、公开 run_background/run_subagent、直接 Registry / BaseTools 入口仍未使用新权限策略；第六阶段持久化模式原有后台 / SubAgent 拒绝继续有效。没有通知、用户身份认证、审批 UI、自动 Resume、RBAC、Shell AST / 沙箱或 UNKNOWN 补偿。actor 是调用方提供的审计身份，不是认证机制；数据库按受信任本地存储处理，JSON 验证 / 摘要不是真实性签名。Policy 检查也不是文件系统事务，外部修改竞态及 Workspace 摘要观察范围沿用既有限制。审批参数可能包含敏感内容，Store 不把它们额外写入诊断日志。
+
+
+## 2026-10-11：第七阶段 B：主 Agent 的持久化审批等待与原批次继续
+
+Commit: `PENDING`
+Commit Description: `feat: 接入持久化 HITL 暂停与审批后工具继续`
+
+### Description
+
+7A 能保存用户决定，但 Agent 尚未使用它；如果在普通异常路径中模拟 ASK，会把未执行调用写成 UNKNOWN 或错误结果。本阶段在主 Agent 的既有 dispatch 前增加显式控制返回，并复用原工具批次循环，没有另建执行器。HITL 默认关闭，启用前必须有 SQLite Checkpoint；注册 / 参数 / Feature / 路径授权 / CommandPolicy 等硬性规则不会因审批而放宽。
+
+ALLOW 先按原协议提交 RUNNING，再调用 handler；DENY 写原 ID 的未执行结果，跳过实际工具失败分析和治理观察；ASK 返回 WAITING_APPROVAL，不写 Tool Result、不推进游标、不记录失败。等待 Run 保存 approval_id，批次仍以原有 PAUSED 表达当前位置，原参数和 Provider ID 保留。去重集合只代表已处理前缀，遇到 ASK 时移除尚未处理的当前签名，避免获批继续时被错误去重。
+
+ApprovalStore.request_wait() 持既有 Run 锁，将创建审批与保存等待投影放在同一 BEGIN IMMEDIATE / COMMIT 中。创建和保存复用既有校验及事务实现，使用内部连接传递避免嵌套提交；提交后才发布内存等待状态。等人期间不持锁、不阻塞线程。请求、消费或结果提交失败均停止推进，提交后异常仍按原 Store 的独立连接核验规则处理，不能把持久化失败转换为工具反馈。
+
+现有 SQLite runs 表的 CHECK 限制不允许新状态和边界，因此将数据库升级为 v3。迁移在事务中重建父表的 CHECK，显式按列复制 Run 原值，calls / approvals 不改写；临时关闭该迁移连接的外键检查，提交前执行 foreign_key_check，失败整体回滚。v1 顺序增加审批表再升级，v2 直接扩展等待状态。初始化验证版本和字段，不强行接收未来版本。数据库迁移不改写快照源码指纹，不保证旧实现生成的 Run 能在新源码下执行。
+
+HITL 快照使用绑定数据库的 v3 投影，等待 Run 只能在 approval 边界校验；旧 v1/v2 缺少 approval_id 时解释为无审批。普通 JSON 导入不能接受 WAITING，绑定投影必须匹配数据库已提交内容并持执行锁。Store 在同一个 WAL 读快照中读取 Run、calls、审批，核对原调用、当前位置、Workspace 和 Runtime 绑定，以及等待 / 消费与 PREPARED / RUNNING / UNKNOWN 的对应关系。
+
+Runtime 查询 API 只展示等待记录；决定 API 先校验 Run 与审批 ID，再持锁调用原 Store 决定接口，不执行 handler。恢复 PENDING 返回等待信息，新实例同时建立 WAITING 生命周期，防止后续普通输入覆盖它。APPROVED 恢复重新校验 Snapshot 与当前执行上下文，在既有 _checkpoint_dispatch() 调用 consume_and_mark_running()，同一事务 CONSUMED + RUNNING；之后不再次调用普通 mark_running()。原 Handler 及结果 / messages / 游标提交沿原循环继续。
+
+REJECTED 不运行当前调用和剩余依赖调用；为它们按原 ID 写连续 NOT_EXECUTED 说明，用已知阻断结果保存闭合批次，再在 Tool Results 后写重规划反馈。用户拒绝不进入真实执行失败统计。关闭投影提交后即使退出，下一实例也能完成剩余收尾，不会重新执行工具。每次恢复只继续原批次，下一次模型请求发生在完整闭合之后。
+
+审批消费后、handler 前退出和副作用发生后结果未提交，都按第六阶段恢复为 UNKNOWN；批准不能重放 UNKNOWN。结果已经提交的工具不重复执行。审批等待返回后的诊断错误 / 中断保留等待事实并传播信号，真实策略异常不伪装成参数错误或 UNKNOWN。HITL 模式的参数必须先成为有限 JSON 对象，避免非对象进入治理观察器或 NaN 污染投影；默认关闭的原模式保持行为。
+
+### Result / Evidence
+
+Windows Python 3.14.3 最终冻结代码的完整 tests/unit 为 601 passed、12 skipped、4 failed；新增 HITL 58 项全部通过，其中 52 项非进程测试、6 项真正独立 Python 进程测试。LoopController integration 35 passed。确定性覆盖实际 ALLOW / DENY / ASK、前缀保存、连续审批、批准 / 拒绝、去重、参数形态、Todo / Note / cwd / 预算、手动 / 自动压缩保护、审批身份损坏、上下文失效、请求 / 消费 / 结果事务提交前后故障、迁移及回滚、正常关闭模式回归，以及真实进程的等待 / 决策 / 原批次继续、活 handler 竞争与死亡。没有付费 Provider、危险 Shell 或 Terminal-Bench；12 项跳过沿用平台限制，Linux 实测尚未进行。
+
+首轮完整测试期间源码仍在修改，有一项真实进程恢复被源码指纹检查拒绝，该次结果不作为最终验收；冻结生产代码和测试后重新完整运行，最终只剩四项历史失败。审批后的 cwd / 参数 / Feature 等校验，以及等待返回后诊断错误和中断的传播均有回归；测试通过不表示可以自动恢复 UNKNOWN 副作用。
+
+本轮未修改 main `899fa3c` 上同四项历史失败复核为 2 failed、2 passed：Provider fixture 缺 provider 字段、read_file 描述原文字串断言仍失败；Node / Java Reference Variant 在 main 通过，本 Worktree 保留 CRLF oracle 字节哈希差异。原 oracle SHA256 与 7A 一致，不修改 oracle 或删除有效断言。
+
+### Decision / Limitation
+
+仅主 Agent 的持久化批次调度受此 opt-in HITL 保护，SubAgent、直接 Registry / BaseTools 和公共后台 API 不接入；原持久化模式对后台和 SubAgent 的限制仍有效。actor 是调用方审计身份，不是认证；本地 SQLite 视为受信任数据，未增加签名、加密、TTL 默认策略或自动清理。工作区摘要和执行前外部修改的竞态沿用已有边界，不承诺 Shell 沙箱或文件系统事务。
+
+审批恢复不兼容或策略 / Feature / 授权变化时 fail-closed；过期或上下文变化的旧批准失效，不自动换发新批准。INVALIDATED 暂无用户取消 / 重规划 API；UNKNOWN 没有补偿或重试接口。本阶段不提供最终 CLI 操作。7C 只需展示 Run / Approval 的绑定及原因、调用查询和决定接口、再显式恢复；不允许 CLI 直接操作 SQLite 状态或 dispatch handler。

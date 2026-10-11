@@ -69,9 +69,11 @@ from core.run_state import (
 )
 from core.checkpoint_store import CheckpointError, SqliteCheckpointStore, TERMINAL as CHECKPOINT_TERMINAL
 from core.run_snapshot import (
-    SCHEMA_VERSION, CHECKPOINT_SNAPSHOT_VERSION, SNAPSHOT_FIELDS, PAUSED_RESULT_OUTCOMES, decode_messages, decode_run, encode_run,
+    SCHEMA_VERSION, CHECKPOINT_SNAPSHOT_VERSION, HITL_SNAPSHOT_VERSION, SNAPSHOT_FIELDS, PAUSED_RESULT_OUTCOMES, decode_messages, decode_run, encode_run,
     fields as snapshot_fields, json_copy, require as snapshot_require, text as snapshot_text,
 )
+from core.approvals import ApprovalStore, ApprovalStatus
+from core.permissions import DefaultPermissionPolicy, PermissionKind, digest as permission_digest
 from core.session_recorder import SessionLogHandler, SessionRecorder
 from core.failure_intelligence import FailureAnalyzer
 from core.runtime_context import (
@@ -94,6 +96,9 @@ class ToolDispatchStatus(str, Enum):
     UNKNOWN_TOOL = "unknown_tool"
     INVALID_ARGUMENTS = "invalid_arguments"
     EXECUTION_FAILED = "execution_failed"
+    WAITING_APPROVAL = "waiting_approval"
+    PERMISSION_DENIED = "permission_denied"
+    APPROVAL_REJECTED = "approval_rejected"
 
 
 @dataclass(frozen=True)
@@ -148,7 +153,7 @@ class MiniClaudeAgent:
                  workdir: Optional[Path] = None,
                  workspace_confirmed: bool = False,
                  runtime_data_root: Optional[Path] = None,
-                 checkpoint_enabled: bool = False):
+                 checkpoint_enabled: bool = False, hitl_enabled: bool = False):
         self._ui_event_handler: Optional[Callable[[str, Dict[str, Any]], None]] = None
         self._last_assistant_note: Optional[str] = None
         # ── Resolve workspace root (explicit > legacy > cwd fallback) ──
@@ -303,8 +308,13 @@ class MiniClaudeAgent:
         self._checkpoint_run_id: Optional[str] = None
         self._checkpoint_revision: Optional[int] = None
         self._checkpoint_faulted = False
+        self._hitl_enabled = False
+        self._permission_policy = None
+        self._approval_store = None
         if checkpoint_enabled:
             self.enable_checkpoints()
+        if hitl_enabled:
+            self.enable_hitl()
 
         # Start background processor
         self.background.start()
@@ -408,7 +418,7 @@ class MiniClaudeAgent:
         if getattr(self, "_checkpoint_faulted", False):
             raise CheckpointError("当前实例已因 Checkpoint 故障停止；请用新实例核验原 Run，不能直接开始新任务")
         current = getattr(self, "_run_state", None)
-        if current and current.status in {RunStatus.RUNNING, RunStatus.PAUSED}:
+        if current and current.status in {RunStatus.RUNNING, RunStatus.PAUSED, RunStatus.WAITING_APPROVAL}:
             return "错误: 当前运行尚未完成；请先继续或终止该运行。"
         self._run_state = RunState(require_tool_call=require_tool_call)
         try:
@@ -431,7 +441,7 @@ class MiniClaudeAgent:
         runtime_root = Path(__file__).resolve().parents[1]
         # Fail closed after relevant implementation changes, including delegated helpers.
         sources = ["agent/mini_claude_agent.py", "core/run_state.py", "core/run_snapshot.py", "core/checkpoint_store.py",
-                   "core/loop_controller.py", "core/tools/base_tools.py", "core/tools/registry.py",
+                   "core/loop_controller.py", "core/tools/base_tools.py", "core/tools/registry.py", "core/permissions.py", "core/approvals.py",
                    "core/runtime_context/shell_session.py", "core/runtime_context/command_policy.py",
                    "core/runtime_context/workspace_authority.py", "core/runtime_context/path_resolver.py",
                    "core/features/manager.py", "core/compression.py",
@@ -444,6 +454,7 @@ class MiniClaudeAgent:
             source_hash.update((runtime_root / relative).read_text(encoding="utf-8").encode("utf-8"))
         return {
             "runtime_source_hash": source_hash.hexdigest(),
+            "hitl_enabled": getattr(self, "_hitl_enabled", False),
             "platform": sys.platform,
             "python_version": list(sys.version_info[:2]),
             "tools": self.tool_registry.execution_contract(),
@@ -458,11 +469,12 @@ class MiniClaudeAgent:
     def _validate_run_snapshot(self, raw: dict, *, _checkpoint_boundary: str | None = None):
         """Pure preparation: no live state, files, trace or authorization is overwritten."""
         snapshot = json_copy(raw)
-        linked = type(snapshot) is dict and snapshot.get("schema_version") == CHECKPOINT_SNAPSHOT_VERSION
+        linked = type(snapshot) is dict and snapshot.get("schema_version") in {CHECKPOINT_SNAPSHOT_VERSION, HITL_SNAPSHOT_VERSION}
         snapshot_fields(snapshot, SNAPSHOT_FIELDS | ({"checkpoint_binding"} if linked else set()), "Snapshot")
         store = getattr(self, "_checkpoint_store", None)
         snapshot_require(type(snapshot["schema_version"]) is int
                          and (snapshot["schema_version"] == SCHEMA_VERSION or (linked and store is not None)), "快照版本不兼容；持久化投影要求 Checkpoint Store")
+        snapshot_require(snapshot["schema_version"] != HITL_SNAPSHOT_VERSION or getattr(self, "_hitl_enabled", False), "审批快照必须启用持久化 HITL")
         snapshot_require(snapshot["compatibility"] == self._snapshot_compatibility(),
                          "工具实现、Schema 或关键运行配置不兼容")
         workspace = snapshot["workspace"]
@@ -481,7 +493,8 @@ class MiniClaudeAgent:
         snapshot_text(workspace["content_digest"], "工作区内容摘要")
         snapshot_require(workspace["content_digest"] == self.workspace_state_guard.content_digest(),
                          "工作区内容在导出后发生变化，无法安全继续原调用")
-        state = decode_run(snapshot["run"], _pre_model=_checkpoint_boundary == "before_model")
+        state = decode_run(snapshot["run"], _pre_model=_checkpoint_boundary == "before_model",
+                           _approval=_checkpoint_boundary == "approval" and snapshot["schema_version"] == HITL_SNAPSHOT_VERSION)
         if linked:
             snapshot_fields(snapshot["checkpoint_binding"], {"database", "run_id"}, "Checkpoint 归属")
             snapshot_require(snapshot["checkpoint_binding"] == {"database": str(store.path), "run_id": state.run_id},
@@ -556,25 +569,28 @@ class MiniClaudeAgent:
         })
         store = getattr(self, "_checkpoint_store", None)
         if store is not None:
-            snapshot["schema_version"] = CHECKPOINT_SNAPSHOT_VERSION
+            snapshot["schema_version"] = HITL_SNAPSHOT_VERSION if getattr(self, "_hitl_enabled", False) else CHECKPOINT_SNAPSHOT_VERSION
             snapshot["checkpoint_binding"] = {"database": str(store.path), "run_id": state.run_id}
         return snapshot
 
-    def restore_run_snapshot(self, snapshot: dict, *, _checkpoint_boundary: str | None = None) -> None:
+    def restore_run_snapshot(self, snapshot: dict, *, _checkpoint_boundary: str | None = None, _refresh_waiting: bool = False) -> None:
         """Install validated detached state; caller explicitly continues the paused Run."""
-        snapshot_require(not self.has_active_run, "已有未完成 Run，不能被快照覆盖")
+        refreshing = (_refresh_waiting and _checkpoint_boundary == "approval"
+            and self._run_state is not None and self._run_state.status is RunStatus.WAITING_APPROVAL
+            and self._run_state.run_id == snapshot["run"]["run_id"])
+        snapshot_require(not self.has_active_run or refreshing, "已有未完成 Run，不能被快照覆盖")
         snapshot_require(not self.background.list(), "恢复目标有独立后台任务")
         data, state, messages, todo, history, cwd = self._validate_run_snapshot(snapshot, _checkpoint_boundary=_checkpoint_boundary)
-        if data["schema_version"] == CHECKPOINT_SNAPSHOT_VERSION:
+        if data["schema_version"] in {CHECKPOINT_SNAPSHOT_VERSION, HITL_SNAPSHOT_VERSION}:
             store = getattr(self, "_checkpoint_store", None)
             snapshot_require(_checkpoint_boundary is not None and store.holds_lock(state.run_id),
                              "持久化快照必须通过 Checkpoint 恢复入口并持有执行锁")
             record = store.load(state.run_id)
             snapshot_require(record["snapshot"] == data and record["boundary"] == _checkpoint_boundary
-                             and record["status"] in {"active", "paused"}, "不能导入陈旧或未提交的持久化快照")
+                             and record["status"] in {"active", "paused", "waiting_approval"}, "不能导入陈旧或未提交的持久化快照")
         seen_ids = getattr(self, "_seen_run_ids", set())
-        snapshot_require(state.run_id not in seen_ids
-                         and (self._run_state is None or self._run_state.run_id != state.run_id),
+        snapshot_require(refreshing or (state.run_id not in seen_ids
+                         and (self._run_state is None or self._run_state.run_id != state.run_id)),
                          "本实例已经持有或执行过该 Run，拒绝回退重放")
         # Prepare fallible components before publishing; old state survives IO failure.
         trace = TraceManager(trace_dir=self.data_paths.traces)
@@ -691,18 +707,59 @@ class MiniClaudeAgent:
             function = call["function"]
             if function["name"] != name or json.dumps(json.loads(function["arguments"]), sort_keys=True) != json.dumps(args, sort_keys=True):
                 raise CheckpointError("实际 handler 参数与原 Tool Call 不一致")
-            self._checkpoint_revision = store.mark_running(state.run_id,
-                self._checkpoint_revision, batch.model_iteration, batch.next_call_index,
-                batch.pending_call_ids[0], call=call)
+            if state.approval_id is not None:
+                decision = self._hitl_decision(call)
+                self._checkpoint_revision = self._approval_store.consume_and_mark_running(
+                    state.approval_id, decision, self._checkpoint_revision)
+            else:
+                self._checkpoint_revision = store.mark_running(state.run_id,
+                    self._checkpoint_revision, batch.model_iteration, batch.next_call_index,
+                    batch.pending_call_ids[0], call=call)
         except BaseException:
             self._checkpoint_faulted = True
             raise
 
+    def enable_hitl(self) -> None:
+        """Opt in before a Run; durable approvals never degrade to memory-only."""
+        if self.has_active_run or getattr(self, "_checkpoint_store", None) is None:
+            raise CheckpointError("HITL 要求先启用 SQLite Checkpoint，且当前没有活动 Run")
+        if getattr(self, "_hitl_enabled", False):
+            raise CheckpointError("HITL 已启用")
+        self._hitl_enabled = True
+        self._permission_policy = DefaultPermissionPolicy.for_agent(self)
+        self._approval_store = ApprovalStore(self._checkpoint_store, self._permission_policy)
+
+    def get_pending_approval(self, run_id: str):
+        if not getattr(self, "_hitl_enabled", False):
+            raise CheckpointError("未启用持久化 HITL")
+        record = self._checkpoint_store.load(run_id)
+        if record["boundary"] != "approval" or record["status"] != "waiting_approval":
+            raise CheckpointError("当前 Run 没有可处理的等待审批")
+        return self._approval_store.get(record["snapshot"]["run"]["approval_id"])
+
+    def decide_approval(self, run_id: str, approval_id: str, *, approved: bool, actor: str):
+        """Audit a caller decision; no handler, resume or thread waiting here."""
+        record = self.get_pending_approval(run_id)
+        if record.approval_id != approval_id:
+            raise CheckpointError("审批 ID 不属于当前 Run 的待处理调用")
+        store = self._checkpoint_store
+        store.acquire(run_id)
+        try:
+            return self._approval_store.decide(approval_id, approved=approved, actor=actor)
+        finally:
+            store.release(run_id)
+
+    @staticmethod
+    def _approval_wait_message(approval) -> str:
+        return f"任务等待审批：approval_id={approval.approval_id}，工具={approval.decision.operation.tool_name}。"
+
     def resume_checkpoint(self, run_id: str) -> str:
-        """Claim -> inspect journal -> validate/install -> continue, holding one lock."""
+        """Claim -> inspect approval/journal -> install -> existing batch loop."""
         store = getattr(self, "_checkpoint_store", None)
-        if store is None or self.has_active_run:
-            raise CheckpointError("恢复要求启用 Checkpoint，且当前没有活动 Run")
+        same_wait = bool(self._run_state and self._run_state.run_id == run_id
+                         and self._run_state.status is RunStatus.WAITING_APPROVAL)
+        if store is None or (self.has_active_run and not same_wait):
+            raise CheckpointError("恢复要求启用 Checkpoint，且当前没有其他活动 Run")
         store.acquire(run_id)
         try:
             record = store.recover(run_id)
@@ -712,10 +769,34 @@ class MiniClaudeAgent:
                 return record["final_result"] or ""
             if record["snapshot"] is None:
                 raise CheckpointError("尚未提交完整运行边界；初始化或模型响应无法原样恢复")
-            self.restore_run_snapshot(record["snapshot"], _checkpoint_boundary=record["boundary"])
+            approval = None
+            if record["boundary"] == "approval":
+                if not getattr(self, "_hitl_enabled", False):
+                    raise CheckpointError("等待审批的 Run 必须通过 HITL 恢复")
+                approval = self._approval_store.get(record["snapshot"]["run"]["approval_id"])
+                if approval.state in {ApprovalStatus.PENDING, ApprovalStatus.APPROVED} and approval.to_dict()["expires_at"] is not None and self._approval_store.clock() >= approval.to_dict()["expires_at"]:
+                    self._approval_store.invalidate(approval.approval_id, "审批已过期")
+                    raise CheckpointError("审批已过期并失效")
+                if approval.state is ApprovalStatus.PENDING and same_wait:
+                    return self._approval_wait_message(approval)
+                if approval.state not in {ApprovalStatus.PENDING, ApprovalStatus.APPROVED, ApprovalStatus.REJECTED}:
+                    raise CheckpointError("审批已失效或消费，不能继续原操作")
+            try:
+                self.restore_run_snapshot(record["snapshot"], _checkpoint_boundary=record["boundary"], _refresh_waiting=same_wait)
+            except ValueError:
+                if approval and approval.state in {ApprovalStatus.PENDING, ApprovalStatus.APPROVED}:
+                    self._approval_store.invalidate(approval.approval_id, "恢复时工作区 / Runtime 上下文不兼容")
+                raise
             self._checkpoint_run_id = run_id
             self._checkpoint_revision = record["revision"]
             self._checkpoint_faulted = False
+            if approval and approval.state is ApprovalStatus.PENDING:
+                # A fresh instance now owns an in-memory WAITING lifecycle, so
+                # ordinary user input cannot silently replace the pending Run.
+                return self._approval_wait_message(approval)
+            if approval:
+                # Approval is still authoritative. Only _checkpoint_dispatch consumes it.
+                self._run_state.status = RunStatus.PAUSED
             self.session_recorder.record("checkpoint_restored", run_id=run_id,
                 revision=record["revision"], trace_task_id=self._run_state.trace_task_id)
             return self._continue_run()
@@ -743,7 +824,7 @@ class MiniClaudeAgent:
     @property
     def has_active_run(self) -> bool:
         state = getattr(self, "_run_state", None)
-        return bool(state and state.status in {RunStatus.RUNNING, RunStatus.PAUSED})
+        return bool(state and state.status in {RunStatus.RUNNING, RunStatus.PAUSED, RunStatus.WAITING_APPROVAL})
 
     def _request_run_pause(self) -> None:
         """Set an internal pause signal; the loop observes it after a call completes."""
@@ -757,6 +838,8 @@ class MiniClaudeAgent:
         state = getattr(self, "_run_state", None)
         if state is None:
             return "错误: 当前没有可继续的运行。"
+        if state.status is RunStatus.WAITING_APPROVAL:
+            return self.resume_checkpoint(state.run_id)
         if state.status in {
             RunStatus.COMPLETED,
             RunStatus.TERMINATED,
@@ -798,7 +881,7 @@ class MiniClaudeAgent:
             require_tool_call=state.require_tool_call,
             _continuing=True,
         )
-        if state.status is not RunStatus.PAUSED:
+        if state.status not in {RunStatus.PAUSED, RunStatus.WAITING_APPROVAL}:
             self.session_recorder.record(
                 "final",
                 status="RESPONSE",
@@ -840,7 +923,7 @@ class MiniClaudeAgent:
         batch.finalized = True
         if (getattr(self, "_checkpoint_store", None) is not None
                 and batch is self._run_state.tool_batch
-                and self._run_state.status in {RunStatus.RUNNING, RunStatus.PAUSED}
+                and self._run_state.status in {RunStatus.RUNNING, RunStatus.PAUSED, RunStatus.WAITING_APPROVAL}
                 and all(r.outcome in PAUSED_RESULT_OUTCOMES for r in batch.results.values())):
             self._checkpoint_save("tools")
 
@@ -1547,14 +1630,76 @@ class MiniClaudeAgent:
         header += ">"
         return ToolResult(content=f"{header}\n{skill.content}\n</skill>")
 
+    def _hitl_decision(self, call):
+        state = self._run_state
+        batch = state.tool_batch
+        op = self._permission_policy.bind(state.run_id, batch.model_iteration,
+            batch.next_call_index, call, workspace_digest=self.workspace_state_guard.content_digest(),
+            runtime_digest=permission_digest(self._snapshot_compatibility()))
+        return self._permission_policy.evaluate(op)
+
+    def _hitl_gate(self, name, args):
+        state = self._run_state
+        if state is None or state.status is not RunStatus.RUNNING or not state.has_pending_tool_batch:
+            raise CheckpointError("HITL handler 必须通过当前持久化 Run 批次")
+        batch = state.tool_batch
+        call = batch.tool_calls[batch.next_call_index]
+        if call["function"]["name"] != name or json.loads(call["function"]["arguments"]) != args:
+            raise CheckpointError("HITL 调用身份 / 参数与原调用不一致")
+        if state.approval_id is not None:
+            approval = self._approval_store.get(state.approval_id)
+            if approval.state is ApprovalStatus.REJECTED:
+                return ToolDispatchResult(ToolDispatchStatus.APPROVAL_REJECTED,
+                    "[NOT_EXECUTED] 用户拒绝本操作；当前批次剩余调用不执行，需要重新规划。")
+            if approval.state is not ApprovalStatus.APPROVED:
+                raise CheckpointError("审批未批准、已失效或已消费")
+            # Always consume/recheck an existing grant, even if policy now says DENY.
+            return None
+        decision = self._hitl_decision(call)
+        if decision.kind is PermissionKind.DENY:
+            return ToolDispatchResult(ToolDispatchStatus.PERMISSION_DENIED,
+                f"[NOT_EXECUTED] 权限拒绝（{decision.rule_id}）：{decision.reason}")
+        if decision.kind is PermissionKind.ALLOW:
+            return None
+        # The current call was visited but has not been processed. Its signature
+        # must not count as completed in the durable dedup prefix.
+        batch.seen_signatures.discard((name, call["function"]["arguments"]))
+        pending = copy.deepcopy(state)
+        pending.status = RunStatus.WAITING_APPROVAL
+        pending.pause_requested = False
+        pending.tool_batch.status = ToolBatchStatus.PAUSED
+        data = self._build_run_snapshot_data(pending)
+        try:
+            approval, revision = self._approval_store.request_wait(decision, self._checkpoint_revision, data)
+        except BaseException:
+            self._checkpoint_faulted = True
+            raise
+        # Publish memory only after both request and projection have committed.
+        state.approval_id = approval.approval_id
+        state.status = RunStatus.WAITING_APPROVAL
+        state.pause_requested = False
+        batch.status = ToolBatchStatus.PAUSED
+        self._checkpoint_revision = revision
+        return ToolDispatchResult(ToolDispatchStatus.WAITING_APPROVAL, approval)
+
     def _execute_tool(self, name: str, args: Dict[str, Any]) -> ToolDispatchResult:
         """Check current capability, then dispatch through the Main Agent registry."""
-        if not self.tool_registry.has_handler(name):
+        if getattr(self, "_hitl_enabled", False):
+            try:
+                control = self._hitl_gate(name, args)
+            except BaseException:
+                # Real pre-dispatch failures are not handler outcomes. Durable
+                # PREPARED / WAITING facts must survive without fabricated closure.
+                self._checkpoint_faulted = True
+                raise
+            if control is not None:
+                return control
+        if not self.tool_registry.has_handler(name) and not (getattr(self, "_hitl_enabled", False) and self._run_state.approval_id):
             return ToolDispatchResult(
                 ToolDispatchStatus.UNKNOWN_TOOL,
                 f"错误: 未知工具 '{name}'",
             )
-        if not self.feature_manager.is_tool_enabled(name):
+        if not self.feature_manager.is_tool_enabled(name) and not (getattr(self, "_hitl_enabled", False) and self._run_state.approval_id):
             return ToolDispatchResult(
                 ToolDispatchStatus.FEATURE_DISABLED,
                 ToolResult(
@@ -2622,7 +2767,10 @@ class MiniClaudeAgent:
 
                     try:
                         args = json.loads(args_raw) if isinstance(args_raw, str) else args_raw
-                    except (json.JSONDecodeError, TypeError) as exc:
+                        if getattr(self, "_hitl_enabled", False):
+                            snapshot_require(type(args) is dict, "工具参数必须为 JSON 对象")
+                            json_copy(args)  # Reject non-finite values before governance or dispatch.
+                    except (ValueError, TypeError) as exc:
                         # A malformed model argument should become tool feedback,
                         # not terminate the entire agent task.
                         result_text = f"工具参数 JSON 无效，请重新生成合法 JSON: {exc}"
@@ -2805,6 +2953,34 @@ class MiniClaudeAgent:
                             else:
                                 dispatch_status = ToolDispatchStatus.DISPATCHED
                                 result = dispatch
+                            if dispatch_status is ToolDispatchStatus.WAITING_APPROVAL:
+                                current_tool_execution_started = False
+                                return self._approval_wait_message(result)
+                            if dispatch_status in {ToolDispatchStatus.PERMISSION_DENIED, ToolDispatchStatus.APPROVAL_REJECTED}:
+                                current_tool_execution_started = False
+                                tool_call_outcome = "BLOCKED_PERMISSION_DENIED"
+                                result_text = str(result)
+                                current_tool_result_available = True
+                                append_tool_result(tc, result_text)
+                                current_tool_result_received = True
+                                record_tool_result_event(tname, result_text, success=False,
+                                    blocked=True, outcome=tool_call_outcome)
+                                if dispatch_status is ToolDispatchStatus.APPROVAL_REJECTED:
+                                    # Close the suffix as a single known, non-execution projection.
+                                    state.pause_requested = False
+                                    state.record_tool_result(tc["id"], tool_call_outcome, result_text)
+                                    while batch.has_pending_calls:
+                                        remaining = batch.tool_calls[batch.next_call_index]
+                                        batch.seen_signatures.add((remaining["function"]["name"], remaining["function"]["arguments"]))
+                                        text = "[NOT_EXECUTED] 前置操作被用户拒绝，剩余依赖操作未执行；请重新规划。"
+                                        append_tool_result(remaining, text)
+                                        state.record_tool_result(remaining["id"], "BLOCKED_NOT_EXECUTED", text)
+                                    defer_replan("用户拒绝了原操作，剩余工具均未执行。请重新规划合法替代方案。")
+                                    self._checkpoint_save("tools")
+                                    break
+                                if advance_current_call(tool_call_outcome, result_text):
+                                    return "任务已在安全工具边界暂停，可在同一进程继续。"
+                                continue
                             tool_result = result if isinstance(result, ToolResult) else ToolResult(
                                 content=str(result), success=not self._is_tool_error(str(result), tname)
                             )
@@ -3140,7 +3316,7 @@ class MiniClaudeAgent:
                 iteration = state.model_turns_used
 
             except KeyboardInterrupt:
-                if getattr(self, "_checkpoint_faulted", False):
+                if getattr(self, "_checkpoint_faulted", False) or state.status is RunStatus.WAITING_APPROVAL:
                     raise
                 if active_tool_calls:
                     finish_tool_batch(
@@ -3163,7 +3339,7 @@ class MiniClaudeAgent:
                 self.trace.end_task("CANCELLED")
                 return self._finish_run(RunStatus.CANCELLED, "已停止当前任务。")
             except Exception as e:
-                if getattr(self, "_checkpoint_faulted", False):
+                if getattr(self, "_checkpoint_faulted", False) or state.status is RunStatus.WAITING_APPROVAL:
                     raise
                 if active_tool_calls:
                     finish_tool_batch(
@@ -3218,7 +3394,7 @@ class MiniClaudeAgent:
     def chat(self, message: str, require_tool_call: bool = False) -> str:
         """Submit a user instruction to the Agent Runtime."""
         state = getattr(self, "_run_state", None)
-        if state and state.status in {RunStatus.RUNNING, RunStatus.PAUSED}:
+        if state and state.status in {RunStatus.RUNNING, RunStatus.PAUSED, RunStatus.WAITING_APPROVAL}:
             return "错误: 当前运行尚未完成；请先继续或终止该运行。"
         self.session_recorder.start_round()
         logger.info("USER_INPUT: %s", message)
@@ -3229,7 +3405,8 @@ class MiniClaudeAgent:
         # A final model response only means the conversation turn ended; the
         # benchmark trace remains the authority for task success.
         final_event = {
-            "status": "PAUSED" if state and state.status is RunStatus.PAUSED else "RESPONSE",
+            "status": ("WAITING_APPROVAL" if state and state.status is RunStatus.WAITING_APPROVAL
+                       else "PAUSED" if state and state.status is RunStatus.PAUSED else "RESPONSE"),
             "run_id": state.run_id if state else "",
         }
         if result == self._last_assistant_note:

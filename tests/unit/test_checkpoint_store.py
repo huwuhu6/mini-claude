@@ -66,7 +66,7 @@ def test_schema_and_snapshot_roundtrip(ready):
         assert connection.execute("PRAGMA synchronous").fetchone()[0] == 2
 
 
-@pytest.mark.parametrize("version", [3, 999])
+@pytest.mark.parametrize("version", [4, 999])
 def test_incompatible_schema_refused(tmp_path, version):
     path = tmp_path / "db"
     with sqlite3.connect(path) as connection:

@@ -265,7 +265,21 @@ CLI
 - `src/core/compression.py` 使用 `tiktoken` 做 estimated token 估算；包未安装或编码资源初始化失败时会安全回退到粗略估算，不提供 provider-specific tokenizer。Provider 返回的 `usage.prompt_tokens` 才是实际请求用量。
 - 评测结果中的过程指标用于工程分析，不等同于通用 Agent 能力排名。
 
-HITL 的权限决策与持久化审批记录目前仅提供开发契约，尚未接入 Agent 执行、暂停或 CLI 交互；默认运行不会请求或消费审批。详见 [工具与 Runtime 演进](docs/evolution/tool_registry.md)。
+主 Agent 已支持显式启用的持久化 HITL Runtime API，默认关闭且要求先启用 SQLite Checkpoint。ASK 保存原工具调用并暂停，批准后继续原批次；拒绝会关闭剩余调用后重新规划。CLI 审批交互尚未提供，SubAgent 和直接工具 API 不在此保护范围内。详见 [工具与 Runtime 演进](docs/evolution/tool_registry.md)。
+
+开发接口示例（审批决定由调用方显式提供）：
+
+```python
+agent.enable_checkpoints(checkpoint_path)
+agent.enable_hitl()
+agent.run(task)
+run_id = agent._run_state.run_id  # 当前内部 RunState 身份
+approval = agent.get_pending_approval(run_id)  # 仅在等待审批时查询
+agent.decide_approval(run_id, approval.approval_id, approved=user_approved, actor=user_identity)
+agent.resume_checkpoint(run_id)  # 重查上下文；不会重新生成待执行调用
+```
+
+`actor` 用于审计，不提供身份认证。审批消费后的未知执行状态仍需人工检查，不能通过再次批准自动重试。
 
 ## 工程讨论主题
 

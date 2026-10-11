@@ -12,6 +12,7 @@ import uuid
 class RunStatus(str, Enum):
     RUNNING = "running"
     PAUSED = "paused"
+    WAITING_APPROVAL = "waiting_approval"
     COMPLETED = "completed"
     TERMINATED = "terminated"
     FAILED = "failed"
@@ -134,6 +135,7 @@ class RunState:
     terminal_result: str | None = None
     # Imported workspace precondition, retained through preparation failures.
     workspace_checkpoint_digest: str | None = None
+    approval_id: str | None = None
 
     @property
     def has_pending_tool_batch(self) -> bool:
@@ -177,6 +179,7 @@ class RunState:
         # The first completed call consumes the import boundary. Later tool writes
         # are ordinary run effects and must not be compared to the old workspace.
         self.workspace_checkpoint_digest = None
+        self.approval_id = None
         if advance is ToolBatchAdvance.PAUSED:
             self.pause_requested = False
             self.status = RunStatus.PAUSED
@@ -192,5 +195,6 @@ class RunState:
     def finish(self, status: RunStatus, result: str) -> str:
         self.status = status
         self.terminal_result = result
+        self.approval_id = None
         self.pause_requested = False
         return result

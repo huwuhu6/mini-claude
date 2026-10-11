@@ -125,7 +125,7 @@ class ApprovalStore:
         tools = snapshot["compatibility"].get("tools")
         require(tools is None or tools.get(operation.tool_name) == context["tool_contract"], "审批工具契约冲突")
 
-    def create(self, decision, revision, *, expires_at=None):
+    def create(self, decision, revision, *, expires_at=None, _transaction=None):
         require(isinstance(decision, PermissionDecision) and decision.kind is PermissionKind.ASK, "只为 ASK 创建审批")
         op = decision.operation
         require(self.policy.evaluate(op) == decision, "当前策略拒绝 / 决策已变化，不能创建审批")
@@ -147,6 +147,24 @@ class ApprovalStore:
             connection.execute("INSERT INTO approvals VALUES(?,?,?,?,?,?,?,?,?,?,?,?,?,?)", tuple(data.values()))
             self._touch(connection, op.run_id, token)
             return ApprovalRecord.from_dict(data)
+        if _transaction is not None:
+            return operation(*_transaction)
+        return self.checkpoints._write(op.run_id, operation)
+
+    def request_wait(self, decision, revision, snapshot, *, expires_at=None):
+        """One lock/transaction publishes request and its WAITING projection."""
+        from core.run_snapshot import json_copy, HITL_SNAPSHOT_VERSION
+        data = json_copy(snapshot)
+        require(data["schema_version"] == HITL_SNAPSHOT_VERSION and data["run"]["status"] == "waiting_approval", "等待投影契约错误")
+        op = decision.operation
+        def operation(connection, token):
+            approval = self.create(decision, revision, expires_at=expires_at, _transaction=(connection, token))
+            data["run"]["approval_id"] = approval.approval_id
+            # create advances the Run revision, within this same uncommitted transaction.
+            current_revision = connection.execute("SELECT revision FROM runs WHERE run_id=?", (op.run_id,)).fetchone()[0]
+            updated = self.checkpoints.save_snapshot(op.run_id, current_revision, data,
+                boundary="approval", _transaction=(connection, token))
+            return approval, updated
         return self.checkpoints._write(op.run_id, operation)
 
     def _invalidate(self, connection, data, token, reason):
