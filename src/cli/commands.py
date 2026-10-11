@@ -44,6 +44,9 @@ def register_agent_commands(console: ConsoleCommandSystem, agent: Any) -> None:
 def create_agent_console(agent: Any) -> ConsoleCommandSystem:
     console = ConsoleCommandSystem()
     register_agent_commands(console, agent)
+    if getattr(agent, "_hitl_enabled", False):
+        from cli.hitl_commands import register_hitl_commands
+        register_hitl_commands(console, agent)
     return console
 
 
@@ -51,6 +54,17 @@ def execute_agent_command(
     console: ConsoleCommandSystem, agent: Any, command: str
 ) -> str:
     """Execute a CLI command and preserve command session events."""
+    # Approval displays are ephemeral: no parameters/results in command logs.
+    try:
+        parsed = console.parse(command)
+    except ValueError:
+        parsed = None  # execute() owns the existing malformed-input feedback.
+    name = parsed[0] if parsed else ''
+    definition = console.get_command(name)
+    if definition and definition.category == 'hitl':
+        agent.session_recorder.start_round()
+        agent.session_recorder.record("cli_control", command=name)
+        return console.execute(command, {'agent': agent})
     recorder = agent.session_recorder
     recorder.start_round()
     logger.info("USER_INPUT: %s", command)

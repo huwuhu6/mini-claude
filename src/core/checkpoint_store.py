@@ -68,9 +68,13 @@ class RunLock:
 
 class SqliteCheckpointStore:
     """One current projection per run, CAS revisions and a small execution journal."""
-    def __init__(self, path: Path):
+    def __init__(self, path: Path, *, require_existing: bool = False):
         self.path = Path(path).expanduser().resolve()
-        self.path.parent.mkdir(parents=True, exist_ok=True)
+        self._require_existing = require_existing
+        if require_existing and not self.path.is_file():
+            raise CheckpointError("Checkpoint 数据库不存在；恢复不能创建空数据库")
+        if not require_existing:
+            self.path.parent.mkdir(parents=True, exist_ok=True)
         self.lock_dir = self.path.parent / (self.path.name + ".locks")
         self.lock_dir.mkdir(exist_ok=True)
         self._locks: dict[str, RunLock] = {}
@@ -83,6 +87,8 @@ class SqliteCheckpointStore:
             connection.execute("BEGIN IMMEDIATE")
             try:
                 version = connection.execute("PRAGMA user_version").fetchone()[0]
+                if require_existing and version == 0:
+                    raise CheckpointError("已有文件缺少 Checkpoint Schema；不能在恢复时初始化空库")
                 if version not in {0, 1, 2, DB_VERSION}:
                     raise CheckpointError(f"Checkpoint 数据库版本不兼容: {version}")
                 tables = connection.execute("SELECT name FROM sqlite_master WHERE type='table'").fetchall()
@@ -153,7 +159,8 @@ class SqliteCheckpointStore:
     def _connection(self):
         if self._closed:
             raise CheckpointError("Checkpoint Store 已关闭")
-        connection = sqlite3.connect(str(self.path), timeout=5, isolation_level=None)
+        target = self.path.as_uri() + "?mode=rw" if self._require_existing else str(self.path)
+        connection = sqlite3.connect(target, uri=self._require_existing, timeout=5, isolation_level=None)
         connection.row_factory = sqlite3.Row
         try:
             connection.execute("PRAGMA foreign_keys=ON")
@@ -340,6 +347,11 @@ class SqliteCheckpointStore:
     def mark_running(self, run_id, revision, turn, ordinal, call_id, *, call=None):
         return self._write(run_id, lambda connection, token: self._start_call(
             connection, token, run_id, revision, turn, ordinal, call_id, call=call))
+
+    def list_run_ids(self):
+        """Read-only discovery; callers still load/validate each selected Run."""
+        with self._connection() as connection:
+            return [row[0] for row in connection.execute("SELECT run_id FROM runs ORDER BY run_id")]
 
     def load(self, run_id):
         with self._connection() as connection:

@@ -95,6 +95,11 @@ class ApprovalStore:
         self.policy = policy
         self.clock = clock
 
+    def list_for_run(self, run_id):
+        with self.checkpoints._connection() as connection:
+            rows = connection.execute("SELECT * FROM approvals WHERE run_id=? ORDER BY turn,ordinal", (run_id,)).fetchall()
+        return [ApprovalRecord.from_dict(dict(row)) for row in rows]
+
     def get(self, approval_id):
         with self.checkpoints._connection() as connection:
             row = connection.execute("SELECT * FROM approvals WHERE approval_id=?", (approval_id,)).fetchone()

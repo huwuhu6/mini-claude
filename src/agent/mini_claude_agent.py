@@ -629,7 +629,7 @@ class MiniClaudeAgent:
             trace_task_id=state.trace_task_id, source_trace_task_id=source_trace_id,
             source_session_id=data["diagnostics"]["source_session_id"])
 
-    def enable_checkpoints(self, path: Path | None = None) -> None:
+    def enable_checkpoints(self, path: Path | None = None, *, require_existing: bool = False) -> None:
         """Opt in before a Run. Normal CLI/Mock/Benchmark behavior stays in-memory."""
         if self.has_active_run or getattr(self, "_checkpoint_store", None) is not None:
             raise CheckpointError("只能在没有活动 Run 且尚未启用时配置 Checkpoint")
@@ -638,7 +638,7 @@ class MiniClaudeAgent:
             raise CheckpointError("Checkpoint 数据库必须位于用户工作区之外")
         if self.background.list():
             raise CheckpointError("已有后台任务表，不能启用 Checkpoint")
-        self._checkpoint_store = SqliteCheckpointStore(database)
+        self._checkpoint_store = SqliteCheckpointStore(database, require_existing=require_existing)
         self._checkpoint_run_id = None
         self._checkpoint_revision = None
         self._checkpoint_faulted = False
@@ -728,6 +728,25 @@ class MiniClaudeAgent:
         self._hitl_enabled = True
         self._permission_policy = DefaultPermissionPolicy.for_agent(self)
         self._approval_store = ApprovalStore(self._checkpoint_store, self._permission_policy)
+
+    def get_checkpoint_info(self, run_id: str):
+        """Read-only CLI view; neither claims a Run nor repairs its journal."""
+        if not getattr(self, "_hitl_enabled", False):
+            raise CheckpointError("未启用持久化 HITL")
+        record = self._checkpoint_store.load(run_id)
+        snapshot = record["snapshot"]
+        return {"run_id": run_id, "status": record["status"], "checked_at": self._approval_store.clock(),
+            "workspace": snapshot["workspace"]["root"] if snapshot else None,
+            "cwd": snapshot["workspace"]["cwd"] if snapshot else None,
+            "result": record["final_result"],
+            "calls": [{"call_id": call["call_id"], "state": call["state"]} for call in record["journal"]],
+            "approval_id": snapshot["run"].get("approval_id") if snapshot else None,
+            "approvals": self._approval_store.list_for_run(run_id)}
+
+    def list_checkpoint_runs(self):
+        if not getattr(self, "_hitl_enabled", False):
+            raise CheckpointError("未启用持久化 HITL")
+        return [self.get_checkpoint_info(run_id) for run_id in self._checkpoint_store.list_run_ids()]
 
     def get_pending_approval(self, run_id: str):
         if not getattr(self, "_hitl_enabled", False):

@@ -91,9 +91,10 @@ class ConsoleCommandSystem:
             return msg
 
         # Add to history
-        self._history.append(text)
-        if len(self._history) > self._max_history:
-            self._history.pop(0)
+        if cmd.category != "hitl":
+            self._history.append(text)
+            if len(self._history) > self._max_history:
+                self._history.pop(0)
 
         try:
             result = cmd.handler(args, context or {})

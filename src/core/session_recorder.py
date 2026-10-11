@@ -21,6 +21,7 @@ class SessionRecorder:
         self._lock = threading.Lock()
         self._round_id = 0
         self._step = 0
+        self.redact_display = False
 
     def start_round(self) -> int:
         """Start one user -> agent completion interaction."""
@@ -30,6 +31,9 @@ class SessionRecorder:
             return self._round_id
 
     def record(self, event_type: str, **data: Any) -> None:
+        if self.redact_display:
+            from core.display_safety import redact
+            data = redact(data)
         try:
             self.sessions_dir.mkdir(parents=True, exist_ok=True)
             with self._lock:

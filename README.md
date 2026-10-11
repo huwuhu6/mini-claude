@@ -119,6 +119,38 @@ mini-claude path/to/project -y
 python -m cli.entrypoint . --yes
 ```
 
+### 本地 HITL 审批与恢复
+
+HITL 默认关闭。首次启用时显式允许创建 SQLite 数据库；默认位置为当前 Workspace 的运行数据目录，启动时会显示完整路径：
+
+```text
+mini-claude path/to/project --hitl --init-checkpoints
+```
+
+也可使用 `--checkpoint-db <工作区之外的数据库路径>`，以后重启必须使用相同路径。仅 `--hitl` 要求已有有效数据库；缺失、空文件或损坏时拒绝启动，不降级为无审批执行。`--init-checkpoints` 只用于显式初始化，不会清空已有任务。需要恢复时不可用它绕过缺失数据库检查。
+
+当 Run 显示 `WAITING_APPROVAL`，Runtime 已保存原调用和完成前缀并释放执行锁；终端返回普通输入提示，可正常 `exit`。使用显示的准确身份操作：
+
+| 命令 | 行为 |
+| --- | --- |
+| `/runs` | 查询保存的 Run ID、状态、Workspace 和当前 Approval ID |
+| `/approval <Run ID>` | 查看实际参数、cwd、原因、历史及当前审批状态 |
+| `/approve <Run ID> <Approval ID>` | 仅记录批准，不执行工具 |
+| `/reject <Run ID> <Approval ID>` | 仅记录拒绝；使用既有固定拒绝说明，不接受自由文本理由 |
+| `/resume <Run ID>` | 取得执行独占并复用 Runtime 恢复协议 |
+
+批准后显式 `/resume` 才执行原调用；拒绝后 `/resume` 关闭剩余调用并重新规划。未决定时继续等待；失效审批不能再次授权；UNKNOWN 必须人工检查，不提供批准重试。已终结 Run 的重复恢复只展示已有结果。审批期间普通新输入、`/clear` 和 `/compact` 不能覆盖当前未完成 Run。
+
+退出后重新进入相同 Workspace，可先用 `/runs` 查询，再输入命令；也可启动时显式恢复：
+
+```text
+mini-claude path/to/project --hitl --resume RUN_ID
+```
+
+`--config <配置文件>` 用于明确指定配置；恢复时配置、工具实现、权限与工作区仍需通过 Runtime 的兼容检查。源码版本变化也可能使旧审批失效，本阶段不放宽这个门槛。
+
+敏感字段及常见命令凭据仅在展示和诊断中脱敏，原操作仍使用原参数绑定；审批详情不写入命令历史或命令结果日志。脱敏是保守的展示辅助，不能识别任意文本中的所有秘密；SQLite、Snapshot 和必要执行 Trace 仍是含原参数的可信本地数据。Shell、测试、构建、TodoWrite、笔记等仍沿用保守策略，每个新操作可能单独要求批准，不提供“始终允许”。
+
 ### REPL 命令
 
 常用内置命令包括：
@@ -265,7 +297,7 @@ CLI
 - `src/core/compression.py` 使用 `tiktoken` 做 estimated token 估算；包未安装或编码资源初始化失败时会安全回退到粗略估算，不提供 provider-specific tokenizer。Provider 返回的 `usage.prompt_tokens` 才是实际请求用量。
 - 评测结果中的过程指标用于工程分析，不等同于通用 Agent 能力排名。
 
-主 Agent 已支持显式启用的持久化 HITL Runtime API，默认关闭且要求先启用 SQLite Checkpoint。ASK 保存原工具调用并暂停，批准后继续原批次；拒绝会关闭剩余调用后重新规划。CLI 审批交互尚未提供，SubAgent 和直接工具 API 不在此保护范围内。详见 [工具与 Runtime 演进](docs/evolution/tool_registry.md)。
+主 Agent 已支持显式启用的持久化 HITL Runtime API，默认关闭且要求先启用 SQLite Checkpoint。ASK 保存原工具调用并暂停，批准后继续原批次；拒绝会关闭剩余调用后重新规划。可信本地终端已提供审批、查询与显式恢复入口；SubAgent 和直接工具 API 不在此保护范围内。详见 [工具与 Runtime 演进](docs/evolution/tool_registry.md)。
 
 开发接口示例（审批决定由调用方显式提供）：
 
