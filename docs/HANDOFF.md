@@ -1,13 +1,13 @@
-## 2026-10-11 当前现场：第五阶段暂停快照契约
+## 2026-10-11 当前现场：第六阶段 SQLite Checkpoint
 
-- 第五阶段整合基线为 `a3cbd530631fdd9d54616624bcc6de0b6eccf512`，已经包含前四阶段；第四阶段功能提交为 `a3ef6b3`。之前“暂缓合并”的现场记录已经被后续安全 fast-forward 整合取代。
-- 第五阶段实现已在 `codex/run-snapshot-contract` 提交为 `f6ff2571fa2a8f0d826a7a83a1a8ea6b21bfd8a1`，提交说明为 `feat: 增加版本化 Run 快照与跨实例恢复`；Worktree 为 `D:\02_study\code\AgentProject\mini-claude-worktrees\run-snapshot-contract`。用户已授权仅以 fast-forward 整合到本地 main，不推送、不删除 Worktree、不开始第六阶段。
-- 新增 JSON schema v1：export_run_snapshot() 只导出受控 PAUSED 状态；restore_run_snapshot() 先完整验证，再装入新实例，随后显式 _continue_run()。消息、原 Call ID / 参数、结果前缀 / 游标、预算、重试、Todo、Note 内容及有界 AttemptHistory 恢复。没有 SQLite、跨进程崩溃恢复或 HITL。
-- 当前工具 / 关键配置 / Workspace 不兼容时拒绝；可观察工作区内容变化时拒绝导入或首次继续。该前置条件保存在 RunState，在首个完成调用后消费。cwd 在恢复与继续时用当前授权重新检查。执行仍使用当前 Feature / CommandPolicy / WorkspaceAuthority；旧授权和环境不被复制。
-- 新实例建立新 Trace / Session 片段并关联原 Run。文件观察与 Recent Files 重建，不把陈旧观察当当前事实。后台任务表、子 Agent 栈、旧 Shell / 客户端 / 锁不恢复。
-- 最终 Windows Python 3.14.3 验证：快照专项 54 passed；扩展 Runtime / Tools / CLI / LoopController 定向回归 260 passed、12 skipped；完整 tests/unit 419 passed、12 skipped、4 failed。main 同四项复核 2 failed、2 passed，仍为 Provider fixture / schema 文本断言两项基线问题与两项 Worktree CRLF oracle 哈希差异；原 oracle 未改。Linux 全套验证仍未执行。
-- `src/core/run_snapshot.py`、`tests/unit/test_run_snapshot.py` 已明确加入第五阶段实现提交；暂存差异检查通过。Evolution 已使用真实实现 SHA 回填，回填由独立文档提交保存。完整契约、取舍及限制以 docs/evolution/tool_registry.md 为准。
-- 快照复制给多个新实例没有全局去重保证；调用方需要唯一继续者。本轮只支持受控暂停边界，不支持副作用成功后结果未落盘、handler 内退出或任意异步中断。
+- 基线是已整合前五阶段的本地 main `9f6a313cfe75e3c1d9a07db109cdf4d83d50a383`；第五阶段实现为 `f6ff2571fa2a8f0d826a7a83a1a8ea6b21bfd8a1`。main 未修改。
+- 当前分支 `codex/sqlite-checkpoint-recovery`，Worktree `D:\02_study\code\AgentProject\mini-claude-worktrees\sqlite-checkpoint-recovery`；本阶段尚未提交。用户仅授权实现、测试及文档，不提交、合并、推送或进入 HITL。
+- 先完成独立 Store / 故障协议并测试，再接入既有 RunState / Snapshot / dispatch 边界。SQLite schema v1 只有 runs / calls 两表，WAL + FULL，版本 CAS；结果、messages 与游标同一事务保存。执行前可靠提交 RUNNING，遗留 RUNNING 保守归 UNKNOWN，不自动重放。
+- 默认内存 / JSON v1 路径保留；checkpoint_enabled=True 或 enable_checkpoints() 显式启用。resume_checkpoint(run_id) 使用内核文件锁持锁读取、核验和继续。持久化投影是绑定数据库的 JSON v2，不允许通过普通 Snapshot 入口绕过锁。后台任务 / 子 Agent 在该模式拒绝启动。
+- Store 提交异常在新连接核验 last_operation；无论已提交、未提交还是无法判断都停止当前实例。恢复必须新建实例；Run 被另一实例推进后旧内存 CAS 拒绝继续。工具原调用、结果前缀、当前目录、工作区摘要、实现 / 配置和当前能力按既有验证器检查，不继承旧授权 / 完整环境。
+- Windows Python 3.14.3 最终完整 tests/unit：477 passed、12 skipped、4 failed；新增 Checkpoint 58 项全部通过。Snapshot / RunState / 消息闭环与 Checkpoint 的非进程故障定向集 164 passed、10 deselected；LoopController integration 35 passed。独立进程测试使用临时数据库、Mock Provider 与可观察副作用，包含 PREPARED、RUNNING、结果事务前后、终结后退出、受控暂停和活 handler 并发排斥。无付费模型或 Terminal-Bench。
+- 完整单测四项已知失败仍保留：Provider fixture / read_file schema 文本断言在未修改 main 同样失败；Node / Java oracle 的本 Worktree CRLF 哈希与 HEAD 的 LF 不同，在 main 对应测试通过。测试修改的是临时副本；原 oracle 未修改，未删除断言。Linux / POSIX 实际验证尚未执行。
+- 实际契约、证据与保守恢复限制以 docs/evolution/tool_registry.md 为准，Commit 暂为 PENDING。仍没有 HITL 审批、自动 UNKNOWN 解除、数据库迁移、跨机器锁或外部副作用事务保证。
 
 ## 2026-10-01 当前现场
 

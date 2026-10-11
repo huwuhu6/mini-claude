@@ -10,6 +10,7 @@ from core.run_state import RunState, RunStatus, ToolBatchState, ToolBatchStatus,
 from providers.base import Message
 
 SCHEMA_VERSION = 1
+CHECKPOINT_SNAPSHOT_VERSION = 2  # Bound projections cannot use standalone JSON resume.
 SNAPSHOT_FIELDS = {"schema_version", "workspace", "compatibility", "run", "messages",
                    "history", "todo", "agent_note", "memory", "context", "diagnostics"}
 # UNKNOWN/cancellation/not-executed terminal closures are never resumable pauses.
@@ -84,25 +85,32 @@ def call_ids(calls: Any) -> list[str]:
     return ids
 
 
-def decode_run(data: Any) -> RunState:
+def decode_run(data: Any, *, _terminal: bool = False, _pre_model: bool = False) -> RunState:
     fields(data, set(RunState.__dataclass_fields__), "RunState")
     text(data["run_id"], "Run ID", nonempty=True)
-    require(data["status"] == RunStatus.PAUSED.value, "只恢复安全暂停中的 Run")
-    require(data["terminal_result"] is None, "暂停 Run 不得含终结结果")
+    if _terminal:
+        require(data["status"] in {"completed", "terminated", "failed", "cancelled"}, "Checkpoint 终结状态错误")
+        text(data["terminal_result"], "终结结果")
+    else:
+        require(data["status"] == RunStatus.PAUSED.value, "只恢复安全暂停中的 Run")
+        require(data["terminal_result"] is None, "暂停 Run 不得含终结结果")
     integer(data["max_iterations"], "模型预算", 1)
-    integer(data["model_turns_used"], "已用模型轮次", 1)
+    integer(data["model_turns_used"], "已用模型轮次", 0 if _terminal or _pre_model else 1)
     integer(data["no_tool_retry_count"], "无工具重试")
     require(data["no_tool_retry_count"] <= 1, "无工具重试超过现有运行契约")
     require(data["model_turns_used"] <= data["max_iterations"], "已用轮次超过预算")
     for key in ("require_tool_call", "tool_call_seen", "pause_requested", "trace_started"):
         require(type(data[key]) is bool, f"{key} 必须为布尔值")
-    require(data["tool_call_seen"] and data["trace_started"] and not data["pause_requested"],
+    require((_terminal or (_pre_model and data["trace_started"]) or (data["tool_call_seen"] and data["trace_started"])) and not data["pause_requested"],
             "不是已确认的工具边界暂停")
-    text(data["trace_task_id"], "原 Trace ID", nonempty=True)
+    if not _terminal or data["trace_task_id"] is not None:
+        text(data["trace_task_id"], "原 Trace ID", nonempty=True)
     digest = data["workspace_checkpoint_digest"]
     require(digest is None or (type(digest) is str and len(digest) == 64
             and all(c in "0123456789abcdef" for c in digest)), "工作区前置摘要格式错误")
     raw = data["tool_batch"]
+    if (_terminal or _pre_model) and raw is None:
+        return RunState(**{**data, "status": RunStatus(data["status"])})
     fields(raw, set(ToolBatchState.__dataclass_fields__), "ToolBatchState")
     ids = call_ids(raw["tool_calls"])
     cursor = raw["next_call_index"]
@@ -111,9 +119,16 @@ def decode_run(data: Any) -> RunState:
     integer(raw["model_iteration"], "批次模型轮次")
     text(raw["assistant_content"], "Assistant 内容")
     require(cursor <= len(ids), "游标越界")
-    require(raw["model_iteration"] == data["model_turns_used"] - 1, "批次轮次不一致")
+    require((raw["model_iteration"] < data["model_turns_used"] if _terminal or _pre_model
+             else raw["model_iteration"] == data["model_turns_used"] - 1), "批次轮次不一致")
     expected_status = ToolBatchStatus.PAUSED if cursor < len(ids) else ToolBatchStatus.COMPLETED
-    require(raw["status"] == expected_status.value, "游标与批次阶段不一致")
+    if _terminal:
+        require(cursor == len(ids) and raw["status"] in {"completed", "failed", "terminated"}, "终结批次未闭合")
+        expected_status = ToolBatchStatus(raw["status"])
+    else:
+        require(raw["status"] == expected_status.value, "游标与批次阶段不一致")
+    if _pre_model:
+        require(cursor == len(ids) and raw["finalized"], "模型边界仍有未完成工具或收尾")
     require(type(raw["finalized"]) is bool, "finalized 必须为布尔值")
     require(not raw["finalized"] or cursor == len(ids), "待执行批次不能已收尾")
     require(type(raw["pending_replan_messages"]) is list
@@ -126,7 +141,8 @@ def decode_run(data: Any) -> RunState:
     for call_id, result in results.items():
         fields(result, {"call_id", "outcome", "content"}, "工具结果")
         require(result["call_id"] == call_id, "结果关联了错误 ID")
-        require(type(result["outcome"]) is str and result["outcome"] in PAUSED_RESULT_OUTCOMES,
+        require(type(result["outcome"]) is str and result["outcome"] in (PAUSED_RESULT_OUTCOMES | {"UNKNOWN", "NOT_EXECUTED", "CANCELLED", "RECORDED_BEFORE_TERMINAL"}
+                    if _terminal else PAUSED_RESULT_OUTCOMES),
                 "结果不是可继续边界的已知执行事实")
         text(result["content"], "结果内容")
         decoded_results[call_id] = ToolCallResultState(**result)
@@ -139,13 +155,13 @@ def decode_run(data: Any) -> RunState:
     seen = {tuple(s) for s in signatures}
     expected_seen = {(c["function"]["name"], c["function"]["arguments"])
                      for c in raw["tool_calls"][:cursor]}
-    require(len(seen) == len(signatures) and seen == expected_seen, "去重状态与已处理调用不一致")
+    require(len(seen) == len(signatures) and (seen <= expected_seen if _terminal else seen == expected_seen), "去重状态与已处理调用不一致")
     batch = ToolBatchState(**{**raw, "status": expected_status, "results": decoded_results,
                               "resolved_call_ids": set(resolved), "seen_signatures": seen})
-    return RunState(**{**data, "status": RunStatus.PAUSED, "tool_batch": batch})
+    return RunState(**{**data, "status": RunStatus(data["status"]), "tool_batch": batch})
 
 
-def decode_messages(data: Any, state: RunState) -> list[Message]:
+def decode_messages(data: Any, state: RunState, *, _pre_model: bool = False) -> list[Message]:
     require(type(data) is list, "messages 必须为列表")
     messages = []
     for raw in data:
@@ -160,22 +176,23 @@ def decode_messages(data: Any, state: RunState) -> list[Message]:
             require(raw["tool_call_id"] is None, "只有工具结果可以关联调用 ID")
         messages.append(Message(**raw))
     batch = state.tool_batch
-    index = batch.assistant_message_index
-    require(index < len(messages), "当前批次没有 Assistant 消息")
-    assistant = messages[index]
-    require(assistant.role == "assistant" and assistant.tool_calls == batch.tool_calls
-            and assistant.content == batch.assistant_content, "当前 Assistant 与批次原始响应不一致")
-    end = index + 1 + batch.next_call_index
-    require(end <= len(messages), "缺少已完成 Tool Result")
-    for i, call in enumerate(batch.tool_calls[:batch.next_call_index]):
-        message = messages[index + i + 1]
-        require(message.role == "tool" and message.tool_call_id == call["id"]
-                and message.content == batch.results[call["id"]].content, "结果内容或顺序冲突")
-    if not batch.finalized:
-        require(end == len(messages), "未收尾批次尾部存在多余消息")
-    else:
-        require(all(m.role == "user" for m in messages[end:]),
-                "已收尾暂停点之后只能有延后的用户重规划反馈")
+    if batch is not None:
+        index = batch.assistant_message_index
+        require(index < len(messages), "当前批次没有 Assistant 消息")
+        assistant = messages[index]
+        require(assistant.role == "assistant" and assistant.tool_calls == batch.tool_calls
+                and assistant.content == batch.assistant_content, "当前 Assistant 与批次原始响应不一致")
+        end = index + 1 + batch.next_call_index
+        require(end <= len(messages), "缺少已完成 Tool Result")
+        for i, call in enumerate(batch.tool_calls[:batch.next_call_index]):
+            message = messages[index + i + 1]
+            require(message.role == "tool" and message.tool_call_id == call["id"]
+                    and message.content == batch.results[call["id"]].content, "结果内容或顺序冲突")
+        if not batch.finalized:
+            require(end == len(messages), "未收尾批次尾部存在多余消息")
+        elif state.status is RunStatus.PAUSED and not _pre_model:
+            require(all(m.role == "user" for m in messages[end:]),
+                    "已收尾暂停点之后只能有延后的用户重规划反馈")
     # Every previous batch must close; only this batch may have a pending suffix.
     expected = []
     position = 0
@@ -190,5 +207,5 @@ def decode_messages(data: Any, state: RunState) -> list[Message]:
         if message.role == "assistant" and message.tool_calls is not None:
             expected = call_ids(message.tool_calls)
     remaining = expected[position:]
-    require(remaining == batch.pending_call_ids, "消息中待执行调用与游标不一致")
+    require(remaining == (batch.pending_call_ids if batch is not None else []), "消息中待执行调用与游标不一致")
     return messages

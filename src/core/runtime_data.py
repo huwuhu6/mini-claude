@@ -21,6 +21,10 @@ class RuntimeDataPaths:
     inbox: Path
     logs: Path
 
+    @property
+    def checkpoints(self) -> Path:
+        return self.root / "checkpoints.sqlite3"
+
     @classmethod
     def for_workspace(
         cls, workspace: Path, data_root: Path | None = None

@@ -67,8 +67,9 @@ from core.run_state import (
     ToolBatchState,
     ToolCallResultState,
 )
+from core.checkpoint_store import CheckpointError, SqliteCheckpointStore, TERMINAL as CHECKPOINT_TERMINAL
 from core.run_snapshot import (
-    SCHEMA_VERSION, SNAPSHOT_FIELDS, decode_messages, decode_run, encode_run,
+    SCHEMA_VERSION, CHECKPOINT_SNAPSHOT_VERSION, SNAPSHOT_FIELDS, PAUSED_RESULT_OUTCOMES, decode_messages, decode_run, encode_run,
     fields as snapshot_fields, json_copy, require as snapshot_require, text as snapshot_text,
 )
 from core.session_recorder import SessionLogHandler, SessionRecorder
@@ -146,7 +147,8 @@ class MiniClaudeAgent:
                  workspace_root: Optional[Path] = None,
                  workdir: Optional[Path] = None,
                  workspace_confirmed: bool = False,
-                 runtime_data_root: Optional[Path] = None):
+                 runtime_data_root: Optional[Path] = None,
+                 checkpoint_enabled: bool = False):
         self._ui_event_handler: Optional[Callable[[str, Dict[str, Any]], None]] = None
         self._last_assistant_note: Optional[str] = None
         # ── Resolve workspace root (explicit > legacy > cwd fallback) ──
@@ -297,6 +299,13 @@ class MiniClaudeAgent:
         # Workspace confirmation state for trace schema
         self._workspace_confirmed = workspace_confirmed
 
+        self._checkpoint_store: Optional[SqliteCheckpointStore] = None
+        self._checkpoint_run_id: Optional[str] = None
+        self._checkpoint_revision: Optional[int] = None
+        self._checkpoint_faulted = False
+        if checkpoint_enabled:
+            self.enable_checkpoints()
+
         # Start background processor
         self.background.start()
 
@@ -396,6 +405,8 @@ class MiniClaudeAgent:
 
     def run(self, user_input: str, require_tool_call: bool = False) -> str:
         """Process user input and return agent response."""
+        if getattr(self, "_checkpoint_faulted", False):
+            raise CheckpointError("当前实例已因 Checkpoint 故障停止；请用新实例核验原 Run，不能直接开始新任务")
         current = getattr(self, "_run_state", None)
         if current and current.status in {RunStatus.RUNNING, RunStatus.PAUSED}:
             return "错误: 当前运行尚未完成；请先继续或终止该运行。"
@@ -419,7 +430,7 @@ class MiniClaudeAgent:
         from dataclasses import asdict
         runtime_root = Path(__file__).resolve().parents[1]
         # Fail closed after relevant implementation changes, including delegated helpers.
-        sources = ["agent/mini_claude_agent.py", "core/run_state.py", "core/run_snapshot.py",
+        sources = ["agent/mini_claude_agent.py", "core/run_state.py", "core/run_snapshot.py", "core/checkpoint_store.py",
                    "core/loop_controller.py", "core/tools/base_tools.py", "core/tools/registry.py",
                    "core/runtime_context/shell_session.py", "core/runtime_context/command_policy.py",
                    "core/runtime_context/workspace_authority.py", "core/runtime_context/path_resolver.py",
@@ -444,12 +455,14 @@ class MiniClaudeAgent:
             "failure_horizon": self.runtime_policy.failure_detector.horizon,
         }
 
-    def _validate_run_snapshot(self, raw: dict):
+    def _validate_run_snapshot(self, raw: dict, *, _checkpoint_boundary: str | None = None):
         """Pure preparation: no live state, files, trace or authorization is overwritten."""
         snapshot = json_copy(raw)
-        snapshot_fields(snapshot, SNAPSHOT_FIELDS, "Snapshot")
+        linked = type(snapshot) is dict and snapshot.get("schema_version") == CHECKPOINT_SNAPSHOT_VERSION
+        snapshot_fields(snapshot, SNAPSHOT_FIELDS | ({"checkpoint_binding"} if linked else set()), "Snapshot")
+        store = getattr(self, "_checkpoint_store", None)
         snapshot_require(type(snapshot["schema_version"]) is int
-                         and snapshot["schema_version"] == SCHEMA_VERSION, "快照版本不兼容")
+                         and (snapshot["schema_version"] == SCHEMA_VERSION or (linked and store is not None)), "快照版本不兼容；持久化投影要求 Checkpoint Store")
         snapshot_require(snapshot["compatibility"] == self._snapshot_compatibility(),
                          "工具实现、Schema 或关键运行配置不兼容")
         workspace = snapshot["workspace"]
@@ -468,10 +481,14 @@ class MiniClaudeAgent:
         snapshot_text(workspace["content_digest"], "工作区内容摘要")
         snapshot_require(workspace["content_digest"] == self.workspace_state_guard.content_digest(),
                          "工作区内容在导出后发生变化，无法安全继续原调用")
-        state = decode_run(snapshot["run"])
+        state = decode_run(snapshot["run"], _pre_model=_checkpoint_boundary == "before_model")
+        if linked:
+            snapshot_fields(snapshot["checkpoint_binding"], {"database", "run_id"}, "Checkpoint 归属")
+            snapshot_require(snapshot["checkpoint_binding"] == {"database": str(store.path), "run_id": state.run_id},
+                             "Checkpoint 数据库或 Run 归属冲突")
         snapshot_require(state.workspace_checkpoint_digest in {None, workspace["content_digest"]},
                          "Run 的工作区前置条件与快照冲突")
-        messages = decode_messages(snapshot["messages"], state)
+        messages = decode_messages(snapshot["messages"], state, _pre_model=_checkpoint_boundary == "before_model")
         snapshot_require(type(snapshot["history"]) is dict
                          and snapshot["history"].get("maxlen") == self.attempt_history.maxlen,
                          "历史窗口不兼容")
@@ -511,6 +528,12 @@ class MiniClaudeAgent:
         snapshot_require(state is not None and state.status is RunStatus.PAUSED,
                          "只能导出安全边界暂停中的 Run")
         snapshot_require(not self.background.list(), "后台任务表不属于本快照契约")
+        snapshot = self._build_run_snapshot_data(state)
+        self._validate_run_snapshot(snapshot)  # Refuse inconsistent live state, never repair it.
+        return snapshot
+
+    def _build_run_snapshot_data(self, state: RunState) -> dict:
+        """Data construction only; each caller must validate its explicit boundary."""
         from dataclasses import asdict
         snapshot = json_copy({
             "schema_version": SCHEMA_VERSION,
@@ -531,14 +554,24 @@ class MiniClaudeAgent:
                             "source_trace_task_id": state.trace_task_id,
                             "metrics": self.last_metrics},
         })
-        self._validate_run_snapshot(snapshot)  # Refuse inconsistent live state, never repair it.
+        store = getattr(self, "_checkpoint_store", None)
+        if store is not None:
+            snapshot["schema_version"] = CHECKPOINT_SNAPSHOT_VERSION
+            snapshot["checkpoint_binding"] = {"database": str(store.path), "run_id": state.run_id}
         return snapshot
 
-    def restore_run_snapshot(self, snapshot: dict) -> None:
+    def restore_run_snapshot(self, snapshot: dict, *, _checkpoint_boundary: str | None = None) -> None:
         """Install validated detached state; caller explicitly continues the paused Run."""
         snapshot_require(not self.has_active_run, "已有未完成 Run，不能被快照覆盖")
         snapshot_require(not self.background.list(), "恢复目标有独立后台任务")
-        data, state, messages, todo, history, cwd = self._validate_run_snapshot(snapshot)
+        data, state, messages, todo, history, cwd = self._validate_run_snapshot(snapshot, _checkpoint_boundary=_checkpoint_boundary)
+        if data["schema_version"] == CHECKPOINT_SNAPSHOT_VERSION:
+            store = getattr(self, "_checkpoint_store", None)
+            snapshot_require(_checkpoint_boundary is not None and store.holds_lock(state.run_id),
+                             "持久化快照必须通过 Checkpoint 恢复入口并持有执行锁")
+            record = store.load(state.run_id)
+            snapshot_require(record["snapshot"] == data and record["boundary"] == _checkpoint_boundary
+                             and record["status"] in {"active", "paused"}, "不能导入陈旧或未提交的持久化快照")
         seen_ids = getattr(self, "_seen_run_ids", set())
         snapshot_require(state.run_id not in seen_ids
                          and (self._run_state is None or self._run_state.run_id != state.run_id),
@@ -579,6 +612,115 @@ class MiniClaudeAgent:
         self.session_recorder.record("run_snapshot_restored", run_id=state.run_id,
             trace_task_id=state.trace_task_id, source_trace_task_id=source_trace_id,
             source_session_id=data["diagnostics"]["source_session_id"])
+
+    def enable_checkpoints(self, path: Path | None = None) -> None:
+        """Opt in before a Run. Normal CLI/Mock/Benchmark behavior stays in-memory."""
+        if self.has_active_run or getattr(self, "_checkpoint_store", None) is not None:
+            raise CheckpointError("只能在没有活动 Run 且尚未启用时配置 Checkpoint")
+        database = Path(path or self.data_paths.checkpoints).resolve()
+        if database.is_relative_to(self.workdir.resolve()):
+            raise CheckpointError("Checkpoint 数据库必须位于用户工作区之外")
+        if self.background.list():
+            raise CheckpointError("已有后台任务表，不能启用 Checkpoint")
+        self._checkpoint_store = SqliteCheckpointStore(database)
+        self._checkpoint_run_id = None
+        self._checkpoint_revision = None
+        self._checkpoint_faulted = False
+
+    def _checkpoint_claim(self, *, creating: bool = False) -> None:
+        store = getattr(self, "_checkpoint_store", None)
+        if store is None:
+            return
+        state = self._run_state
+        if store.holds_lock(state.run_id):
+            return
+        store.acquire(state.run_id)
+        try:
+            if creating:
+                revision = store.create_run(state.run_id)
+                self._checkpoint_run_id = state.run_id
+                self._checkpoint_revision = revision
+            else:
+                record = store.load(state.run_id)
+                if (record["revision"] != self._checkpoint_revision
+                        or record["status"] in CHECKPOINT_TERMINAL):
+                    raise CheckpointError("Checkpoint 已被推进或终结，旧内存状态不能继续")
+        except BaseException:
+            if creating:
+                self._checkpoint_faulted = True
+            store.release(state.run_id)
+            raise
+
+    def _checkpoint_save(self, boundary: str) -> None:
+        store = getattr(self, "_checkpoint_store", None)
+        if store is None:
+            return
+        try:
+            if self.background.list():
+                raise CheckpointError("Checkpoint 不支持运行中的独立后台任务")
+            from copy import deepcopy
+            state = deepcopy(self._run_state)
+            if boundary == "before_model":
+                if state.has_pending_tool_batch or (state.tool_batch and not state.tool_batch.finalized):
+                    raise CheckpointError("未完成的批次不能进入模型 Checkpoint 边界")
+                # Finished history is in messages/journal; no live batch at this boundary.
+                state.tool_batch = None
+            state.status = RunStatus.PAUSED
+            state.pause_requested = False
+            if state.tool_batch and state.tool_batch.has_pending_calls:
+                state.tool_batch.status = ToolBatchStatus.PAUSED
+            data = self._build_run_snapshot_data(state)
+            self._validate_run_snapshot(data, _checkpoint_boundary=boundary)
+            self._checkpoint_revision = store.save_snapshot(state.run_id,
+                self._checkpoint_revision, data, paused=self._run_state.status is RunStatus.PAUSED,
+                boundary=boundary)
+        except BaseException:
+            self._checkpoint_faulted = True
+            raise
+
+    def _checkpoint_dispatch(self, name: str, args: Dict[str, Any]) -> None:
+        store = getattr(self, "_checkpoint_store", None)
+        if store is None:
+            return
+        try:
+            state = self._run_state
+            if self._checkpoint_faulted or state is None or state.status is not RunStatus.RUNNING or not state.has_pending_tool_batch or self._checkpoint_run_id != state.run_id:
+                raise CheckpointError("持久化模式的 handler 必须通过当前 Run 批次执行")
+            batch = state.tool_batch
+            call = batch.tool_calls[batch.next_call_index]
+            function = call["function"]
+            if function["name"] != name or json.dumps(json.loads(function["arguments"]), sort_keys=True) != json.dumps(args, sort_keys=True):
+                raise CheckpointError("实际 handler 参数与原 Tool Call 不一致")
+            self._checkpoint_revision = store.mark_running(state.run_id,
+                self._checkpoint_revision, batch.model_iteration, batch.next_call_index,
+                batch.pending_call_ids[0], call=call)
+        except BaseException:
+            self._checkpoint_faulted = True
+            raise
+
+    def resume_checkpoint(self, run_id: str) -> str:
+        """Claim -> inspect journal -> validate/install -> continue, holding one lock."""
+        store = getattr(self, "_checkpoint_store", None)
+        if store is None or self.has_active_run:
+            raise CheckpointError("恢复要求启用 Checkpoint，且当前没有活动 Run")
+        store.acquire(run_id)
+        try:
+            record = store.recover(run_id)
+            if record["status"] == "unknown":
+                raise CheckpointError("UNKNOWN：存在无法确认的工具副作用，必须人工检查，禁止自动重试")
+            if record["status"] in CHECKPOINT_TERMINAL:
+                return record["final_result"] or ""
+            if record["snapshot"] is None:
+                raise CheckpointError("尚未提交完整运行边界；初始化或模型响应无法原样恢复")
+            self.restore_run_snapshot(record["snapshot"], _checkpoint_boundary=record["boundary"])
+            self._checkpoint_run_id = run_id
+            self._checkpoint_revision = record["revision"]
+            self._checkpoint_faulted = False
+            self.session_recorder.record("checkpoint_restored", run_id=run_id,
+                revision=record["revision"], trace_task_id=self._run_state.trace_task_id)
+            return self._continue_run()
+        finally:
+            store.release(run_id)
 
     def _create_run_trace(self, trace, state, prompt: str, *, resumed_from: str | None = None) -> str:
         """Create a diagnostic segment without resetting execution/governance state."""
@@ -625,6 +767,7 @@ class MiniClaudeAgent:
         if state.status is not RunStatus.PAUSED:
             return "错误: 当前运行未处于可继续的暂停状态。"
 
+        self._checkpoint_claim()
         try:
             # Grants and directories can change after snapshot validation or a pause.
             cwd = self.workspace_authority.check(str(self.runtime_context.cwd.resolve()))
@@ -646,6 +789,9 @@ class MiniClaudeAgent:
         except BaseException as exc:
             # Continue preparation failed before entering the cycle or dispatching.
             self._abort_run_initialization(state, exc, continuing=True)
+            store = getattr(self, "_checkpoint_store", None)
+            if store is not None:
+                store.release(state.run_id)
             raise
         result = self._llm_tool_cycle(
             max_iterations=state.max_iterations,
@@ -692,6 +838,11 @@ class MiniClaudeAgent:
                 if any(item is message for item in self.messages):
                     batch.pending_replan_messages.pop(0)
         batch.finalized = True
+        if (getattr(self, "_checkpoint_store", None) is not None
+                and batch is self._run_state.tool_batch
+                and self._run_state.status in {RunStatus.RUNNING, RunStatus.PAUSED}
+                and all(r.outcome in PAUSED_RESULT_OUTCOMES for r in batch.results.values())):
+            self._checkpoint_save("tools")
 
     def _finish_run(self, status: RunStatus, result: str) -> str:
         state = getattr(self, "_run_state", None)
@@ -699,6 +850,20 @@ class MiniClaudeAgent:
             if state.has_pending_tool_batch and state.tool_batch is not None:
                 state.tool_batch.mark_terminal(failed=status is RunStatus.FAILED)
             state.finish(status, result)
+            store = getattr(self, "_checkpoint_store", None)
+            if store is not None:
+                try:
+                    data = self._build_run_snapshot_data(state)
+                    # Compression can remove a finished diagnostic batch from messages.
+                    batch = state.tool_batch
+                    if batch and batch.finalized and (batch.assistant_message_index >= len(self.messages)
+                            or self.messages[batch.assistant_message_index].tool_calls != batch.tool_calls):
+                        data["run"]["tool_batch"] = None
+                    self._checkpoint_revision = store.finish(state.run_id,
+                        self._checkpoint_revision, status.value, result, data)
+                except BaseException:
+                    self._checkpoint_faulted = True
+                    raise
         return result
 
     def set_ui_event_handler(
@@ -1063,6 +1228,8 @@ class MiniClaudeAgent:
     def _queue_background_command(self, command: str, description: str = "",
                                   timeout: int = 3600) -> str | ToolResult:
         """Submit a command to the shared background executor."""
+        if getattr(self, "_checkpoint_store", None) is not None:
+            return ToolResult(content="错误: Checkpoint 模式不支持后台任务执行或恢复", success=False, execution_success=False)
         capability_error = self._background_capability_error()
         if capability_error:
             return ToolResult(content=capability_error, success=False, execution_success=False)
@@ -1211,6 +1378,8 @@ class MiniClaudeAgent:
         5. On **failure** → ROLLBACK: delete the entire shadow directory,
            roll back the LLM context to the pre-subagent checkpoint.
         """
+        if getattr(self, "_checkpoint_store", None) is not None:
+            return "错误: Checkpoint 模式不支持子 Agent 执行栈恢复"
         try:
             atype = SubAgentType(agent_type)
         except ValueError:
@@ -1394,9 +1563,13 @@ class MiniClaudeAgent:
                     execution_success=False,
                 ),
             )
+        self._checkpoint_dispatch(name, args)
         try:
             value = self.tool_registry.execute(name, args)
             return ToolDispatchResult(ToolDispatchStatus.DISPATCHED, value)
+        except CheckpointError:
+            self._checkpoint_faulted = True
+            raise
         except RuntimeEscalationException:
             # Runtime control signals must reach the loop's control handler.
             raise
@@ -1925,7 +2098,40 @@ class MiniClaudeAgent:
 
     # ── Core LLM + Tool Cycle ──────────────────────────────────────
 
-    def _llm_tool_cycle(
+    def _llm_tool_cycle(self, max_iterations: int = 50, require_tool_call: bool = False,
+                        *, _continuing: bool = False) -> str:
+        store = getattr(self, "_checkpoint_store", None)
+        if store is None:
+            return self._llm_tool_cycle_impl(max_iterations, require_tool_call, _continuing=_continuing)
+        if self._checkpoint_faulted:
+            raise CheckpointError("Checkpoint 故障实例不能再次推进，请用新实例核验原 Run")
+        state = self._run_state
+        if state is None or state.status in {RunStatus.COMPLETED, RunStatus.FAILED, RunStatus.TERMINATED, RunStatus.CANCELLED}:
+            state = RunState(max_iterations=max_iterations, require_tool_call=require_tool_call)
+            self._run_state = state
+        creating = self._checkpoint_run_id != state.run_id
+        try:
+            self._checkpoint_claim(creating=creating)
+            return self._llm_tool_cycle_impl(max_iterations, require_tool_call, _continuing=_continuing)
+        except BaseException as error:
+            if self._checkpoint_faulted or (creating and state.status is RunStatus.RUNNING):
+                self._checkpoint_faulted = True
+                # Memory can lead the DB. Do not fabricate closure or continue from it.
+                state.finish(RunStatus.FAILED if isinstance(error, Exception) else RunStatus.CANCELLED,
+                             f"Checkpoint 故障，运行已停止: {error}")
+            elif state.status in {RunStatus.FAILED, RunStatus.CANCELLED}:
+                # Bootstrap has not dispatched. Persist its terminal lifecycle,
+                # but a second persistence failure must not replace the signal.
+                try:
+                    self._finish_run(state.status, state.terminal_result or "运行初始化失败")
+                except BaseException:
+                    logger.exception("初始化失败后的 Checkpoint 收尾失败；保留原始中断/异常")
+            raise
+        finally:
+            if store.holds_lock(state.run_id):
+                store.release(state.run_id)
+
+    def _llm_tool_cycle_impl(
         self, max_iterations: int = 50, require_tool_call: bool = False,
         *, _continuing: bool = False,
     ) -> str:
@@ -2059,6 +2265,7 @@ class MiniClaudeAgent:
                     )
                     self.trace.set_message_count(len(self.messages))
                     self.trace.record_provider_stream(getattr(provider, 'stream', False))
+                    self._checkpoint_save("before_model")
                     response = provider.create_message(
                         msgs_for_llm,
                         tool_defs,
@@ -2212,6 +2419,7 @@ class MiniClaudeAgent:
                     )
                     batch.start()
                     state.tool_batch = batch
+                    self._checkpoint_save("tools")
                     active_batch_assistant_index = batch.assistant_message_index
                 active_tool_calls = batch.tool_calls
                 resolved_tool_call_ids = batch.resolved_call_ids
@@ -2344,6 +2552,7 @@ class MiniClaudeAgent:
                         outcome,
                         result_text,
                     )
+                    self._checkpoint_save("tools")
                     if advance is ToolBatchAdvance.PAUSED or state.status is RunStatus.PAUSED:
                         self.session_recorder.record(
                             "run_paused",
@@ -2931,6 +3140,8 @@ class MiniClaudeAgent:
                 iteration = state.model_turns_used
 
             except KeyboardInterrupt:
+                if getattr(self, "_checkpoint_faulted", False):
+                    raise
                 if active_tool_calls:
                     finish_tool_batch(
                         "用户中断当前任务",
@@ -2952,6 +3163,8 @@ class MiniClaudeAgent:
                 self.trace.end_task("CANCELLED")
                 return self._finish_run(RunStatus.CANCELLED, "已停止当前任务。")
             except Exception as e:
+                if getattr(self, "_checkpoint_faulted", False):
+                    raise
                 if active_tool_calls:
                     finish_tool_batch(
                         "工具批次异常终止",
@@ -3044,6 +3257,8 @@ class MiniClaudeAgent:
     def run_background(self, command: str, description: str = "",
                        timeout: int = 120) -> str:
         """Execute a command in the background. Returns task ID or an error."""
+        if getattr(self, "_checkpoint_store", None) is not None:
+            return "错误: Checkpoint 模式不支持后台任务执行或恢复"
         capability_error = self._background_capability_error()
         if capability_error:
             return capability_error
@@ -3057,6 +3272,8 @@ class MiniClaudeAgent:
     def run_subagent(self, prompt: str, agent_type: str = "general-purpose"
                      ) -> SubAgentResult:
         """Run a sub-agent with the given prompt."""
+        if getattr(self, "_checkpoint_store", None) is not None:
+            return "错误: Checkpoint 模式不支持子 Agent 执行栈恢复"
         try:
             atype = SubAgentType(agent_type)
         except ValueError:
@@ -3084,4 +3301,7 @@ class MiniClaudeAgent:
         self.background.stop()
         self.team_manager.shutdown_all()
         self._running = False
+        store = getattr(self, "_checkpoint_store", None)
+        if store is not None:
+            store.close()
         logger.info("关闭完成。")

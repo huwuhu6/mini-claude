@@ -249,3 +249,41 @@ Windows Python 3.14.3 上，快照专项为 `54 passed`；扩展定向回归（�
 源码和配置匹配采用保守拒绝策略，包括注释 / 格式等源码变化；不可检查源码的 handler 不能导出快照。指纹检查覆盖当前列明的模块和 handler，不证明动态 monkeypatch、闭包配置、插件依赖或所有外部工具版本相同。Workspace 摘要仅覆盖现有 guard 可观察的主根文件；忽略目录、不可读文件、额外根、远程服务和 Shell 外部资源不因此被锁定或证明不变。首次继续检查与实际文件操作之间仍有外部修改竞态。Shell cwd 也不是 Shell 沙箱。
 
 SQLite 阶段可以复用版本契约、验证器和安全边界；仍需原子保存 / 事务、唯一继续者、工具特定前置条件、外部产物归属、审批状态和副作用 UNKNOWN 的人工处理协议。本阶段未处理进程在 handler 内退出、工具成功但结果未保存、任意字节码位置中断或数据库加载。快照内容包含任务消息 / Note / 结果，未做加密或真实性签名；格式验证不证明其中历史事实真实。
+
+
+## 2026-10-11：SQLite Checkpoint 与保守故障恢复
+
+Commit: `PENDING`
+Commit Description: `feat: 引入 SQLite Checkpoint 与保守故障恢复`
+
+### Description
+
+第五阶段的 JSON 快照能把安全暂停状态交给新实例，但它无法确认退出前工具有没有执行，也没有阻止多个实例继续同一副作用。本阶段先单独建立存储层与故障协议，通过测试后再在既有 Agent Loop 插入提交边界；没有替换 RunState、Provider、工具注册、循环治理或压缩算法。
+
+Snapshot 仍是经过验证的逻辑状态；Checkpoint 是这个状态的可靠数据库提交；Execution Journal 是每个原始调用是否进入 handler、结果是否保存的事实。数据库 schema v1 只有 runs / calls 两张表。runs 保留 Run ID、版本号、状态、当前投影、工具日志摘要和最终响应；calls 按模型轮次与调用位置保留 Provider ID、原调用 JSON、执行阶段和结果。SQLite 使用 WAL、synchronous=FULL、参数化 SQL、逐操作关闭连接；没有 pickle、Provider API Key、完整环境或活运行对象。
+
+提交边界为 tools、before_model 和 terminal。完整模型批次先作为 PREPARED 与一致投影提交；真正 handler 前提交 RUNNING；handler 返回后，将真实结果、消息、游标及必要状态同一事务保存，然后才允许下一项。去重、无效参数或执行能力拒绝保存为 NOT_EXECUTED，并保留原具体 outcome。确定的 handler 失败是 COMPLETED 中的失败事实。批次收尾另行保存 finalized 和延后 REPLAN，恢复最后一个调用后的暂停时仍先收尾再请求模型。模型请求前保存闭合消息的边界，允许在尚无工具批次时恢复。未经提交的模型响应不是权威事实，退出后可能重新请求模型，不能保证复现那次响应。
+
+工具日志和投影分开不是放宽快照规则：安全可继续投影仍只有已完成结果前缀及未执行后缀，RUNNING 仅在日志中。新增显式终结验证模式保存 HARD_STOP、取消及异常闭合的原结果；不把 UNKNOWN 伪装为可继续暂停。普通独立 JSON 仍用 v1；持久化投影使用 v2 并绑定规范数据库路径及 Run ID，只能由持有 Run 锁、核对当前数据库投影的恢复入口加载。此前普通 JSON 导入可以绕过 Store 的独占，这个反例已通过回归测试封闭。
+
+同一数据库、同一 Run 使用永久文件上的内核锁（Windows 字节锁 / POSIX flock）和数据库版本 CAS。锁覆盖完整执行 / 恢复，暂停返回后释放；另一实例已经推进后，旧内存版本不能继续。锁无超时租约，进程退出由内核释放，不删除锁文件。父进程死亡与外部子进程停止是两回事；恢复不凭锁释放就认为未保存的 Shell 副作用可以重试。
+
+Checkpoint 写入失败立即隔离当前实例，禁止继续工具、普通错误闭合清理和新任务。COMMIT 异常通过新连接核对本事务操作标识，区分已提交、未提交与无法核验；三种结果都不在故障实例中继续。新实例持锁读取最新版本，遗留 RUNNING 改为 UNKNOWN 并拒绝自动执行；PREPARED 可以在当前环境 / 授权 / 能力重新校验后继续；已经提交的结果不会再次 dispatch。结果副作用已发生但尚未保存时，SQLite 无法与文件 / Shell / 外部服务统一事务，只能要求人工核验，不承诺通用 exactly-once。
+
+### Result / Evidence
+
+实现顺序是独立 Store / 故障测试先行，再接入 Runtime。回归实际暴露并修复了：初始化身份提交失败后内存残留 RUNNING、初始化中断未写终结状态、WAL 下分开读取 Run / Journal 的版本错配、历史日志损坏未被检测，以及持久化投影绕过锁走普通 JSON 入口。Store 加载现在使用同一读事务，日志整体和投影都有一致版本的校验摘要；摘要用于发现损坏，不证明数据来源真实性。
+
+Windows Python 3.14.3 最终完整 tests/unit 为 477 passed、12 skipped、4 failed；其中新增 Store 22 项与 Runtime 36 项全部通过。非进程故障定向集（含既有 Snapshot / RunState / 消息闭环）164 passed、10 deselected；LoopController integration 35 passed。12 项跳过均为既有平台相关测试；未进行真实 Provider 或 Terminal-Bench。新增测试包含独立真实 Python 进程的退出 / 重启、真实文件副作用计数和活 handler 竞争；不以同一进程的两个对象代替进程恢复。故障位置包括模型请求前、响应未提交、PREPARED 后、RUNNING 后 handler 前、结果事务提交前 / 后、终结事务后；另有提交成功后抛 IO 异常、核验连接不可用、数据损坏、源码 / Workspace 改变、能力变化及重复恢复测试。Trace 和 SessionRecorder 建立新的诊断片段并关联原 Run，不作为恢复权威。
+
+原有四项完整单测失败继续记录：未修改 main 的同四项复核为 2 failed / 2 passed；Provider fixture 与 read_file 描述字串断言同样失败，不修改真实接口断言。Node / Java Reference Variant 的 Worktree oracle 分别含 7 / 13 个 CRLF，归一化 LF 后匹配 HEAD，main 对应测试通过。测试只在临时目录修改实现，原 oracle 的测试前后哈希保持不变，未修改评测数据或 Harness。
+
+### Decision / Limitation
+
+采用显式 opt-in：默认 CLI / Mock / Benchmark 路径不打开数据库。该模式的主 Agent 前台工具受 journal 保护；后台任务和子 Agent 明确拒绝，不宣称能恢复它们的执行栈。直接使用 BaseTools、Registry 或手动外部执行不在此契约内；独立 v1 JSON 快照仍由调用方保证唯一继续者，不能把复制数据库或手动改写归属当作合法恢复。
+
+每次真正 dispatch 至少增加 RUNNING 和结果两次事务，另有批次准备、收尾、模型前与 Run 终结提交。投影、工具日志摘要、源码 / 工作区摘要有随历史增长的成本；没有运行性能 Benchmark，不量化吞吐影响。未启用模式只增加轻量空 Store 判断，没有数据库 IO。
+
+恢复沿用现有源码 / 配置兼容检查、WorkspaceStateGuard 摘要、cwd 存在及当前路径授权检查，实际 dispatch 重查当前 Feature / CommandPolicy。它不扩大旧权限，也不是文件系统锁或 Shell 沙箱。工作区摘要观察范围、外部根 / 资源、动态依赖与执行前的外部修改竞态仍有第五阶段的限制。运行数据可能包含任务文本 / Note / 输出；未实现加密、真实性签名、数据库迁移或自动清理。
+
+POSIX flock 和真实 Linux shell 尚待 Linux 环境验证，Windows 核心故障协议已用真实子进程测试。未来 HITL 可以复用 PREPARED 安全边界、Run 锁、版本 CAS 与投影原子提交，但审批身份 / 授权有效期 / ASK 状态尚未设计。UNKNOWN 不提供自动清除、补偿或重试接口；本阶段也不支持任意历史回滚、分布式执行或跨机器共享数据库。

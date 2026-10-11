@@ -255,12 +255,12 @@ CLI
 
 ## 文档
 
-项目的主题演进记录保存在本地 `docs/evolution/`，不纳入 Git；每个方向只维护一份文档。当前代码、测试和对应主题文档是主要参考资料。
+项目的主题演进记录保存在 `docs/evolution/`；每个方向只维护一份文档。当前代码、测试和对应主题文档是主要参考资料。
 
 ## 已知问题与边界
 
 - 项目仍是单机、单进程为主的 runtime，不承诺生产级并发、分布式队列或多租户隔离。
-- 当前暂停与继续执行仅限同一进程、同一 Agent 实例。`RunState` 未持久化，进程正常退出或崩溃后无法继续原 Run；尚未实现持久化 Checkpoint、跨进程 Resume 或 HITL 审批。Trace 与 Session Recorder 是诊断记录，不是可恢复的执行快照。
+- 默认执行模式仍为内存 RunState；受控暂停可导出 JSON 快照并移交新实例。可显式启用 SQLite Checkpoint，跨进程继续已提交的原始工具批次；执行记录为 RUNNING 而结果未提交时进入 UNKNOWN，拒绝自动重试并要求人工核验。该模式只支持本机同一数据库的主 Agent 前台工具，拒绝后台任务和子 Agent 执行；不提供通用 exactly-once 或 HITL 审批。Trace 与 Session Recorder 是诊断记录，恢复的权威状态来自数据库。
 - `s_full.py` 作为历史实现保留；当前正式 Agent Runtime 位于 `src/agent/mini_claude_agent.py`。
 - `src/core/compression.py` 使用 `tiktoken` 做 estimated token 估算；包未安装或编码资源初始化失败时会安全回退到粗略估算，不提供 provider-specific tokenizer。Provider 返回的 `usage.prompt_tokens` 才是实际请求用量。
 - 评测结果中的过程指标用于工程分析，不等同于通用 Agent 能力排名。
@@ -280,9 +280,15 @@ D:\02_study\code\mini-claude-project-data\<project-name>-<short-hash>\
   team/       # teammate state
   inbox/      # teammate messages
   transcripts/# compressed context summaries
+  checkpoints.sqlite3 # opt-in checkpoint projections and execution journal
+  checkpoints.sqlite3.locks/ # permanent local run lock files
 ```
 
 可以设置 `MINI_CLAUDE_DATA_DIR` 使用其他数据根目录。
+
+SQLite 模式目前提供 Python API，没有 Resume CLI：创建 Agent 时传入 `checkpoint_enabled=True`，或在新 Run 前调用 `agent.enable_checkpoints()`（自定义数据库必须在工作区外）。新实例使用相同工作区、数据库及兼容配置，然后调用 `agent.resume_checkpoint(run_id)`；该入口持锁读取、校验并继续执行。完成 Run 的重复恢复只返回已保存结果。持久化投影使用绑定数据库的 schema v2，不能走普通 `restore_run_snapshot()`；默认模式的独立 JSON 快照仍是 schema v1。
+
+数据库保存失败时立即停止，该实例不能继续 dispatch 或开始新任务。即使重新核验发现 COMMIT 已成功，也须由新实例从权威数据库恢复。UNKNOWN 没有自动解除或补偿接口；Shell / 文件系统副作用与 SQLite 不是同一个事务，父进程退出也不证明它启动的外部子进程已经结束。运行数据可能含任务文本、Note 和工具输出，应按敏感项目数据保护；不保存 Provider 凭据或完整环境。详细提交边界和限制见 [工具与 Runtime 演进](docs/evolution/tool_registry.md)。
 
 不启动 LLM 也可以查看已记录的会话：
 
