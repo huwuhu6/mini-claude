@@ -157,6 +157,8 @@ def test_last_call_pause_and_deferred_replan_can_resume(agents):
     a._checkpoint_claim()
     a._checkpoint_save("tools")
     a._checkpoint_store.release(a._run_state.run_id)
+    a._release_conversation_lock()
+    assert not a._checkpoint_store._locks
     b, bp = receiver(agents, a)
     b.resume_checkpoint(a._run_state.run_id)
     assert b.executions == [] and len(bp.requests) == 1

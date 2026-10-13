@@ -15,29 +15,30 @@ logger = logging.getLogger(__name__)
 def register_agent_commands(console: ConsoleCommandSystem, agent: Any) -> None:
     """Bind the runtime's user-facing commands to a CLI console."""
     commands: tuple[tuple[str, str, Callable, str, list[str], str], ...] = (
-        ('status', 'Show system status', _status, '', [], 'system'),
-        ('stats', 'Show performance statistics', _stats, '', [], 'system'),
-        ('config', 'Show current configuration', _config, '', [], 'system'),
-        ('tasks', 'List all tasks', _tasks, '[status]', ['task'], 'tasks'),
-        ('team', 'List all teammates', _team, '[status]', [], 'team'),
-        ('inbox', 'Read messages from inbox', _inbox, '', [], 'team'),
-        ('features', 'List feature flags and status', _features,
+        ('status', '查看当前会话、状态和保存位置', _status, '[--details]', [], 'system'),
+        ('stats', '查看状态详情（建议使用 /status --details）', _stats, '', [], 'system'),
+        ('config', '查看当前配置', _config, '', [], 'system'),
+        ('tasks', '查看任务列表', _tasks, '[status]', ['task'], 'tasks'),
+        ('team', '查看队友列表', _team, '[status]', [], 'team'),
+        ('inbox', '查看收件箱', _inbox, '', [], 'team'),
+        ('features', '查看或调整功能开关', _features,
          '[enable/disable] [name]', [], 'system'),
-        ('compact', 'Manually compress conversation', _compact, '', [], 'general'),
-        ('providers', 'Show provider information', _providers, '', [], 'system'),
-        ('add_workdir', 'Add a directory to path validation whitelist',
+        ('compact', '压缩当前上下文', _compact, '', [], 'general'),
+        ('providers', '查看模型提供者', _providers, '', [], 'system'),
+        ('add_workdir', '明确授权额外工作目录',
          _add_workdir, '<path>', ['addpath'], 'system'),
-        ('whitelist', 'List all paths in the validation whitelist',
+        ('whitelist', '查看已授权的目录',
          _whitelist, '', ['workdirs'], 'system'),
-        ('skills', 'List all available skill modules', _skills,
+        ('skills', '查看技能模块', _skills,
          '[name]', ['skill'], 'system'),
-        ('clear', 'Clear conversation history', _clear, '', [], 'general'),
+        ('clear', '开始新对话（建议使用 /new）', _clear, '', [], 'general'),
     )
     for name, help_text, handler, args_help, aliases, category in commands:
         console.register(Command(
             name, help_text,
             lambda args, context, callback=handler: callback(agent, args, context),
             args_help=args_help, aliases=aliases, category=category,
+            advanced=name not in {'status', 'compact'},
         ))
 
 
@@ -47,6 +48,8 @@ def create_agent_console(agent: Any) -> ConsoleCommandSystem:
     if getattr(agent, "_hitl_enabled", False):
         from cli.hitl_commands import register_hitl_commands
         register_hitl_commands(console, agent)
+    else:
+        console.register(Command('new', '开始新对话', lambda args, ctx: _clear(agent, args, ctx)))
     return console
 
 
@@ -77,30 +80,31 @@ def execute_agent_command(
 
 def _status(agent: Any, _args: list[str], _context: dict[str, Any]) -> str:
     lines = [f"=== {agent.config.agent.name} v{agent.config.agent.version} ==="]
-    for name, available in agent.provider_manager.check_health().items():
-        lines.append(f"  提供者 [{name}]: {'正常' if available else '失败'}")
+    if _args not in ([], ['--details']):
+        return '用法: /status [--details]'
+    info = agent.get_session_info()
+    lines += [f"  会话 ID: {info['conversation_id'] or '尚未创建（首个任务开始时生成）'}",
+              f"  标题: {info['title']}", f"  当前 Run: {info['run_id'] or '-'}",
+              f"  状态: {info['status'].upper()}", f"  工作区: {info['workspace']}",
+              f"  执行目录: {info['cwd']}", f"  模型: {agent.config.llm.provider} / {agent.config.llm.model}",
+              f"  审批: {'开启' if info['hitl'] else '关闭'}",
+              f"  Checkpoint: {info['checkpoint_db'] or '未启用'}",
+              f"  运行数据: {info['data_root']}", f"  本次诊断日志: {info['session_log']}",
+              f"  Trace 目录: {info['traces']}"]
     lines.append(f"  消息数: {len(agent.messages)}")
+    if info.get('execution_blocked'):
+        lines += ["  执行保护: UNKNOWN；只读核验，禁止重放或覆盖原任务。",
+                  "  不确定调用: " + ', '.join(info.get('unknown_call_ids', [])),
+                  "  后续处理: /approval <Run ID> 查看；人工检查后 /archive <原因>。"]
     lines.append(f"  估计 tokens: {agent.compressor.estimate_tokens(agent.messages)}")
-    task_counts = agent.task_manager.count()
-    lines.append(f"  任务数: {sum(task_counts.values())} 个")
-    team_stats = agent.team_manager.get_stats()
-    lines.append(f"  队友数: {team_stats['total']} 活跃")
-    enabled = agent.feature_manager.get_enabled_features()
-    lines.append(
-        f"  已启用功能: {len(enabled)}/{len(agent.feature_manager.list_features())}"
-    )
+    if _args:
+        lines += [f"  Recorder ID: {info['recorder_id']}", f"  Trace ID: {info['trace_id'] or '-'}",
+                  "  已启用功能: " + ', '.join(agent.feature_manager.get_enabled_features())]
     return '\n'.join(lines)
 
 
 def _stats(agent: Any, _args: list[str], _context: dict[str, Any]) -> str:
-    lines = ["=== 统计信息 ==="]
-    lines.append(f"对话: {len(agent.messages)} 条消息")
-    lines.append(f"  估计 tokens: {agent.compressor.estimate_tokens(agent.messages)}")
-    lines.append(f"任务: {agent.task_manager.count()}")
-    lines.append(f"队友: {agent.team_manager.get_stats()}")
-    lines.append(f"后台: {agent.background.get_stats()}")
-    lines.append(f"总线: {agent.message_bus.get_stats()}")
-    return '\n'.join(lines)
+    return _status(agent, ['--details'], _context)
 
 
 def _config(agent: Any, _args: list[str], _context: dict[str, Any]) -> str:
@@ -182,7 +186,7 @@ def _features(agent: Any, args: list[str], _context: dict[str, Any]) -> str:
 
 
 def _compact(agent: Any, _args: list[str], _context: dict[str, Any]) -> str:
-    if getattr(agent, "has_active_run", False):
+    if getattr(agent, "has_active_run", False) or getattr(agent, "has_unfinished_conversation", False):
         return "当前运行尚未完成；请继续执行后再压缩消息。"
     if len(agent.messages) < 4:
         return "消息数量不足以进行压缩（至少需要 4 条）。"
@@ -239,9 +243,12 @@ def _skills(agent: Any, args: list[str], _context: dict[str, Any]) -> str:
 
 
 def _clear(agent: Any, _args: list[str], _context: dict[str, Any]) -> str:
-    if getattr(agent, "has_active_run", False):
+    if getattr(agent, "has_active_run", False) or getattr(agent, "has_unfinished_conversation", False):
         return "当前运行尚未完成；请继续执行后再清除消息历史。"
-    agent.messages.clear()
+    if getattr(agent, '_checkpoint_store', None) is not None:
+        agent.start_new_conversation()
+    else:
+        agent.messages.clear()
     if hasattr(agent, '_last_assistant_note'):
         agent._last_assistant_note = None
     if hasattr(agent, '_compression_notice_pending'):

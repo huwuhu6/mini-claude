@@ -532,6 +532,8 @@ def legacy_v2(store):
     store.close()
     with sqlite3.connect(path) as connection:
         connection.execute("PRAGMA foreign_keys=OFF")
+        for table in ('approval_feedback', 'permission_grants', 'run_archives', 'conversation_runs', 'conversations'):
+            connection.execute('DROP TABLE ' + table)
         connection.execute("""CREATE TABLE runs_old (
             run_id TEXT PRIMARY KEY, status TEXT NOT NULL CHECK(status IN
             ('started','active','paused','completed','terminated','failed','cancelled','unknown')),

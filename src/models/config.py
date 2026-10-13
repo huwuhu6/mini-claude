@@ -120,13 +120,25 @@ class Config:
 
 class ConfigManager:
     def __init__(self, config_path: Optional[Path] = None):
-        self.config_path = config_path or Path("configs/default.yaml")
+        if config_path is not None:
+            self.config_path = Path(config_path)
+        elif os.getenv("MINI_CLAUDE_CONFIG"):
+            self.config_path = Path(os.environ["MINI_CLAUDE_CONFIG"]).expanduser()
+        else:
+            # A user-selected profile wins over a repository's default config.
+            user_config = Path.home() / ".mini-claude" / "config.yaml"
+            local_config = Path("configs/default.yaml")
+            source_config = Path(__file__).resolve().parents[2] / "configs/default.yaml"
+            self.config_path = next((path for path in (user_config, local_config, source_config)
+                                     if path.is_file()), user_config)
         self.config = self._load_config()
 
     def _load_config(self) -> Config:
         """Load configuration from YAML file with environment variable substitution."""
         if not self.config_path.exists():
-            return Config()
+            raise FileNotFoundError(
+                f"配置文件不存在: {self.config_path}；请使用 --config 指定配置，不能自动回退到其他 Provider"
+            )
 
         with open(self.config_path, 'r', encoding='utf-8') as f:
             raw_config = yaml.safe_load(f)
@@ -144,7 +156,14 @@ class ConfigManager:
                 return obj
 
         processed_config = substitute_env(raw_config)
-        return self._dict_to_config(processed_config)
+        config = self._dict_to_config(processed_config)
+        # Unselected provider profiles may contain placeholders; only the active
+        # profile must resolve. Never pass a literal placeholder to an SDK.
+        for name in ("provider", "model", "api_key", "base_url"):
+            value = getattr(config.llm, name)
+            if isinstance(value, str) and value.startswith("${") and value.endswith("}"):
+                raise ValueError(f"当前 Provider 配置需要环境变量 {value[2:-1]}，请先设置；不会切换 Provider")
+        return config
 
     def _dict_to_config(self, data: Dict[str, Any]) -> Config:
         """Convert dictionary to Config dataclass."""

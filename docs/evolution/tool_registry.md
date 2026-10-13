@@ -363,3 +363,48 @@ Windows Python 3.14.3 最终冻结代码的完整 tests/unit 为 601 passed、12
 仅主 Agent 的持久化批次调度受此 opt-in HITL 保护，SubAgent、直接 Registry / BaseTools 和公共后台 API 不接入；原持久化模式对后台和 SubAgent 的限制仍有效。actor 是调用方审计身份，不是认证；本地 SQLite 视为受信任数据，未增加签名、加密、TTL 默认策略或自动清理。工作区摘要和执行前外部修改的竞态沿用已有边界，不承诺 Shell 沙箱或文件系统事务。
 
 审批恢复不兼容或策略 / Feature / 授权变化时 fail-closed；过期或上下文变化的旧批准失效，不自动换发新批准。INVALIDATED 暂无用户取消 / 重规划 API；UNKNOWN 没有补偿或重试接口。本阶段不提供最终 CLI 操作。7C 只需展示 Run / Approval 的绑定及原因、调用查询和决定接口、再显式恢复；不允许 CLI 直接操作 SQLite 状态或 dispatch handler。
+
+## 2026-10-11：标准确认策略、独立授权规则和安全归档
+
+Commit: `PENDING`
+Commit Description: `feat: 整理会话恢复、审批交互与可撤销授权规则`
+
+### Description
+
+默认开启 HITL 后，TodoWrite 和工作笔记也逐项 ASK，Shell 查询与构建没有区分；持久化模式还会把实际不支持恢复的后台/SubAgent 工具提供给模型。现在在既有权限策略中核实内置 handler 身份：计划与笔记只修改 Runtime 内部状态，可以自动允许；只读文件查询保持 ALLOW，常见凭据文件单次 ASK；仅少量不带展开或复合语法的 Shell 内置查询允许，测试、构建和未知风险保持 ASK。持久化模式的能力约束同时用于 schema 过滤和实际执行阻断，不改 FeatureManager 或 CommandPolicy 的职责。
+
+策略版本改为 main-standard-v2。旧 main-conservative-v1 记录允许读取用于检查和归档，当前绑定始终生成新版本，evaluate 不会将旧绑定解释为可执行批准。默认策略变化同时受 Runtime 源码指纹约束，没有降低原恢复兼容性检查。
+
+可撤销规则是明确用户意图，不是第二份执行事实：进程规则在内存，工作区规则在原 SQLite 新表；指纹包含工具、完整参数、cwd、工作区、工具实现与有效策略，不绑定新 Run/Call ID 或工作区内容摘要。后续同一操作可以不再弹 ASK，但每次重新生成当前绑定并先过硬拒绝，原批准仍按原协议消费一次。规则的原操作与指纹一致性重新校验，损坏或数据库读取失败不会允许 dispatch。任何依赖当前文件内容的工具前置条件仍由 handler/恢复校验负责，本次不承诺工作区级规则具有文件系统隔离能力。
+
+SQLite v4 在同一升级事务增加 conversations、conversation_runs、run_archives、permission_grants、approval_feedback，保留 runs/calls/approvals 原记录。创建下一 Run 持 Conversation 与 Run 两个内核锁并核对 head；正常等待、完成和异常返回释放锁。拒绝意见与用户决定同事务写入，stop 与 replan 分别控制本轮终结或工具结果闭合后的模型请求。归档保留执行事实，只阻断原操作、解除当前会话选择，UNKNOWN 永远不会因归档变成成功或未执行。
+
+### Result / Evidence
+
+最终验收结果见 CLI 演进主线本日期的记录。迁移测试模拟真实 v1/v2/v3 旧结构，比较升级前后 Run 与 journal；会话与规则测试检查跨实例、旧 head 冲突、执行次数、原 Call ID 唯一性、规则精确参数匹配、撤销、禁用 Feature、旧策略和归档。原审批原子消费及崩溃恢复测试继续保留，不修改 oracle。
+
+### Decision / Limitation
+
+授权规则可跨新 Run 使用，授权范围明确；这并不保证工具幂等或 exactly-once，执行日志继续负责原调用的一次 dispatch 和未知状态。归档是人工处理记录，不是 UNKNOWN 的补偿/核销。源码整体摘要、严格工作区摘要暂不放宽；审批过期、上下文失效不能通过规则恢复原批准。更多 Shell 查询应在可验证隔离条件下独立扩展，不能单靠字符串黑名单扩大 ALLOW。
+
+
+## 2026-10-11：将可复用授权与一次性操作绑定分开
+
+Commit: `PENDING`
+Commit Description: `feat: 按文件与对话保存授权并整理终端交互`
+
+### Description
+
+前一阶段保存完整参数，使 edit_file 的下一次局部编辑无法复用授权；将这种规则叫做“会话允许”会误导用户。现在内置 edit_file / write_file 的可复用规则绑定同一个规范文件路径，不绑定替换文本；保留当前实现、有效 Feature、策略版本与主工作区绑定。路径复用统一使用实际文件工具的 Workspace PathResolver，不能随 Shell cwd 改变文件解释。当前 ToolOperation / ApprovalRecord 仍精确绑定原 Call ID、原参数和执行上下文。
+
+Conversation 范围在原 permission_grants 表的版本化 JSON 中保存，匹配前从原 Run 查询 Conversation 身份，另一个对话不能借用；Workspace 范围没有 Conversation 限定。两种范围都重新检查规范路径与当前两个文件 handler 的实现契约，未知替换 handler、敏感文件、.git 或越界目标不提供文件范围授权。Shell 与其他操作保持精确参数、cwd 与平台绑定，不维护第二套命令解析器。旧 v4 全操作规则不改变语义，损坏数据或数据库读取错误 fail-closed。
+
+为了让审批 diff 与实际执行一致，把 edit_file 原有的全量预校验和逆序 offset 应用抽成纯函数，保留原有 2000 字符限制、唯一性及 approx_line_start 窗口规则。执行继续原子替换文件，预览只读取目标文件。共享函数同时进入 Runtime 源码兼容摘要，改变辅助实现不能留下可继续使用的旧授权。文件读写显式禁用通用换行转换，修复原来声明保留 CRLF、实际读取却先转换为 LF 的差异。
+
+### Result / Evidence
+
+测试与交互结果以 CLI 演进主线本日期的“文件授权范围与终端信息层次”记录为准。回归不仅检查提示文字，还验证真实临时文件内容、Call ID 唯一性、calls Journal 完成前缀、模型请求次数、同一 Conversation 重启、新 Conversation 隔离、当前 Feature 与替换 handler。原 SQLite 锁、审批消费、异常与 UNKNOWN 协议不变。
+
+### Decision / Limitation
+
+文件规则授权的是对选定文件的后续编辑/覆盖，不承诺代码内容安全，也不授予 Shell 或新路径授权。规则与执行日志不是同一个事实来源；旧批准不能因有资源规则而复活。整体源码和 Workspace 摘要仍是恢复门槛。更宽 Shell 查询、命令前缀、操作级前置条件和沙箱应作为独立任务；本轮没有扩大默认 Shell ALLOW。

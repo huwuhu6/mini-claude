@@ -228,7 +228,7 @@ def test_default_cli_and_model_text_do_not_execute_control_commands(agents):
     assert 'cli_control' not in a.session_recorder.path.read_text(encoding='utf-8')
 
 
-@pytest.mark.parametrize('argv',[['--resume','r'],['--checkpoint-db','x'],['--init-checkpoints']])
+@pytest.mark.parametrize('argv',[['--no-hitl','--resume','r'],['--no-hitl','--checkpoint-db','x'],['--no-hitl','--init-checkpoints']])
 def test_hitl_flags_are_explicit(argv):
     with pytest.raises(SystemExit):
         parse_args(argv)
@@ -313,7 +313,7 @@ def test_real_cli_exit_decide_restart_resume_and_repeat(tmp_path,decision):
     decided=child(base,'decide',f'/{decision} {run} {aid}\n/{decision} {run} {aid}\nexit\n')
     assert decision.upper().replace('APPROVE','APPROVED').replace('REJECT','REJECTED') in decided.stdout
     assert report(decided)['requests']==0 and effects(base)==['A']
-    resumed=child(base,'resume',f'/approval {run}\n/resume {run}\nexit\n',startup_run=run)
+    resumed=child(base,'resume',f'/approval {run}\n/resume {run}\nexit\n',startup_run=report(start)['conversation_id'])
     data=report(resumed)
     assert data['requests']==1 and data['executions']==(['B','C'] if decision=='approve' else [])
     assert effects(base)==(['A','B','C'] if decision=='approve' else ['A'])
@@ -385,18 +385,24 @@ def test_terminal_state_display_does_not_offer_retry(agents,monkeypatch,status):
     assert '/approve' not in out and p.requests==[] and a.executions==[]
 
 
-@pytest.mark.parametrize('tool,args',[
-    ('TodoWrite',{'items':[{'content':'plan','status':'pending','activeForm':'planning'}]}),
-    ('bash',{'command':'echo query'}),('bash',{'command':'python -m pytest -q'}),
-    ('bash',{'command':'echo build'}),('update_agent_note',{'content':'remember'})])
-def test_actual_conservative_policy_frequency_is_visible(agents,tool,args):
+@pytest.mark.parametrize('tool,args,asks',[
+    ('TodoWrite',{'items':[{'content':'plan','status':'pending','activeForm':'planning'}]},False),
+    ('bash',{'command':'echo query'},False),('bash',{'command':'python -m pytest -q'},True),
+    ('bash',{'command':'echo build'},False),('update_agent_note',{'content':'remember'},False)])
+def test_standard_policy_only_interrupts_external_risk(agents,tool,args,asks):
     call={'id':'frequency','type':'function','function':{'name':tool,'arguments':json.dumps(args)}}
-    a,p=agents([{'tool_calls':[call]}],pause_after=None)
+    a,p=agents([{'tool_calls':[call]},{}],pause_after=None)
     a.enable_checkpoints();a.enable_hitl()
     out=issue(a,create_agent_console(a),'task')
-    assert 'WAITING_APPROVAL' in out and tool in out
-    assert len(p.requests)==1 and a.executions==[]
-    assert a.get_pending_approval(a._run_state.run_id).state is ApprovalStatus.PENDING
+    assert len(p.requests)==(1 if asks else 2) and a.executions==[]
+    if asks:
+        assert 'WAITING_APPROVAL' in out and tool in out
+        assert a.get_pending_approval(a._run_state.run_id).state is ApprovalStatus.PENDING
+    else:
+        assert a._run_state.status.value=='completed'
+        row=a._checkpoint_store.load(a._run_state.run_id)
+        assert row['journal'][0]['state']=='COMPLETED'
+        assert a.get_checkpoint_info(a._run_state.run_id)['approvals']==[]
 
 
 def test_refusal_replanning_same_operation_requires_a_fresh_decision(agents):

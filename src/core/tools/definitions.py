@@ -37,7 +37,7 @@ def read_file_spec(handler: ToolHandler) -> ToolSpec:
         description=(
             f"Read a known file (source, configuration, or text) by contiguous 1-based line range. "
             f"Returns at most {READ_FILE_MAX_LINES} lines and is subject to character/byte limits; "
-            "read later ranges to continue through long files."
+            "Use start_line/end_line to paginate (行数硬上限；继续读取时指定下一段范围)."
         ),
         input_schema={
             "type": "object",

@@ -41,11 +41,12 @@ class RuntimeDataPaths:
             if configured:
                 data_root = Path(configured).expanduser()
             elif sys.platform == "win32":
-                data_root = Path(r"D:\02_study\code\mini-claude-project-data")
+                data_root = Path(os.getenv("LOCALAPPDATA") or Path.home() / "AppData" / "Local") / "mini-claude"
             else:
-                data_root = Path.home() / ".local" / "share" / "mini-claude"
+                data_root = Path(os.getenv("XDG_DATA_HOME") or Path.home() / ".local" / "share") / "mini-claude"
 
-            digest = hashlib.sha256(str(workspace).lower().encode("utf-8")).hexdigest()[:8]
+            identity = str(workspace).lower() if sys.platform == "win32" else str(workspace)
+            digest = hashlib.sha256(identity.encode("utf-8")).hexdigest()[:8]
             project_name = "".join(c if c.isalnum() or c in "-_" else "_" for c in workspace.name)
             root = data_root / f"{project_name}-{digest}"
         else:

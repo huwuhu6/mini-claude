@@ -1,0 +1,2 @@
+# Reference verifiers hash raw bytes. Checkout must preserve committed LF bytes.
+sandbox/tasks/**/reference_solution/** text=auto eol=lf

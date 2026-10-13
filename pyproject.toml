@@ -13,6 +13,7 @@ dependencies = [
     "pyyaml>=6.0",
     "python-dotenv>=1.0.0",
     "prompt-toolkit>=3.0.0",
+    "rich>=13.7.0",
     "tiktoken>=0.7.0",
 ]
 
@@ -22,3 +23,6 @@ mini-claude-headless = "agent.headless:main"
 
 [tool.setuptools.packages.find]
 where = ["src"]
+
+[tool.pytest.ini_options]
+pythonpath = ["src"]

@@ -420,6 +420,8 @@ class MiniClaudeAgent:
         current = getattr(self, "_run_state", None)
         if current and current.status in {RunStatus.RUNNING, RunStatus.PAUSED, RunStatus.WAITING_APPROVAL}:
             return "错误: 当前运行尚未完成；请先继续或终止该运行。"
+        if self.has_unfinished_conversation:
+            return "错误: 当前会话有未完成或 UNKNOWN 操作；请查看原任务，必要时人工检查后 /archive <原因>，不能覆盖原运行。"
         self._run_state = RunState(require_tool_call=require_tool_call)
         try:
             self._seen_run_ids = getattr(self, "_seen_run_ids", set())
@@ -441,7 +443,7 @@ class MiniClaudeAgent:
         runtime_root = Path(__file__).resolve().parents[1]
         # Fail closed after relevant implementation changes, including delegated helpers.
         sources = ["agent/mini_claude_agent.py", "core/run_state.py", "core/run_snapshot.py", "core/checkpoint_store.py",
-                   "core/loop_controller.py", "core/tools/base_tools.py", "core/tools/registry.py", "core/permissions.py", "core/approvals.py",
+                   "core/loop_controller.py", "core/tools/base_tools.py", "core/tools/file_edits.py", "core/tools/registry.py", "core/permissions.py", "core/permission_grants.py", "core/approvals.py",
                    "core/runtime_context/shell_session.py", "core/runtime_context/command_policy.py",
                    "core/runtime_context/workspace_authority.py", "core/runtime_context/path_resolver.py",
                    "core/features/manager.py", "core/compression.py",
@@ -650,10 +652,20 @@ class MiniClaudeAgent:
         state = self._run_state
         if store.holds_lock(state.run_id):
             return
-        store.acquire(state.run_id)
+        conversation_id = getattr(self, "_conversation_id", None)
+        if creating and conversation_id is None:
+            conversation_id = str(uuid.uuid4())
+            self._conversation_id = conversation_id
+            self._conversation_head_run_id = None
+        if conversation_id and not store.holds_lock("conversation:" + conversation_id):
+            store.acquire("conversation:" + conversation_id)
         try:
+            store.acquire(state.run_id)
             if creating:
-                revision = store.create_run(state.run_id)
+                revision = store.create_run(state.run_id, conversation_id=conversation_id,
+                    workspace=str(self.workdir.resolve()), title=self._current_user_prompt,
+                    expected_head=getattr(self, "_conversation_head_run_id", None))
+                self._conversation_head_run_id = state.run_id
                 self._checkpoint_run_id = state.run_id
                 self._checkpoint_revision = revision
             else:
@@ -665,7 +677,74 @@ class MiniClaudeAgent:
             if creating:
                 self._checkpoint_faulted = True
             store.release(state.run_id)
+            if conversation_id:
+                store.release("conversation:" + conversation_id)
             raise
+
+    def _release_conversation_lock(self):
+        store = getattr(self, "_checkpoint_store", None)
+        identity = getattr(self, "_conversation_id", None)
+        if store and identity:
+            store.release("conversation:" + identity)
+
+    def list_conversations(self, *, archived=False):
+        if getattr(self, "_checkpoint_store", None) is None:
+            raise CheckpointError("会话历史要求启用 Checkpoint")
+        return self._checkpoint_store.list_conversations(str(self.workdir.resolve()), archived=archived)
+
+    def open_conversation(self, conversation_id):
+        store = self._checkpoint_store
+        row = store.get_conversation(conversation_id)
+        snapshot_require(row["workspace"] == str(self.workdir.resolve()) and row["archived_at"] is None,
+                         "会话不属于当前 Workspace 或已归档")
+        if self.has_active_run and getattr(self, "_conversation_id", None) != conversation_id:
+            raise CheckpointError("已有活动 Run，不能切换会话")
+        store.acquire("conversation:" + conversation_id)
+        try:
+            row = store.get_conversation(conversation_id)
+            self._conversation_id = conversation_id
+            self._conversation_head_run_id = row["head_run_id"]
+            store.touch_conversation(conversation_id)
+            result = self.open_checkpoint_conversation(row["head_run_id"])
+            return result
+        finally:
+            self._release_conversation_lock()
+
+    def start_new_conversation(self):
+        if self.has_active_run or self.has_unfinished_conversation:
+            raise CheckpointError("当前任务未完成；请保持暂停或先归档")
+        self._conversation_id = None
+        self._conversation_head_run_id = None
+        self.messages.clear()
+        self._run_state = None
+
+    def archive_checkpoint(self, run_id, reason):
+        """Detach from an operation without rewriting its execution facts."""
+        if self.has_active_run and self._run_state.run_id != run_id:
+            raise CheckpointError("不能在另一个 Run 活动时归档")
+        store = self._checkpoint_store
+        identity = store.conversation_for_run(run_id)
+        if identity:
+            store.acquire("conversation:" + identity)
+        try:
+            store.acquire(run_id)
+            try:
+                record = store.recover(run_id)
+                snapshot_require(record["snapshot"] is not None and
+                    record["snapshot"]["workspace"]["root"] == str(self.workdir.resolve()), "归档工作区不一致")
+                store.archive_run(run_id, reason)
+            finally:
+                store.release(run_id)
+        finally:
+            if identity:
+                store.release("conversation:" + identity)
+        if getattr(self, "_conversation_id", None) == identity or (self._run_state and self._run_state.run_id == run_id):
+            self._run_state = None
+            self._conversation_id = None
+            self._conversation_head_run_id = None
+            self._checkpoint_faulted = False
+            self.messages.clear()
+        return "已归档；原执行事实和审批记录保留，原操作不能恢复。可以开始新会话。"
 
     def _checkpoint_save(self, boundary: str) -> None:
         store = getattr(self, "_checkpoint_store", None)
@@ -728,6 +807,63 @@ class MiniClaudeAgent:
         self._hitl_enabled = True
         self._permission_policy = DefaultPermissionPolicy.for_agent(self)
         self._approval_store = ApprovalStore(self._checkpoint_store, self._permission_policy)
+        from core.permission_grants import PermissionGrants
+        self._permission_grants = PermissionGrants(self._checkpoint_store, self.tool_registry)
+
+    def remember_approval(self, run_id, approval_id, scope):
+        store = self._checkpoint_store
+        store.acquire(run_id)
+        try:
+            record = self.get_pending_approval(run_id)
+            if record.approval_id != approval_id or record.state is not ApprovalStatus.APPROVED:
+                raise CheckpointError("只能为刚刚批准的当前操作保存规则")
+            operation = record.decision.operation
+            if self._permission_policy.evaluate(operation) != record.decision:
+                raise CheckpointError("操作上下文已变化，不能保存旧授权")
+            expiry = record.to_dict()["expires_at"]
+            if expiry is not None and self._approval_store.clock() >= expiry:
+                raise CheckpointError("审批已过期，不能保存授权")
+            if record.decision.rule_id == "file.sensitive":
+                raise CheckpointError("敏感文件只能单次确认")
+            self._permission_grants.remember(operation, scope)
+        finally:
+            store.release(run_id)
+
+    def list_permissions(self):
+        return self._permission_grants.list(str(self.workdir.resolve()))
+
+    def get_session_info(self):
+        """Read-only identity and resolved storage view for the terminal UI."""
+        state = self._run_state
+        store = getattr(self, "_checkpoint_store", None)
+        conversation = getattr(self, "_conversation_id", None)
+        head = getattr(self, "_conversation_head_run_id", None)
+        if state and head and state.run_id != head:
+            state = None
+        record = store.load(head) if store and head else None
+        unknown_ids = [call["call_id"] for call in record["journal"] if call["state"] == "UNKNOWN"] if record else []
+        title = store.get_conversation(conversation)["title"] if store and conversation else "新会话"
+        return {"conversation_id": conversation, "title": title,
+                "run_id": state.run_id if state else head,
+                "status": state.status.value if state else record["status"] if record else "ready",
+                "execution_blocked": bool(unknown_ids or (record and record["status"] == "unknown")),
+                "unknown_call_ids": unknown_ids,
+                "trace_id": state.trace_task_id if state else None,
+                "recorder_id": self.session_recorder.session_id,
+                "workspace": str(self.workdir.resolve()), "cwd": str(self.runtime_context.cwd),
+                "checkpoint_db": str(store.path) if store else None,
+                "data_root": str(self.data_paths.root.resolve()),
+                "session_log": str(self.session_recorder.path.resolve()),
+                "traces": str(self.data_paths.traces.resolve()),
+                "hitl": getattr(self, "_hitl_enabled", False)}
+
+    def get_conversation_preview(self, limit=6):
+        """Reference history only; no tool results or execution replay."""
+        return [{"role": m.role, "content": m.content} for m in self.messages
+                if m.role in {"user", "assistant"} and m.content][-limit:]
+
+    def revoke_permission(self, grant_id):
+        return self._permission_grants.revoke(str(self.workdir.resolve()), grant_id)
 
     def get_checkpoint_info(self, run_id: str):
         """Read-only CLI view; neither claims a Run nor repairs its journal."""
@@ -735,11 +871,24 @@ class MiniClaudeAgent:
             raise CheckpointError("未启用持久化 HITL")
         record = self._checkpoint_store.load(run_id)
         snapshot = record["snapshot"]
+        calls = []
+        for call in record["journal"]:
+            function = json.loads(call["call_json"])["function"]
+            try:
+                arguments = json.loads(function["arguments"])
+            except json.JSONDecodeError:
+                # Journal preserves malformed original input for inspection too.
+                arguments = function["arguments"]
+            calls.append({"call_id": call["call_id"], "state": call["state"],
+                          "tool_name": function["name"], "arguments": arguments})
         return {"run_id": run_id, "status": record["status"], "checked_at": self._approval_store.clock(),
+            "conversation_id": self._checkpoint_store.conversation_for_run(run_id),
+            "archive": self._checkpoint_store.archive_info(run_id),
+            "title": snapshot["context"]["user_prompt"] if snapshot else "未完成初始化",
             "workspace": snapshot["workspace"]["root"] if snapshot else None,
             "cwd": snapshot["workspace"]["cwd"] if snapshot else None,
             "result": record["final_result"],
-            "calls": [{"call_id": call["call_id"], "state": call["state"]} for call in record["journal"]],
+            "calls": calls,
             "approval_id": snapshot["run"].get("approval_id") if snapshot else None,
             "approvals": self._approval_store.list_for_run(run_id)}
 
@@ -747,6 +896,51 @@ class MiniClaudeAgent:
         if not getattr(self, "_hitl_enabled", False):
             raise CheckpointError("未启用持久化 HITL")
         return [self.get_checkpoint_info(run_id) for run_id in self._checkpoint_store.list_run_ids()]
+
+    def _load_terminal_history(self, record) -> str:
+        """Load validated reference messages, never execution state or authority."""
+        snapshot = record['snapshot']
+        if snapshot is None:
+            raise CheckpointError('该任务没有完整对话快照；只能检查记录或归档后重新规划')
+        snapshot_require(snapshot['workspace']['root'] == str(self.workdir.resolve())
+            and self.workspace_authority.primary_root == self.workdir.resolve(), '会话不属于当前 Workspace')
+        state = decode_run(snapshot['run'], _terminal=True)
+        messages = decode_messages(snapshot['messages'], state)
+        note = snapshot['agent_note']
+        snapshot_text(note, 'Agent Note')
+        snapshot_require(len(note) <= AgentNote.MAX_CHARS, 'Note 超出上限')
+        # Keep cwd, Todo, policy budgets and ToolBatchState out of this view.
+        self.agent_note.replace(note)
+        self.messages = messages
+        self.session_recorder.record('conversation_loaded', run_id=record['run_id'])
+        if any(call['state'] == 'UNKNOWN' for call in record['journal']):
+            return (f'已加载会话只读历史（{record["status"].upper()}，含 UNKNOWN）。\n'
+                    'Run 已结束，但有调用结果不确定；禁止重放工具或覆盖原任务。\n'
+                    '可用 /status 或 /approval ' + record['run_id'] + ' 检查记录；'
+                    '人工核验后可 /archive <原因>，再开始新会话。')
+        return f'已加载会话上下文（{record["status"].upper()}），可继续输入新任务。\n' + (record['final_result'] or '')
+
+    def open_checkpoint_conversation(self, run_id: str) -> str:
+        """加载完成会话的上下文；未完成任务仍走严格执行恢复协议。"""
+        store = getattr(self, '_checkpoint_store', None)
+        if self.has_active_run and self._run_state.run_id == run_id and self._run_state.status is RunStatus.WAITING_APPROVAL:
+            return self.resume_checkpoint(run_id)
+        if store is None or self.has_active_run:
+            raise CheckpointError('已有活动 Run 或未启用 Checkpoint，不能切换会话')
+        store.acquire(run_id)
+        try:
+            record = store.load(run_id)
+            if record['status'] not in {'completed', 'terminated', 'failed', 'cancelled'}:
+                # 先释放查询锁；resume_checkpoint 自己获取执行独占。
+                completed = False
+            else:
+                completed = True
+                result = self._load_terminal_history(record)
+        finally:
+            store.release(run_id)
+        if not completed:
+            return self.resume_checkpoint(run_id)
+        return result
 
     def get_pending_approval(self, run_id: str):
         if not getattr(self, "_hitl_enabled", False):
@@ -756,15 +950,17 @@ class MiniClaudeAgent:
             raise CheckpointError("当前 Run 没有可处理的等待审批")
         return self._approval_store.get(record["snapshot"]["run"]["approval_id"])
 
-    def decide_approval(self, run_id: str, approval_id: str, *, approved: bool, actor: str):
+    def decide_approval(self, run_id: str, approval_id: str, *, approved: bool, actor: str, feedback=None):
         """Audit a caller decision; no handler, resume or thread waiting here."""
-        record = self.get_pending_approval(run_id)
-        if record.approval_id != approval_id:
-            raise CheckpointError("审批 ID 不属于当前 Run 的待处理调用")
         store = self._checkpoint_store
         store.acquire(run_id)
         try:
-            return self._approval_store.decide(approval_id, approved=approved, actor=actor)
+            if store.archive_info(run_id):
+                raise CheckpointError("Run 已归档，不能继续审批")
+            record = self.get_pending_approval(run_id)
+            if record.approval_id != approval_id:
+                raise CheckpointError("审批 ID 不属于当前 Run 的待处理调用")
+            return self._approval_store.decide(approval_id, approved=approved, actor=actor, feedback=feedback)
         finally:
             store.release(run_id)
 
@@ -779,12 +975,30 @@ class MiniClaudeAgent:
                          and self._run_state.status is RunStatus.WAITING_APPROVAL)
         if store is None or (self.has_active_run and not same_wait):
             raise CheckpointError("恢复要求启用 Checkpoint，且当前没有其他活动 Run")
-        store.acquire(run_id)
+        identity = store.conversation_for_run(run_id)
+        if identity:
+            if not store.holds_lock("conversation:" + identity):
+                store.acquire("conversation:" + identity)
         try:
+            store.acquire(run_id)
+        except BaseException:
+            if identity:
+                store.release("conversation:" + identity)
+            raise
+        try:
+            if store.archive_info(run_id):
+                raise CheckpointError("Run 已归档，不能恢复原操作")
+            if identity and store.get_conversation(identity)["head_run_id"] != run_id:
+                raise CheckpointError("这不是会话当前 Run；请通过会话入口加载最新上下文")
+            if identity:
+                self._conversation_id = identity
+                self._conversation_head_run_id = run_id
             record = store.recover(run_id)
             if record["status"] == "unknown":
                 raise CheckpointError("UNKNOWN：存在无法确认的工具副作用，必须人工检查，禁止自动重试")
             if record["status"] in CHECKPOINT_TERMINAL:
+                if any(call["state"] == "UNKNOWN" for call in record["journal"]):
+                    return self._load_terminal_history(record)
                 return record["final_result"] or ""
             if record["snapshot"] is None:
                 raise CheckpointError("尚未提交完整运行边界；初始化或模型响应无法原样恢复")
@@ -821,6 +1035,8 @@ class MiniClaudeAgent:
             return self._continue_run()
         finally:
             store.release(run_id)
+            if identity:
+                store.release("conversation:" + identity)
 
     def _create_run_trace(self, trace, state, prompt: str, *, resumed_from: str | None = None) -> str:
         """Create a diagnostic segment without resetting execution/governance state."""
@@ -834,6 +1050,18 @@ class MiniClaudeAgent:
             workspace_confirmed=self._workspace_confirmed,
             require_tool_call=state.require_tool_call, environment=self.preflight.to_dict(),
             request_config=request_config)
+
+    @property
+    def has_unfinished_conversation(self) -> bool:
+        # A failed restore can leave a selected durable Run without importing
+        # its in-memory RunState. It still must not be cleared or overwritten.
+        store = getattr(self, "_checkpoint_store", None)
+        head = getattr(self, "_conversation_head_run_id", None)
+        if store is None or head is None:
+            return False
+        record = store.load(head)
+        return (record["status"] not in CHECKPOINT_TERMINAL or record["status"] == "unknown"
+                or any(call["state"] == "UNKNOWN" for call in record["journal"]))
 
     @property
     def has_pending_tool_batch(self) -> bool:
@@ -894,6 +1122,7 @@ class MiniClaudeAgent:
             store = getattr(self, "_checkpoint_store", None)
             if store is not None:
                 store.release(state.run_id)
+                self._release_conversation_lock()
             raise
         result = self._llm_tool_cycle(
             max_iterations=state.max_iterations,
@@ -975,7 +1204,7 @@ class MiniClaudeAgent:
         self._ui_event_handler = handler
 
     def _emit_ui_event(self, event: str, **data: Any) -> None:
-        if self._ui_event_handler is None:
+        if getattr(self, "_ui_event_handler", None) is None:
             return
         try:
             self._ui_event_handler(event, data)
@@ -993,7 +1222,7 @@ class MiniClaudeAgent:
             return str(args.get("command", ""))[:120].replace("\n", " ")
         if name in {"read_file", "write_file", "edit_file", "list_files", "search_code"}:
             target = args.get("path") or args.get("pattern") or args.get("query")
-            return str(target)[:100] if target else ""
+            return str(target) if target else ""
         return ""
 
     def _register_tools(self) -> None:
@@ -1300,7 +1529,16 @@ class MiniClaudeAgent:
         if not hasattr(self, 'tool_registry'):
             self.tool_registry = ToolRegistry()
             self._register_tools()
-        return self.feature_manager.filter_tools(self.tool_registry.definitions())
+        return [tool for tool in self.feature_manager.filter_tools(self.tool_registry.definitions())
+                if self._mode_capability_error(tool["name"]) is None]
+
+    def _mode_capability_error(self, name, args=None):
+        if getattr(self, "_checkpoint_store", None) is not None:
+            command = (args or {}).get("command", "")
+            if name in {"run_background", "task"} or (name == "bash" and sys.platform == "win32"
+                    and isinstance(command, str) and re.match(r"^\s*start(?:\s|$)", command, re.I)):
+                return "持久化模式暂不支持后台或子 Agent 执行，审批不能创建该能力"
+        return None
 
     # ── Tool Handler Methods (bound in ToolRegistry) ──
 
@@ -1668,8 +1906,9 @@ class MiniClaudeAgent:
         if state.approval_id is not None:
             approval = self._approval_store.get(state.approval_id)
             if approval.state is ApprovalStatus.REJECTED:
+                feedback = self._checkpoint_store.approval_feedback(state.approval_id)
                 return ToolDispatchResult(ToolDispatchStatus.APPROVAL_REJECTED,
-                    "[NOT_EXECUTED] 用户拒绝本操作；当前批次剩余调用不执行，需要重新规划。")
+                    "[NOT_EXECUTED] 用户拒绝本操作；当前批次剩余调用不执行。原因：" + feedback["note"])
             if approval.state is not ApprovalStatus.APPROVED:
                 raise CheckpointError("审批未批准、已失效或已消费")
             # Always consume/recheck an existing grant, even if policy now says DENY.
@@ -1679,6 +1918,8 @@ class MiniClaudeAgent:
             return ToolDispatchResult(ToolDispatchStatus.PERMISSION_DENIED,
                 f"[NOT_EXECUTED] 权限拒绝（{decision.rule_id}）：{decision.reason}")
         if decision.kind is PermissionKind.ALLOW:
+            return None
+        if decision.rule_id != "file.sensitive" and self._permission_grants.allows(decision.operation):
             return None
         # The current call was visited but has not been processed. Its signature
         # must not count as completed in the durable dedup prefix.
@@ -1727,7 +1968,14 @@ class MiniClaudeAgent:
                     execution_success=False,
                 ),
             )
+        mode_error = self._mode_capability_error(name, args)
+        if mode_error:
+            return ToolDispatchResult(ToolDispatchStatus.FEATURE_DISABLED, mode_error)
         self._checkpoint_dispatch(name, args)
+        self._emit_ui_event("tool_execution_started", name=name,
+                            summary=self._tool_event_summary(name, args),
+                            command=args.get("command", "") if name in {"bash", "run_background"} else "",
+                            cwd=str(getattr(getattr(self, "runtime_context", None), "cwd", "")))
         try:
             value = self.tool_registry.execute(name, args)
             return ToolDispatchResult(ToolDispatchStatus.DISPATCHED, value)
@@ -1790,6 +2038,9 @@ class MiniClaudeAgent:
                 outcome=outcome,
                 result=result_text,
             )
+            if outcome == "UNKNOWN":
+                self._emit_ui_event("tool_result", name=tool_name, call_id=call_id,
+                                    success=False, blocked=False, outcome=outcome)
 
     # ── Pre-LLM Processing (mirrors s_full.py agent_loop) ────────────
 
@@ -2294,6 +2545,7 @@ class MiniClaudeAgent:
         finally:
             if store.holds_lock(state.run_id):
                 store.release(state.run_id)
+            self._release_conversation_lock()
 
     def _llm_tool_cycle_impl(
         self, max_iterations: int = 50, require_tool_call: bool = False,
@@ -2778,6 +3030,8 @@ class MiniClaudeAgent:
                             success=False, blocked=True,
                             outcome="SKIPPED_DUPLICATE", result=result_text,
                         )
+                        self._emit_ui_event("tool_result", name=tname, call_id=tc["id"],
+                                            success=False, blocked=True, outcome="SKIPPED_DUPLICATE")
                         if advance_current_call("SKIPPED_DUPLICATE", result_text):
                             return "任务已在安全工具边界暂停，可在同一进程继续。"
                         continue
@@ -2985,6 +3239,7 @@ class MiniClaudeAgent:
                                 record_tool_result_event(tname, result_text, success=False,
                                     blocked=True, outcome=tool_call_outcome)
                                 if dispatch_status is ToolDispatchStatus.APPROVAL_REJECTED:
+                                    feedback = self._checkpoint_store.approval_feedback(state.approval_id)
                                     # Close the suffix as a single known, non-execution projection.
                                     state.pause_requested = False
                                     state.record_tool_result(tc["id"], tool_call_outcome, result_text)
@@ -2994,8 +3249,12 @@ class MiniClaudeAgent:
                                         text = "[NOT_EXECUTED] 前置操作被用户拒绝，剩余依赖操作未执行；请重新规划。"
                                         append_tool_result(remaining, text)
                                         state.record_tool_result(remaining["id"], "BLOCKED_NOT_EXECUTED", text)
-                                    defer_replan("用户拒绝了原操作，剩余工具均未执行。请重新规划合法替代方案。")
+                                    defer_replan("用户拒绝了原操作，剩余工具均未执行。用户意见：" + feedback["note"])
                                     self._checkpoint_save("tools")
+                                    if feedback["mode"] == "stop":
+                                        self._finalize_tool_batch(batch)
+                                        self.trace.end_task("CANCELLED")
+                                        return self._finish_run(RunStatus.TERMINATED, "已拒绝操作并结束本轮；工具未执行。")
                                     break
                                 if advance_current_call(tool_call_outcome, result_text):
                                     return "任务已在安全工具边界暂停，可在同一进程继续。"
@@ -3121,6 +3380,8 @@ class MiniClaudeAgent:
                                         name=tname,
                                         success=False,
                                         blocked=False,
+                                        call_id=tc["id"],
+                                        outcome="CANCELLED",
                                     )
                                     self.session_recorder.record(
                                         "runtime_cancelled",
@@ -3287,6 +3548,8 @@ class MiniClaudeAgent:
                         name=tname,
                         success=t_success,
                         blocked=bool(v3_block_msg) or state_guard_blocked,
+                        call_id=tc["id"],
+                        outcome=tool_call_outcome,
                     )
 
                     # Log with clean format

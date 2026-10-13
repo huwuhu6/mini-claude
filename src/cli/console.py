@@ -14,13 +14,14 @@ class Command:
 
     def __init__(self, name: str, help_text: str, handler: Callable,
                  args_help: str = "", aliases: Optional[List[str]] = None,
-                 category: str = "general"):
+                 category: str = "general", advanced: bool = False):
         self.name = name
         self.help_text = help_text
         self.handler = handler
         self.args_help = args_help
         self.aliases = aliases or []
         self.category = category
+        self.advanced = advanced
 
     def full_help(self) -> str:
         parts = [f"/{self.name}"]
@@ -44,11 +45,11 @@ class ConsoleCommandSystem:
     def _register_defaults(self):
         """Register built-in commands."""
         self.register(Command(
-            'help', 'Show available commands', self._cmd_help,
-            args_help='[command name]', category='general'
+            'help', '查看常用命令或高级帮助', self._cmd_help,
+            args_help='[advanced | 命令名]', category='general'
         ))
         self.register(Command(
-            'exit', 'Exit the application', self._cmd_exit,
+            'exit', '退出，保留已保存的对话', self._cmd_exit,
             aliases=['quit'], category='general'
         ))
 
@@ -110,12 +111,15 @@ class ConsoleCommandSystem:
         return list(unique.values())
 
     def get_help_text(self, cmd_name: str = "") -> str:
-        if cmd_name:
+        if cmd_name and cmd_name != 'advanced':
             cmd = self.get_command(cmd_name)
             return cmd.full_help() if cmd else f"未知命令: {cmd_name}"
-        lines = ["可用命令:\n"]
+        lines = ["可用命令 · 高级:" if cmd_name == 'advanced' else "可用命令 · 常用:"]
         for cmd in sorted(self.get_all_commands(), key=lambda c: c.name):
-            lines.append(f"  {cmd.full_help()}")
+            if cmd.advanced == (cmd_name == 'advanced'):
+                lines.append(f"  {cmd.full_help()}")
+        if not cmd_name:
+            lines.append("\n诊断、配置与脚本审批入口：/help advanced")
         return '\n'.join(lines)
 
     def get_history(self) -> List[str]:

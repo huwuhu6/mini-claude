@@ -60,7 +60,7 @@ def test_agent_command_registration_preserves_commands_and_aliases():
     assert names == {
         "help", "exit", "status", "stats", "config", "tasks", "team", "inbox",
         "features", "compact", "providers", "add_workdir", "whitelist", "skills",
-        "clear",
+        "clear", "new",
     }
     for alias in ("quit", "task", "addpath", "workdirs", "skill"):
         assert console.get_command(alias) is not None

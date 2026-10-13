@@ -11,10 +11,16 @@ def describe_run(agent, run_id):
     info = agent.get_checkpoint_info(run_id)
     lines = [f"Run ID: {safe_text(run_id)}", f"Run 状态: {info['status'].upper()}",
         f"Workspace: {safe_text(info['workspace'])}", f"有效 cwd: {safe_text(info['cwd'])}"]
+    if info.get('archive'):
+        lines.append('已归档（原执行事实保留）：' + safe_text(info['archive']['reason']))
     if info['workspace'] != str(agent.workdir.resolve()):
         lines.append("当前 Workspace 与 Checkpoint 不一致；不能借旧审批扩大权限。")
     if info['status'] == 'unknown' or any(c['state'] == 'UNKNOWN' for c in info['calls']):
         lines.append("UNKNOWN：工具副作用无法确认，恢复受阻；禁止通过批准重试，必须人工检查。")
+        for call in info['calls']:
+            if call['state'] == 'UNKNOWN':
+                lines += [f"不确定调用: {safe_text(call.get('tool_name', '工具'))} · {safe_text(call['call_id'])}",
+                          "原操作（仅供核验，不执行）: " + json.dumps(redact(call.get('arguments', {})), ensure_ascii=False)]
     elif any(c['state'] == 'RUNNING' for c in info['calls']):
         lines.append("存在 RUNNING 调用，可能有其他执行者；Runtime 恢复会检查独占锁及未知副作用。")
     current = next((a for a in info['approvals'] if a.approval_id == info['approval_id']), None)
@@ -82,22 +88,94 @@ def _decide(agent, args, approved):
 
 
 def _resume(agent, args):
+    if not args:
+        from cli.entrypoint import _select_session
+        selected = _select_session(agent)
+        return agent.open_conversation(selected) if selected else '已取消，当前会话未改变。'
     if len(args) != 1:
-        return "用法: /resume <Run ID>"
-    result = agent.resume_checkpoint(args[0])
+        return "用法: /resume [会话 ID]"
+    if any(row['conversation_id'] == args[0] for row in agent.list_conversations()):
+        return agent.open_conversation(args[0])
+    result = agent.open_checkpoint_conversation(args[0])
     info = agent.get_checkpoint_info(args[0])
-    if info['status'] == 'waiting_approval' or info['status'] in {'completed', 'terminated', 'failed', 'cancelled'}:
+    if info['status'] == 'waiting_approval' or info['status'] in {'terminated', 'failed', 'cancelled'}:
         return describe_run(agent, args[0])
+    if info['status'] == 'completed':
+        return '会话已完成（COMPLETED），可以继续聊天。\n' + safe_text(result)
     return safe_text(result)
+
+
+def _sessions(agent, args):
+    if args not in ([], ['archived']):
+        return '用法: /sessions [archived]'
+    rows = agent.list_conversations(archived=bool(args))
+    current = agent.get_session_info()['conversation_id']
+    return '\n'.join(f"{'当前 · ' if row['conversation_id'] == current else ''}{safe_text(row['conversation_id'])}  {row['status'].upper()}  {safe_text(row['title'])}"
+                     for row in rows) or '当前工作区没有会话。'
+
+
+def _new(agent, args):
+    if args:
+        return '用法: /new'
+    agent.start_new_conversation()
+    return '已开始新会话。'
+
+
+def _archive(agent, args):
+    current = getattr(agent, '_run_state', None)
+    # Completed history is a reference view; an older terminal in-memory Run
+    # must not redirect archive away from the selected conversation head.
+    run_id = getattr(agent, '_conversation_head_run_id', None) or (current.run_id if current else None)
+    if not run_id or not args:
+        return '用法: /archive <归档原因>（先打开需要归档的会话；不核销 UNKNOWN、不重试原调用）'
+    return agent.archive_checkpoint(run_id, ' '.join(args))
+
+
+def _permissions(agent, args):
+    if len(args) == 2 and args[0] == 'revoke':
+        return '规则已撤销。' if agent.revoke_permission(args[1]) else '规则不存在或不属于当前工作区。'
+    if args:
+        return '用法: /permissions [revoke <规则 ID>]'
+    from core.permissions import ToolOperation
+    from cli.ui import fit_line
+    lines = ['已保存的授权范围（硬拒绝与执行前校验仍然有效）：']
+    current = agent.get_session_info()['conversation_id']
+    for row in agent.list_permissions():
+        rule = row['rule']
+        scope = {'process': 'CLI 进程（退出失效）', 'conversation': '本对话（重启保留）', 'workspace': '此工作区（跨对话）'}[row['scope']]
+        if isinstance(rule, ToolOperation):
+            target = f"旧精确规则 · {rule.tool_name} · " + str(rule.arguments.get('path') or rule.arguments.get('command') or '完整参数匹配')
+        elif rule['selector']['kind'] == 'file':
+            from pathlib import Path
+            path = Path(rule['selector']['path'])
+            try:
+                target = '修改文件 · ' + str(path.relative_to(agent.workdir.resolve()))
+            except ValueError:
+                target = '修改文件 · ' + str(path)
+        else:
+            selector = rule['selector']
+            target = selector['tool'] + ' · ' + str(selector['arguments'].get('command') or '完整参数匹配')
+            target += ' · cwd: ' + selector['cwd']
+        if isinstance(rule, dict) and rule['scope'] == 'conversation':
+            scope = ('当前对话' if rule['conversation_id'] == current else '其他对话') + ' ' + rule['conversation_id'][:8] + '（重启保留）'
+        lines += [f"  {safe_text(row['grant_id'])} · {scope}", '    ' + fit_line(target, 120)]
+    if len(lines) == 1:
+        lines.append('  暂无保存的规则。审批时可以选择文件或完整操作的授权范围。')
+    lines.append('撤销：/permissions revoke <规则 ID>')
+    return '\n'.join(lines)
 
 
 def register_hitl_commands(console, agent):
     definitions = (
+        ('sessions', '查看当前工作区会话', _sessions, '[archived]'),
+        ('new', '开始新会话', _new, ''),
+        ('archive', '归档当前任务，保留执行事实且禁止原操作恢复', _archive, '<原因>'),
+        ('permissions', '查看或撤销明确范围的规则', _permissions, '[revoke <规则 ID>]'),
         ('runs', '查看已保存 Run 与待审批身份', _runs, ''),
         ('approval', '查看 Run、实际操作和审批状态', _approval, '<Run ID>'),
         ('approve', '批准原操作（不会执行）', lambda a, args: _decide(a, args, True), '<Run ID> <Approval ID>'),
         ('reject', '拒绝原操作（不会执行；恢复后重新规划）', lambda a, args: _decide(a, args, False), '<Run ID> <Approval ID>'),
-        ('resume', '通过 SQLite 显式恢复原 Run', _resume, '<Run ID>'),
+        ('resume', '选择历史会话或继续指定会话', _resume, '[会话 ID]'),
     )
     def invoke(callback, args):
         try:
@@ -107,4 +185,4 @@ def register_hitl_commands(console, agent):
     for name, help_text, callback, usage in definitions:
         console.register(Command(name, help_text,
             lambda args, context, callback=callback: invoke(callback, args),
-            args_help=usage, category='hitl'))
+            args_help=usage, category='hitl', advanced=name not in {'new', 'resume', 'permissions'}))

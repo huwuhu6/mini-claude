@@ -234,6 +234,8 @@ def test_v1_upgrade_preserves_checkpoint_bytes_and_continue_protocol(ready):
     before = store.load("run-1")
     store.close()
     with sqlite3.connect(store.path) as connection:
+        for table in ('approval_feedback', 'permission_grants', 'run_archives', 'conversation_runs', 'conversations'):
+            connection.execute('DROP TABLE ' + table)
         connection.execute("DROP TABLE approvals")
         connection.execute("PRAGMA user_version=1")
     migrated = SqliteCheckpointStore(store.path)
@@ -250,6 +252,8 @@ def test_migration_failure_rolls_back_schema_without_touching_calls(ready, monke
     before = store.load("run-1")
     store.close()
     with sqlite3.connect(store.path) as connection:
+        for table in ('approval_feedback', 'permission_grants', 'run_archives', 'conversation_runs', 'conversations'):
+            connection.execute('DROP TABLE ' + table)
         connection.execute("DROP TABLE approvals")
         connection.execute("PRAGMA user_version=1")
     upgrade = SqliteCheckpointStore._upgrade_approvals

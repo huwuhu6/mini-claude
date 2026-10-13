@@ -187,8 +187,12 @@ class ApprovalStore:
         self.checkpoints._write(record.decision.operation.run_id, operation)
         return self.get(approval_id)
 
-    def decide(self, approval_id, *, approved, actor):
+    def decide(self, approval_id, *, approved, actor, feedback=None):
         require(type(approved) is bool and type(actor) is str and bool(actor), "用户决定 / 身份无效")
+        if feedback is not None:
+            require(not approved and type(feedback) is dict and set(feedback) == {"mode", "note"}
+                    and feedback["mode"] in {"stop", "replan"} and type(feedback["note"]) is str
+                    and 0 < len(feedback["note"]) <= 4000, "拒绝意见无效")
         record = self.get(approval_id)
         run_id = record.decision.operation.run_id
         self.checkpoints.load(run_id)
@@ -204,9 +208,13 @@ class ApprovalStore:
             require(now >= data["created_at"] and (data["decided_at"] is None or now >= data["decided_at"]), "审批时钟回退")
             if data["state"] != "PENDING":
                 require(data["user_decision"] == verdict and data["decided_by"] == actor and data["state"] in {verdict, "CONSUMED"}, "审批决定冲突或已失效")
+                prior = connection.execute("SELECT mode,note FROM approval_feedback WHERE approval_id=?", (approval_id,)).fetchone()
+                require((dict(prior) if prior else None) == feedback, "不能修改已记录的拒绝意见")
                 self._touch(connection, run_id, token, changed=False)
                 return True
             connection.execute("UPDATE approvals SET state=?,user_decision=?,decided_by=?,decided_at=? WHERE approval_id=? AND state='PENDING'", (verdict, verdict, actor, now, approval_id))
+            if feedback is not None:
+                connection.execute("INSERT INTO approval_feedback VALUES(?,?,?)", (approval_id, feedback["mode"], feedback["note"]))
             self._touch(connection, run_id, token)
             return True
         if not self.checkpoints._write(run_id, operation):

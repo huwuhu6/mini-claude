@@ -8,11 +8,12 @@ import os
 from pathlib import Path
 import sqlite3
 import threading
+import time
 import uuid
 
 from core.run_snapshot import SCHEMA_VERSION, CHECKPOINT_SNAPSHOT_VERSION, HITL_SNAPSHOT_VERSION, SNAPSHOT_FIELDS, decode_messages, decode_run, fields, json_copy, require, call_ids, PAUSED_RESULT_OUTCOMES
 
-DB_VERSION = 3
+DB_VERSION = 4
 TERMINAL = {"completed", "terminated", "failed", "cancelled", "unknown"}
 
 
@@ -89,7 +90,7 @@ class SqliteCheckpointStore:
                 version = connection.execute("PRAGMA user_version").fetchone()[0]
                 if require_existing and version == 0:
                     raise CheckpointError("已有文件缺少 Checkpoint Schema；不能在恢复时初始化空库")
-                if version not in {0, 1, 2, DB_VERSION}:
+                if version not in {0, 1, 2, 3, DB_VERSION}:
                     raise CheckpointError(f"Checkpoint 数据库版本不兼容: {version}")
                 tables = connection.execute("SELECT name FROM sqlite_master WHERE type='table'").fetchall()
                 if version == 0 and tables:
@@ -123,11 +124,22 @@ class SqliteCheckpointStore:
                     self._upgrade_approvals(connection)
                 if version < 3:
                     self._upgrade_waiting(connection)
+                if version < 4:
+                    self._upgrade_conversations(connection)
                 if connection.execute("PRAGMA foreign_key_check").fetchone() is not None:
                     raise CheckpointError("Checkpoint 外键关系损坏")
                 from core.approvals import APPROVAL_COLUMNS
                 if {r[1] for r in connection.execute("PRAGMA table_info(approvals)")} != APPROVAL_COLUMNS:
                     raise CheckpointError("审批数据库结构损坏或不兼容")
+                for table, columns in {
+                    "conversations": {"conversation_id", "workspace", "title", "updated_at", "opened_at", "archived_at", "head_run_id"},
+                    "conversation_runs": {"run_id", "conversation_id"},
+                    "run_archives": {"run_id", "archived_at", "reason"},
+                    "permission_grants": {"grant_id", "workspace", "fingerprint", "operation_json", "created_at"},
+                    "approval_feedback": {"approval_id", "mode", "note"},
+                }.items():
+                    if {r[1] for r in connection.execute("PRAGMA table_info(" + table + ")")} != columns:
+                        raise CheckpointError("会话数据库结构损坏或不兼容")
                 connection.commit()
                 connection.execute("PRAGMA foreign_keys=ON")
             except BaseException:
@@ -168,6 +180,94 @@ class SqliteCheckpointStore:
             yield connection
         finally:
             connection.close()
+
+    @staticmethod
+    def _upgrade_conversations(connection):
+        # History remains owned by the head Run snapshot. These tables contain
+        # identity/index metadata only, never a second execution journal.
+        connection.execute("""CREATE TABLE conversations (
+            conversation_id TEXT PRIMARY KEY, workspace TEXT NOT NULL, title TEXT NOT NULL,
+            updated_at REAL NOT NULL, opened_at REAL NOT NULL, archived_at REAL,
+            head_run_id TEXT REFERENCES runs(run_id))""")
+        connection.execute("""CREATE TABLE conversation_runs (
+            run_id TEXT PRIMARY KEY REFERENCES runs(run_id),
+            conversation_id TEXT NOT NULL REFERENCES conversations(conversation_id))""")
+        connection.execute("""CREATE TABLE run_archives (
+            run_id TEXT PRIMARY KEY REFERENCES runs(run_id), archived_at REAL NOT NULL, reason TEXT NOT NULL)""")
+        connection.execute("""CREATE TABLE permission_grants (
+            grant_id TEXT PRIMARY KEY, workspace TEXT NOT NULL, fingerprint TEXT NOT NULL,
+            operation_json TEXT NOT NULL, created_at REAL NOT NULL, UNIQUE(workspace,fingerprint))""")
+        connection.execute("""CREATE TABLE approval_feedback (
+            approval_id TEXT PRIMARY KEY REFERENCES approvals(approval_id),
+            mode TEXT NOT NULL CHECK(mode IN ('stop','replan')), note TEXT NOT NULL)""")
+        # Legacy Runs remain inspectable through /runs; grouping them into a
+        # conversation would invent an identity which their data never recorded.
+        connection.execute("PRAGMA user_version=4")
+
+    def conversation_for_run(self, run_id):
+        with self._connection() as connection:
+            row = connection.execute("SELECT conversation_id FROM conversation_runs WHERE run_id=?", (run_id,)).fetchone()
+            return row[0] if row else None
+
+    def get_conversation(self, conversation_id):
+        with self._connection() as connection:
+            row = connection.execute("SELECT * FROM conversations WHERE conversation_id=?", (conversation_id,)).fetchone()
+            if row is None:
+                raise CheckpointError("会话不存在")
+            return dict(row)
+
+    def list_conversations(self, workspace, *, archived=False):
+        with self._connection() as connection:
+            return [dict(row) for row in connection.execute("""SELECT c.*, r.status FROM conversations c
+                JOIN runs r ON r.run_id=c.head_run_id WHERE c.workspace=? AND
+                (c.archived_at IS NOT NULL)=? ORDER BY MAX(c.updated_at,c.opened_at) DESC,c.rowid DESC""",
+                (workspace, int(archived)))]
+
+    def touch_conversation(self, conversation_id):
+        self._owns("conversation:" + conversation_id)
+        with self._connection() as connection:
+            connection.execute("UPDATE conversations SET opened_at=? WHERE conversation_id=? AND archived_at IS NULL",
+                               (time.time(), conversation_id))
+
+    def archive_info(self, run_id):
+        with self._connection() as connection:
+            row = connection.execute("SELECT * FROM run_archives WHERE run_id=?", (run_id,)).fetchone()
+            return dict(row) if row else None
+
+    def approval_feedback(self, approval_id):
+        with self._connection() as connection:
+            row = connection.execute("SELECT mode,note FROM approval_feedback WHERE approval_id=?", (approval_id,)).fetchone()
+            return dict(row) if row else {"mode": "replan", "note": "用户拒绝了原操作"}
+
+    def list_permission_grants(self, workspace):
+        with self._connection() as connection:
+            return [dict(row) for row in connection.execute(
+                "SELECT * FROM permission_grants WHERE workspace=? ORDER BY created_at", (workspace,))]
+
+    def remember_permission(self, run_id, workspace, fingerprint, operation_json):
+        def operation(connection, token):
+            self._current(connection, run_id, connection.execute("SELECT revision FROM runs WHERE run_id=?", (run_id,)).fetchone()[0])
+            connection.execute("INSERT OR IGNORE INTO permission_grants VALUES(?,?,?,?,?)",
+                (uuid.uuid4().hex, workspace, fingerprint, operation_json, time.time()))
+            connection.execute("UPDATE runs SET last_operation=? WHERE run_id=?", (token, run_id))
+        self._write(run_id, operation)
+
+    def revoke_permission(self, workspace, grant_id):
+        with self._connection() as connection:
+            return connection.execute("DELETE FROM permission_grants WHERE workspace=? AND grant_id=?",
+                                      (workspace, grant_id)).rowcount == 1
+
+    def archive_run(self, run_id, reason):
+        require(type(reason) is str and bool(reason.strip()), "归档必须说明原因")
+        record = self.load(run_id)
+        def operation(connection, token):
+            row = connection.execute("SELECT revision FROM runs WHERE run_id=?", (run_id,)).fetchone()
+            require(row[0] == record["revision"], "归档期间执行状态已变化")
+            connection.execute("INSERT OR IGNORE INTO run_archives VALUES(?,?,?)", (run_id, time.time(), reason))
+            connection.execute("UPDATE conversations SET archived_at=? WHERE head_run_id=?", (time.time(), run_id))
+            # Only metadata changes: UNKNOWN / PREPARED / approvals stay facts.
+            connection.execute("UPDATE runs SET last_operation=? WHERE run_id=?", (token, run_id))
+        self._write(run_id, operation)
 
     def acquire(self, run_id: str):
         if self._closed or run_id in self._locks:
@@ -218,6 +318,7 @@ class SqliteCheckpointStore:
                         "SELECT * FROM calls WHERE run_id=? ORDER BY turn,ordinal", (run_id,))]
                     journal_hash = hashlib.sha256(self._json(journal).encode("utf-8")).hexdigest()
                     connection.execute("UPDATE runs SET journal_hash=? WHERE run_id=?", (journal_hash, run_id))
+                    connection.execute("UPDATE conversations SET updated_at=? WHERE head_run_id=?", (time.time(), run_id))
                     committing = True
                     self._commit(connection)
                     return result
@@ -259,14 +360,32 @@ class SqliteCheckpointStore:
         decode_messages(data["messages"], state, _pre_model=boundary == "before_model")
         return state
 
-    def create_run(self, run_id):
+    def create_run(self, run_id, *, conversation_id=None, workspace=None, title=None, expected_head=None):
         def operation(connection, token):
+            if conversation_id is not None:
+                self._owns("conversation:" + conversation_id)
+                prior = connection.execute("SELECT * FROM conversations WHERE conversation_id=?", (conversation_id,)).fetchone()
+                if prior:
+                    require(prior["workspace"] == workspace and prior["archived_at"] is None, "会话归属错误或已归档")
+                    require(prior["head_run_id"] == expected_head, "会话已被其他进程推进，请重新打开")
+                    last = connection.execute("SELECT status FROM runs WHERE run_id=?", (expected_head,)).fetchone()
+                    require(last and last[0] in TERMINAL, "会话仍有未完成 Run")
+                    require(not connection.execute("SELECT 1 FROM calls WHERE run_id=? AND state='UNKNOWN'", (expected_head,)).fetchone(), "会话存在 UNKNOWN；必须归档后开始新会话")
+                else:
+                    require(expected_head is None and isinstance(workspace, str) and isinstance(title, str), "新会话元数据无效")
+                    connection.execute("INSERT INTO conversations VALUES(?,?,?,?,?,NULL,NULL)",
+                                       (conversation_id, workspace, title, time.time(), time.time()))
             connection.execute("INSERT INTO runs(run_id,status,revision,payload,payload_hash,final_result,last_operation) VALUES(?, 'started', 1, NULL, NULL, NULL, ?)", (run_id, token))
+            if conversation_id is not None:
+                connection.execute("INSERT INTO conversation_runs VALUES(?,?)", (run_id, conversation_id))
+                connection.execute("UPDATE conversations SET head_run_id=? WHERE conversation_id=?", (run_id, conversation_id))
             return 1
         return self._write(run_id, operation)
 
     @staticmethod
     def _current(connection, run_id, revision):
+        if connection.execute("SELECT 1 FROM run_archives WHERE run_id=?", (run_id,)).fetchone():
+            raise CheckpointError("Run 已归档，禁止继续原操作")
         row = connection.execute("SELECT * FROM runs WHERE run_id=?", (run_id,)).fetchone()
         if row is None or row["revision"] != revision:
             raise CheckpointError("Checkpoint 版本已变化，拒绝旧执行者推进")
@@ -351,7 +470,7 @@ class SqliteCheckpointStore:
     def list_run_ids(self):
         """Read-only discovery; callers still load/validate each selected Run."""
         with self._connection() as connection:
-            return [row[0] for row in connection.execute("SELECT run_id FROM runs ORDER BY run_id")]
+            return [row[0] for row in connection.execute("SELECT run_id FROM runs ORDER BY rowid DESC")]
 
     def load(self, run_id):
         with self._connection() as connection:

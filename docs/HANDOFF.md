@@ -1,3 +1,69 @@
+## 2026-10-13：磁盘故障后的文档恢复与完整回归（未提交）
+
+用户确认持续输出的日志积累约 90 GB，已释放 D 盘空间。本次检查 D 盘约有 99.5 GB 可用；从完整原始操作记录恢复 cli_command_boundary.md，补齐恢复副本末段的截断内容并保留后续补丁。文档不再缺失，没有修改生产代码、运行数据库或用户项目日志。
+
+冻结源码后使用默认 Python 3.14.3 重跑完整 tests/unit：785 passed、12 skipped、0 failed（396.80 秒），禁用 pytest 缓存写入。上次六个失败标记未复现，因当时没有可靠失败报告，不将它们全部归因于满盘。git diff --check 通过；未调用付费模型，未提交、合并或推送。当前仍在 codex/fix-provider-config-discovery；HEAD / main 为 5f41f1d09806ed8a4c387bd80b47a07adaa45609。后续先审查累计修改和未跟踪文件，再按授权提交与安全整合；本次没有新增日志轮转功能。
+
+## 2026-10-12：取消会话的只读历史与 UNKNOWN 提示（未提交）
+
+终结 Run 恢复曾提前返回取消文本，导致消息数显示 0，隐藏原快照。现在含 UNKNOWN 的终结 Run 可加载经过校验的消息与 Note 作为参考；不恢复执行状态、cwd、Todo 或旧权限，不重放工具，原数据库事实不变。状态栏和 /status 明确只读保护，/approval 展示脱敏原操作供人工核验。非终结崩溃 UNKNOWN 仍阻断。历史非法参数 JSON 保留原文，查询不会再次解析失败。
+
+只读校验用户原数据库确认快照 149 条消息，未修改数据库或执行命令。当时 D 盘已无剩余空间，pytest 缓存写入失败，不能将该轮完整单测称为全绿。关闭缓存后的关键 Runtime / CLI 回归 241 passed；完整单测出现 6 个失败标记且缓存写入失败，未取得可靠最终报告。实际 CLI Python 3.12 的 7 项本次新回归全部通过。未提交、合并或推送。
+
+## 2026-10-12：Rich 动态状态与柔和终端排版（未提交）
+
+用户要求仅重构 TerminalUI：此次未修改 mini_claude_agent.py，保留原有未提交 Agent 改动。requirements.txt 补齐 rich>=13.7.0；常规输出统一 Console，状态统一 console.status，运行期间显示带命令摘要的单行动态状态，结束后仅一行结果。计划文字 muted，成功绿色仅用于图标，失败使用柔和红色；UNKNOWN / CANCELLED / 未执行仍分别展示。PromptSession 的按键、输入和审批协议不变，进入输入或审批前停止 Rich 刷新。旧 entrypoint 的 _paint 调用保留纯文本兼容适配，不再生成 ANSI。
+
+本阶段按最新需求替代此前的多行持久完整命令展示；长命令在运行态按终端宽度省略，完整审批参数仍在详情中。当前 Agent 的普通 tool_result 事件没有错误原文，UI 只显示事件实际携带的 error/message/reason，不猜测、不新增 Runtime 查询。已覆盖状态生命周期、宽度与脱敏二次扩展、输入边界、无颜色状态条与未知结果。CLI / 审批 / 资源授权 / Markdown / 输入集成组合 123 passed；随后补齐计划文字的宽度修复，最终展示专项在 Python 3.14 / 实际 CLI Python 3.12 均为 16 passed。完整单测未重跑，git diff --check 无空白错误。
+
+## 2026-10-12：模型回答 Markdown 展示（未提交历史）
+
+同日追加 Shell 执行前可观测性修复：用户遇到 Bash 久未返回时只看到“执行中 · bash”，原命令摘要要结束才展示且只有前 120 字符。现在既有 tool_execution_started 事件携带原命令与 RuntimeContext.cwd，UI 在 handler 前持久打印完整脱敏命令、目录及 Ctrl+C 提示，长命令换行，授权未通过则不产生执行记录。仅改展示事件及 UI，不改 Shell、审批消费或执行状态协议。两项新增回归先复现失败后通过；实际 CLI Python 3.12 的这两项与既有审批边界测试 3 passed。并未核实用户运行中那条命令或停止其 Redis / Java 子进程。源码兼容校验仍保留，旧未完成 Checkpoint 可能因 Agent 源码变更而拒绝恢复，不能通过重试绕过。
+
+本次最终 Python 3.14 定向回归（资源授权、Markdown、审批菜单、CLI 和工具批次消息闭环）170 passed。完整单测未重跑，git diff --check 无空白错误。
+
+在下述未提交体验改动之上，仅替换 TerminalUI.print_answer 的简单正则排版为 Rich Markdown，并声明 rich>=13.7.0。交互终端渲染标题、列表、引用、表格及代码高亮；NO_COLOR 保留排版但禁用 ANSI，重定向保留经显示脱敏的 Markdown 源文。控制输出、审批卡片、消息与 Checkpoint 均不改变。
+
+本次展示 / 资源授权 / 审批菜单 / CLI 测试 109 passed；流式 Provider 与 CLI 输入集成 19 passed。新增 Markdown 展示测试 5 项。未重跑完整单测；下方 760 passed、12 skipped 是上一轮结果，不代表此次重跑。离线预览成功导出，真实 Windows 终端视觉验收及 Linux 实测仍待完成。
+
+当前默认启用的是 OpenAI-compatible 流式传输，DeepseekProvider._collect_stream 收齐响应才交给 Agent，尚无逐 Token 终端展示。没有为了 Markdown 修改 Provider、执行循环或恢复协议。长期取舍见 cli_command_boundary.md 的 2026-10-12 记录。
+
+用户实测发现 CLI 的启动器绑定 Python 3.12.1，而测试默认 Python 3.14.3；前者缺 rich，导致已完成工具后的回答展示抛出 ModuleNotFoundError。新增依赖导入失败时普通文本退化，回归先失败后通过；当前 CLI 解释器已安装 rich。重新安装项目时运行中的 exe 被 Windows 锁定，按原 RECORD 哈希精确恢复可编辑安装 .pth 与元数据，未终止进程或覆盖启动器。最终实际 mini-claude --help 成功，Python 3.12 展示 6 passed；Python 3.14 展示 / 菜单 / CLI 73 passed。完整单测未重跑。后续需要刷新安装元数据时先退出 CLI，再使用对应解释器重新安装项目。
+
+## 2026-10-11 当前现场：文件授权范围与终端信息层次（未提交）
+
+当前分支 `codex/fix-provider-config-discovery`；HEAD / 本地 main 仍是 `5f41f1d09806ed8a4c387bd80b47a07adaa45609`。在本 Worktree 继续已授权的未提交体验方案，完整保留此前改动；不提交、整合或推送，不改其他 Worktree 或评测 oracle。
+
+- 输入状态栏显示工作区、Conversation 短 ID、审批开关及状态；`/status` 显示完整会话与 Run 身份、实际 Checkpoint、Recorder JSONL 和 Trace 路径，`--details` 再显示 Recorder / Trace ID。恢复历史回显最近用户和助手上下文，选中的完成会话不会借用旧内存 Run 身份。
+- 内置 edit_file / write_file 共享规范文件目标授权，内容变化不再反复审批。本会话规则随 Conversation 保存，重启继续保留，新对话不继承；工作区规则跨对话有效。Shell 仍匹配完整参数、cwd 与平台，不放宽为前缀。敏感 / .git / 越界文件及自定义文件 handler 不开放文件范围规则，硬拒绝优先。
+- 新规则使用原 SQLite v4 表的版本化 JSON，旧精确规则不扩大。一次性审批原 Call ID / 完整参数及消费事务不变；规则不是执行事实。共享编辑预校验进入源码兼容摘要，编辑读写保留原 CRLF。
+- 审批只有一个可擦除的选择器，文件预览按完整文件生成全局 diff，与执行共用匹配函数；初始 Enter 保持暂停。已复现并修复 Backspace 重置到允许项的问题。长预览可滚动，快捷键说明完整换行，数字退化入口可确认规则。文件菜单不显示 Shell 提示。
+- 每轮任务、临时模型/执行进度、工具结果、控制消息和最终回答分层；提议工具在审批前不显示为正在执行。`/status` / `/permissions` 只查询，不重新弹审批。`/help` 列常用入口，脚本审批、兼容与实验入口留在 `/help advanced`；授权列表显示目标与范围，不倾倒原操作 JSON。
+- 最终冻结完整单测 760 passed、12 skipped、0 failed（381.42 秒）；菜单 / 资源授权组合 59 passed，包含两个 Backspace 和两个错误参数类型回归，以及三个真实循环 UI 分类用例。CLI 输入 / LoopController integration 37 passed。Windows Python 3.14.3，无真实模型调用。Linux/POSIX 与人工 Windows 终端视觉体验尚未实测。
+- 原来的四项失败根因记录保留在下方历史和 Evolution；本轮未修改 oracle。源码/整体工作区摘要仍严格校验，Shell 没有沙箱；旧未完成 Run 因源码变化可能不能恢复，不能借资源规则复活失效审批。
+
+本轮决策与详细证据见 `docs/evolution/cli_command_boundary.md` 和 `docs/evolution/tool_registry.md` 同日期的新增记录；Commit 为 PENDING，等待用户后续提交后回填。
+
+## 2026-10-11 当前现场：日常会话与审批体验整理（未提交）
+
+分支 `codex/fix-provider-config-discovery`，HEAD / 本地 main 基线 `5f41f1d09806ed8a4c387bd80b47a07adaa45609`；保留前轮配置、会话和审批菜单的未提交修改，在当前 Worktree 继续用户已批准的体验方案。未提交、合并或推送，未修改其他 Worktree 或评测 oracle。
+
+- CLI 默认审批 / SQLite，`mini-claude` 当前目录新会话，`--continue` 最近活动会话，`--resume` 可搜索的 ↑↓/Enter/Esc 选择器。Conversation 包含多个 Run，只维护 head 索引，消息仍以 head Run Snapshot 为准；旧无会话身份的记录继续 /runs 查看。会话独占与 head 核对阻挡跨进程旧上下文覆盖。
+- 真实终端审批展示片段 diff / 完整命令。允许一次、进程精确规则、工作区精确规则、拒绝并结束、替代意见后重新规划；规则额外确认且可撤销，不是 Shell 前缀放行。Runtime 消费一次性批准的原事务不变，用户意见同事务持久化。
+- 默认策略核实内置 Todo / Note 与少量字面量 Shell 查询后允许；写入、测试、构建、git 和未知风险仍 ASK，硬拒绝不能绕过。不支持持久恢复的后台/SubAgent 在 schema 与 dispatch 都阻挡。UNKNOWN / INVALIDATED 可记录人工处理原因并归档，保留执行事实、阻断旧操作；不核销 UNKNOWN 或自动重试。
+- SQLite v1–v3 自动事务升级为 v4。数据目录改为 LOCALAPPDATA / XDG 用户目录，旧 D 盘数据库需 `--checkpoint-db` 显式定位，不自动移动。配置可用用户文件或 MINI_CLAUDE_CONFIG，不再仅依赖当前工作目录；缺失所选环境变量报错，不切换 Provider。
+- 最终冻结完整 tests/unit：723 passed、12 skipped、0 failed；CLI 输入 / LoopController integration 37 passed。前两次完整无失败复跑为 719 / 720 passed，最终包含末次归档目标与参数类型修复。历史四项根因与旧失败记录保留：补齐 Provider fixture 配置、同步 read_file 分页描述，不删断言；Node/Java oracle 原字节与 HEAD 一致，.gitattributes 保证未来 LF checkout。不调用付费模型。
+- 添加 Windows/Linux、Python 3.10/3.14 CI；本地实际是 Windows Python 3.14.3。该解释器缺少 prompt-toolkit，已安装项目声明依赖补齐键盘实测。Linux/POSIX 本轮尚未实测，不能把 CI 配置存在当成通过。
+- 源码指纹与整体 Workspace 摘要严格恢复门槛仍保留；操作级前置条件、沙箱、UNKNOWN 补偿和更宽 Shell 查询白名单留作独立任务。本轮没有继续增加通用状态机。
+
+长期设计、证据与取舍以 `docs/evolution/cli_command_boundary.md`、`docs/evolution/tool_registry.md` 本日期的新增阶段记录为准，两处 Commit 标记 PENDING 等用户后续提交后回填。
+
+## 2026-10-11 配置加载修复（未提交）
+
+此前真实 TTY 新增单次审批卡片；本轮已经扩展为上面的规则和反馈语义。ID 命令保留用于诊断、管道和跨进程定位，原 SQLite 审批消费协议不变。
+
+此前已修复目标项目启动时丢失配置、静默切到 DeepSeek 官方的问题；本轮增加用户配置优先级和所选 Provider 环境变量校验。原回归保留，不修改密钥，不发起真实模型请求。
+
 ## 2026-10-11 当前现场：第七阶段 C 本地 HITL CLI
 
 - 基线 main 为 `f0de996d71e28922edffd29471216eb7aa30844e`，已包含 7B 功能 `f069085` 和文档 `f0de996`。独立分支 `codex/hitl-cli-interaction`；Worktree `D:\02_study\code\AgentProject\mini-claude-worktrees\hitl-cli-interaction`。功能提交为 `342a5232611a1db268f2351ef5f4d48dc1ee6676`；用户已授权仅 fast-forward 整合至本地 main，不推送、不删除 Worktree。

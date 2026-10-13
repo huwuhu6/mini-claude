@@ -68,6 +68,7 @@ entrypoint.main(args)
 a, provider = created[-1]
 state = a._run_state
 print('CLI_REPORT=' + json.dumps({'pid': os.getpid(), 'executions': a.executions,
+    'conversation_id': getattr(a, '_conversation_id', None),
     'requests': len(provider.requests), 'run_id': state.run_id if state else None,
     'status': state.status.value if state else None,
     'messages': [{'role': m.role, 'id': m.tool_call_id, 'content': m.content} for m in a.messages],

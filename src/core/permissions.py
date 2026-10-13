@@ -13,7 +13,10 @@ from pathlib import Path
 from core.run_snapshot import call_ids, fields, json_copy, require
 from core.tools.base_tools import BaseTools
 
-POLICY_VERSION = "main-conservative-v1"
+POLICY_VERSION = "main-standard-v2"
+# Old records remain readable for inspection/archival; fresh bind/evaluate
+# always use the current version, so this does not revive old approvals.
+READABLE_POLICY_VERSIONS = {"main-conservative-v1", POLICY_VERSION}
 
 
 def canonical(data):
@@ -22,6 +25,18 @@ def canonical(data):
 
 def digest(data):
     return hashlib.sha256(canonical(data).encode("utf-8")).hexdigest()
+
+
+def tool_contract(spec):
+    if spec is None:
+        return {"unregistered": True}
+    try:
+        source = getsource(spec.handler)
+    except (TypeError, OSError):
+        source = "opaque"
+    return {"schema": spec.input_schema,
+            "handler": f"{getattr(spec.handler, '__module__', 'opaque')}.{getattr(spec.handler, '__qualname__', 'opaque')}",
+            "source_hash": hashlib.sha256(source.encode("utf-8")).hexdigest()}
 
 
 class PermissionKind(str, Enum):
@@ -51,7 +66,7 @@ class ToolOperation:
             require(type(path) is str and Path(path).is_absolute() and str(Path(path).resolve()) == path, "工作区 / cwd 必须为规范绝对路径")
         context = json.loads(self.context_json)
         fields(context, {"policy_version", "workspace_digest", "tool_contract", "safety_digest", "runtime_digest"}, "审批上下文")
-        require(context["policy_version"] == POLICY_VERSION and type(context["tool_contract"]) is dict, "策略上下文不兼容")
+        require(context["policy_version"] in READABLE_POLICY_VERSIONS and type(context["tool_contract"]) is dict, "策略上下文不兼容")
         for key in ("workspace_digest", "safety_digest", "runtime_digest"):
             require(type(context[key]) is str and len(context[key]) == 64 and all(c in "0123456789abcdef" for c in context[key]), "上下文摘要无效")
         require(self.context_json == canonical(context), "审批上下文必须为规范 JSON")
@@ -108,7 +123,7 @@ class PermissionDecision:
     def __post_init__(self):
         require(isinstance(self.kind, PermissionKind) and isinstance(self.operation, ToolOperation), "权限决策类型无效")
         require(type(self.rule_id) is str and bool(self.rule_id) and type(self.reason) is str and bool(self.reason), "决策缺少审计说明")
-        require(self.policy_version == POLICY_VERSION, "策略版本不兼容")
+        require(self.policy_version in READABLE_POLICY_VERSIONS, "策略版本不兼容")
 
     def to_dict(self):
         return {"kind": self.kind.value, "operation": self.operation.to_dict(), "rule_id": self.rule_id,
@@ -132,6 +147,9 @@ class DefaultPermissionPolicy:
         self.command_policy, self.cwd = command_policy, cwd
         self.workspace_digest = None
         self.runtime_digest = None
+        self.mode_check = lambda name, args: None
+        self._internal = {}
+        self._shell_handler = None
         self._readers = {name: getattr(BaseTools, name) for name in
                          ("read_file", "search_code", "count_occurrences", "list_files")}
 
@@ -142,23 +160,20 @@ class DefaultPermissionPolicy:
                      agent.command_policy, lambda: agent.runtime_context.cwd)
         policy.workspace_digest = agent.workspace_state_guard.content_digest
         policy.runtime_digest = lambda: digest(agent._snapshot_compatibility())
+        policy.mode_check = agent._mode_capability_error
         if type(agent) is MiniClaudeAgent:
             policy._readers.update({name: getattr(MiniClaudeAgent, "_handle_" + name) for name in
                 ("read_file", "search_code", "count_occurrences", "list_files", "get_background_status")})
-        # get_background_logs may spill formatted output; health_check uses network.
-        # Todo, Note, skills, grants, process control and custom tools stay ASK.
+            policy._internal = {"TodoWrite": MiniClaudeAgent._handle_todo_write,
+                                "update_agent_note": MiniClaudeAgent._handle_update_agent_note}
+            policy._shell_handler = MiniClaudeAgent._handle_bash
+        # Note is runtime-local data; it cannot grant paths or execute commands.
+        # Skills, path grants, process control and unknown/custom handlers stay ASK.
         return policy
 
     def bind(self, run_id, turn, ordinal, call, *, workspace_digest, runtime_digest):
         spec = self.registry.get_spec(call["function"]["name"])
-        contract = {"unregistered": True}
-        if spec is not None:
-            try:
-                source = getsource(spec.handler)
-            except (TypeError, OSError):
-                source = "opaque"
-            contract = {"schema": spec.input_schema, "handler": f"{getattr(spec.handler, '__module__', 'opaque')}.{getattr(spec.handler, '__qualname__', 'opaque')}",
-                        "source_hash": hashlib.sha256(source.encode("utf-8")).hexdigest()}
+        contract = tool_contract(spec)
         rules = {key: [[p.pattern, int(p.flags)] for p in getattr(self.command_policy, key)] for key in
                  ("HIGH_RISK_EXECUTORS", "DESTRUCTIVE", "PIPE_BOMB", "POWERSHELL_BYPASS")}
         rules["BACKGROUND"] = [self.command_policy.BACKGROUND.pattern, int(self.command_policy.BACKGROUND.flags)]
@@ -179,6 +194,9 @@ class DefaultPermissionPolicy:
             return decision(PermissionKind.DENY, "tool.unregistered", "工具未注册，审批不能创建执行能力")
         if not self.features.is_tool_enabled(operation.tool_name):
             return decision(PermissionKind.DENY, "feature.disabled", "当前功能已禁用，审批不能绕过能力边界")
+        mode_error = self.mode_check(operation.tool_name, operation.arguments)
+        if mode_error:
+            return decision(PermissionKind.DENY, "runtime.unsupported", mode_error)
         args = operation.arguments
         opaque = False
         try:
@@ -215,7 +233,20 @@ class DefaultPermissionPolicy:
         if current != operation:
             return decision(PermissionKind.DENY, "context.changed", "工作区、cwd、工具实现或有效策略发生变化，旧授权不可复用")
         handler = getattr(spec.handler, "__func__", spec.handler)
+        if not opaque and handler is self._internal.get(operation.tool_name):
+            return decision(PermissionKind.ALLOW, "audited.internal_state", "已核实的 Runtime 内部计划或笔记更新")
+        if operation.tool_name == "bash" and handler is self._shell_handler:
+            command = args["command"].strip()
+            # No shell parser: only tiny literal builtin queries. Metacharacters,
+            # substitutions, wrappers, git, tests and builds still require ASK.
+            if (command == ("cd" if sys.platform == "win32" else "pwd")
+                    or re.fullmatch(r"echo(?: [A-Za-z0-9 ./_-]{0,160})?", command)):
+                return decision(PermissionKind.ALLOW, "audited.shell_query", "已核实的不含扩展或复合语法的内置查询")
         if not opaque and handler is self._readers.get(operation.tool_name):
+            if operation.tool_name == "read_file":
+                filename = Path(args["path"]).name.lower()
+                if filename in {".env", "id_rsa", "id_ed25519", "credentials"} or (filename.startswith(".env.") and filename != ".env.example"):
+                    return decision(PermissionKind.ASK, "file.sensitive", "文件可能包含凭据，需要明确确认读取")
             if any(any(c in p for c in "*?[") for p in (args.get("paths") or [])):
                 return decision(PermissionKind.ASK, "paths.dynamic", "通配符目标需执行时逐项授权校验")
             return decision(PermissionKind.ALLOW, "audited.read_only", "已核实的内置只读操作")

@@ -66,7 +66,7 @@ def test_schema_and_snapshot_roundtrip(ready):
         assert connection.execute("PRAGMA synchronous").fetchone()[0] == 2
 
 
-@pytest.mark.parametrize("version", [4, 999])
+@pytest.mark.parametrize("version", [DB_VERSION + 1, 999])
 def test_incompatible_schema_refused(tmp_path, version):
     path = tmp_path / "db"
     with sqlite3.connect(path) as connection:
@@ -167,7 +167,8 @@ def test_same_run_lock_is_exclusive_across_stores_and_real_process(ready):
     with pytest.raises(RunBusyError):
         other.acquire("run-1")
     script = "from core.checkpoint_store import *; from pathlib import Path; import sys; s=SqliteCheckpointStore(Path(sys.argv[1])); s.acquire('run-1')"
-    child = subprocess.run([sys.executable, "-B", "-c", script, str(store.path)], capture_output=True, text=True, timeout=20)
+    child = subprocess.run([sys.executable, "-B", "-c", script, str(store.path)], capture_output=True, text=True, timeout=20,
+                           env={**os.environ, 'PYTHONPATH': str(Path(__file__).resolve().parents[2] / 'src')})
     assert child.returncode != 0 and "RunBusyError" in child.stderr
     store.release("run-1")
     other.acquire("run-1")
@@ -177,7 +178,8 @@ def test_same_run_lock_is_exclusive_across_stores_and_real_process(ready):
 def test_kernel_releases_lock_when_process_dies(tmp_path):
     path = tmp_path / "db"
     script = "from core.checkpoint_store import *; from pathlib import Path; import os,sys; s=SqliteCheckpointStore(Path(sys.argv[1])); s.acquire('run-1'); s.create_run('run-1'); os._exit(19)"
-    child = subprocess.run([sys.executable, "-B", "-c", script, str(path)], capture_output=True, text=True, timeout=20)
+    child = subprocess.run([sys.executable, "-B", "-c", script, str(path)], capture_output=True, text=True, timeout=20,
+                           env={**os.environ, 'PYTHONPATH': str(Path(__file__).resolve().parents[2] / 'src')})
     assert child.returncode == 19, child.stderr
     store = SqliteCheckpointStore(path)
     store.acquire("run-1")
