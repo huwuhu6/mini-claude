@@ -16,7 +16,7 @@ from core.run_snapshot import (BOUND_SNAPSHOT_VERSIONS, HITL_SNAPSHOT_VERSIONS,
     decode_tool_result, same_tool_result, fields, json_copy, require, call_ids, PAUSED_RESULT_OUTCOMES)
 from core.tool_outcome import validate_non_execution
 
-DB_VERSION = 4
+DB_VERSION = 5
 TERMINAL = {"completed", "terminated", "failed", "cancelled", "unknown"}
 
 
@@ -93,7 +93,7 @@ class SqliteCheckpointStore:
                 version = connection.execute("PRAGMA user_version").fetchone()[0]
                 if require_existing and version == 0:
                     raise CheckpointError("已有文件缺少 Checkpoint Schema；不能在恢复时初始化空库")
-                if version not in {0, 1, 2, 3, DB_VERSION}:
+                if version not in {0, 1, 2, 3, 4, DB_VERSION}:
                     raise CheckpointError(f"Checkpoint 数据库版本不兼容: {version}")
                 tables = connection.execute("SELECT name FROM sqlite_master WHERE type='table'").fetchall()
                 if version == 0 and tables:
@@ -129,6 +129,14 @@ class SqliteCheckpointStore:
                     self._upgrade_waiting(connection)
                 if version < 4:
                     self._upgrade_conversations(connection)
+                if version < 5:
+                    connection.execute("""CREATE TABLE IF NOT EXISTS call_file_evidence (
+                        run_id TEXT NOT NULL, turn INTEGER NOT NULL, ordinal INTEGER NOT NULL,
+                        call_id TEXT NOT NULL, call_hash TEXT NOT NULL,
+                        evidence_json TEXT NOT NULL, evidence_hash TEXT NOT NULL,
+                        PRIMARY KEY(run_id,turn,ordinal),
+                        FOREIGN KEY(run_id,turn,ordinal) REFERENCES calls(run_id,turn,ordinal))""")
+                    connection.execute("PRAGMA user_version=5")
                 if connection.execute("PRAGMA foreign_key_check").fetchone() is not None:
                     raise CheckpointError("Checkpoint 外键关系损坏")
                 from core.approvals import APPROVAL_COLUMNS
@@ -140,6 +148,7 @@ class SqliteCheckpointStore:
                     "run_archives": {"run_id", "archived_at", "reason"},
                     "permission_grants": {"grant_id", "workspace", "fingerprint", "operation_json", "created_at"},
                     "approval_feedback": {"approval_id", "mode", "note"},
+                    "call_file_evidence": {"run_id", "turn", "ordinal", "call_id", "call_hash", "evidence_json", "evidence_hash"},
                 }.items():
                     if {r[1] for r in connection.execute("PRAGMA table_info(" + table + ")")} != columns:
                         raise CheckpointError("会话数据库结构损坏或不兼容")
@@ -426,6 +435,21 @@ class SqliteCheckpointStore:
                         (run_id, batch.model_iteration, ordinal, call["id"], call_json))
                     existing = {"state": "PREPARED", "result_json": None, "call_json": call_json}
                 require(existing["call_json"] == call_json, "Journal 调用与 Snapshot 冲突")
+                target = snapshot.get("workspace", {}).get("file_targets", {}).get(call["id"])
+                if existing["state"] == "PREPARED" and target is not None:
+                    # Refresh only while unstarted (e.g. after a preceding file
+                    # edit). RUNNING/UNKNOWN evidence is immutable thereafter.
+                    before = {k: v for k, v in target.items() if k not in {"expected_sha256", "verification_reason"}}
+                    evidence = self._json({"version": 1, "before": before,
+                        "expected_sha256": target.get("expected_sha256"),
+                        "reason": target.get("verification_reason", "旧观察缺少预期内容"),
+                        "tool_contract": snapshot["compatibility"].get("tools", {}).get(call["function"]["name"])})
+                    connection.execute("""INSERT INTO call_file_evidence VALUES(?,?,?,?,?,?,?)
+                        ON CONFLICT(run_id,turn,ordinal) DO UPDATE SET
+                        evidence_json=excluded.evidence_json,evidence_hash=excluded.evidence_hash""",
+                        (run_id, batch.model_iteration, ordinal, call["id"],
+                         hashlib.sha256(call_json.encode("utf-8")).hexdigest(), evidence,
+                         hashlib.sha256(evidence.encode("utf-8")).hexdigest()))
                 result = batch.results.get(call["id"])
                 if result is not None:
                     raw = snapshot["run"]["tool_batch"]["results"][call["id"]]
@@ -487,8 +511,23 @@ class SqliteCheckpointStore:
             result = dict(row)
             journal = [dict(r) for r in connection.execute("SELECT * FROM calls WHERE run_id=? ORDER BY turn,ordinal", (run_id,))]
             approval_rows = {r["approval_id"]: dict(r) for r in connection.execute("SELECT * FROM approvals WHERE run_id=?", (run_id,))}
+            file_evidence = [dict(r) for r in connection.execute(
+                "SELECT * FROM call_file_evidence WHERE run_id=? ORDER BY turn,ordinal", (run_id,))]
         try:
             require(hashlib.sha256(self._json(journal).encode("utf-8")).hexdigest() == result["journal_hash"], "执行日志校验摘要不符")
+            journal_by_position = {(item["turn"], item["ordinal"]): item for item in journal}
+            for entry in file_evidence:
+                call = journal_by_position.get((entry["turn"], entry["ordinal"]))
+                require(call is not None and call["call_id"] == entry["call_id"] and
+                    hashlib.sha256(call["call_json"].encode("utf-8")).hexdigest() == entry["call_hash"], "文件核验证据调用归属冲突")
+                require(hashlib.sha256(entry["evidence_json"].encode("utf-8")).hexdigest() == entry["evidence_hash"], "文件核验证据摘要不符")
+                evidence = json.loads(entry["evidence_json"])
+                fields(evidence, {"version", "before", "expected_sha256", "reason", "tool_contract"}, "文件核验证据")
+                require(evidence["version"] == 1 and type(evidence["before"]) is dict and
+                    type(evidence["reason"]) is str, "文件核验证据格式错误")
+                expected = evidence["expected_sha256"]
+                require(expected is None or (type(expected) is str and len(expected) == 64 and
+                    all(c in "0123456789abcdef" for c in expected)), "文件预期摘要格式错误")
             snapshot = json.loads(result["payload"]) if result["payload"] else None
             if snapshot is not None:
                 require(hashlib.sha256((result["boundary"] + "\n" + result["payload"]).encode("utf-8")).hexdigest() == result["payload_hash"], "快照校验摘要不符")
@@ -561,6 +600,7 @@ class SqliteCheckpointStore:
             raise CheckpointError(f"Checkpoint 数据损坏: {exc}") from exc
         result["snapshot"] = snapshot
         result["journal"] = journal
+        result["file_evidence"] = file_evidence
         return result
 
     def recover(self, run_id):

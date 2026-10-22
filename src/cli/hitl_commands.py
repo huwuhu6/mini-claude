@@ -21,6 +21,16 @@ def describe_run(agent, run_id):
             if call['state'] == 'UNKNOWN':
                 lines += [f"不确定调用: {safe_text(call.get('tool_name', '工具'))} · {safe_text(call['call_id'])}",
                           "原操作（仅供核验，不执行）: " + json.dumps(redact(call.get('arguments', {})), ensure_ascii=False)]
+                evidence = call.get('file_evidence')
+                if evidence:
+                    labels = {'POSTCONDITION_SATISFIED': '当前后置条件已满足',
+                              'PRECONDITION_MATCH': '当前内容与执行前相同',
+                              'CONFLICT': '当前内容冲突', 'UNVERIFIABLE': '无法判断'}
+                    lines.append('文件核验证据：' + labels[evidence['classification']] +
+                                 '；仅描述当前状态，原 UNKNOWN 保留，不授权重试。')
+                    lines.append('证据摘要：' + json.dumps(redact({
+                        'before': evidence['before'], 'expected_sha256': evidence['expected_sha256'],
+                        'current': evidence['current']}), ensure_ascii=False))
     elif any(c['state'] == 'RUNNING' for c in info['calls']):
         lines.append("存在 RUNNING 调用，可能有其他执行者；Runtime 恢复会检查独占锁及未知副作用。")
     current = next((a for a in info['approvals'] if a.approval_id == info['approval_id']), None)

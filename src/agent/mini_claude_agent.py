@@ -585,7 +585,13 @@ class MiniClaudeAgent:
 
     def _pending_file_targets(self, batch):
         from core.runtime_context.file_checkpoint import pending_file_targets
-        return pending_file_targets(batch, self.tools)
+        trusted = {}
+        for name in ("write_file", "edit_file"):
+            spec = self.tool_registry.get_spec(name)
+            handler = getattr(spec.handler, "__func__", None) if spec else None
+            trusted[name] = (handler is getattr(MiniClaudeAgent, "_handle_" + name)
+                and getattr(getattr(self.tools, name), "__func__", None) is getattr(BaseTools, name))
+        return pending_file_targets(batch, self.tools, trusted)
 
     def restore_run_snapshot(self, snapshot: dict, *, _checkpoint_boundary: str | None = None, _refresh_waiting: bool = False) -> None:
         """Install validated detached state; caller explicitly continues the paused Run."""
@@ -915,7 +921,9 @@ class MiniClaudeAgent:
                 execution = {"result": "UNKNOWN", "effect": "UNCERTAIN"}
             calls.append({"call_id": call["call_id"], "state": call["state"],
                           "tool_name": function["name"], "arguments": arguments,
-                          "execution": execution})
+                          "execution": execution,
+                          "file_evidence": (self.get_file_recovery_evidence(run_id, call["call_id"], turn=call["turn"])
+                              if call["state"] == "UNKNOWN" and function["name"] in {"write_file", "edit_file"} else None)})
         return {"run_id": run_id, "status": record["status"], "checked_at": self._approval_store.clock(),
             "conversation_id": self._checkpoint_store.conversation_for_run(run_id),
             "archive": self._checkpoint_store.archive_info(run_id),
@@ -927,6 +935,49 @@ class MiniClaudeAgent:
             "approval_id": snapshot["run"].get("approval_id") if snapshot else None,
             "approvals": self._approval_store.list_for_run(run_id)}
 
+    def get_file_recovery_evidence(self, run_id, call_id, *, turn=None):
+        """Observe an UNKNOWN file operation without modifying its durable facts."""
+        from core.runtime_context.file_checkpoint import file_fingerprint, classify_file_observation
+        store = self._checkpoint_store
+        result = {"run_id": run_id, "call_id": call_id, "classification": "UNVERIFIABLE",
+                  "before": None, "expected_sha256": None, "current": None}
+        if store.holds_lock(run_id):
+            return result  # Do not inspect a potentially active handler in this thread.
+        try:
+            store.acquire(run_id)
+        except CheckpointError:
+            return result
+        try:
+            record = store.load(run_id)
+            snapshot = record["snapshot"]
+            if snapshot is None or snapshot["workspace"]["root"] != str(self.workdir.resolve()):
+                return result
+            matches = [row for row in record["journal"] if row["call_id"] == call_id and
+                       (turn is None or row["turn"] == turn)]
+            if len(matches) != 1 or matches[0]["state"] != "UNKNOWN":
+                return result
+            call = matches[0]
+            entry = next((entry for entry in record["file_evidence"] if
+                (entry["turn"], entry["ordinal"]) == (call["turn"], call["ordinal"])), None)
+            if entry is None:
+                return result
+            prepared = json.loads(entry["evidence_json"])
+            result.update(before=prepared["before"], expected_sha256=prepared["expected_sha256"],
+                          turn=call["turn"], ordinal=call["ordinal"])
+            try:
+                function = json.loads(call["call_json"])["function"]
+                args = json.loads(function["arguments"])
+                path = self.tools.safe_path(args["path"])
+                if str(path) != prepared["before"]["path"]:
+                    return result
+                current = file_fingerprint(path)
+            except (ValueError, TypeError, KeyError, OSError):
+                return result
+            result["current"] = current
+            result["classification"] = classify_file_observation(prepared, current)
+            return result
+        finally:
+            store.release(run_id)
 
     def list_checkpoint_runs(self):
         if not getattr(self, "_hitl_enabled", False):

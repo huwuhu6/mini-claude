@@ -29,7 +29,7 @@ def file_fingerprint(path: Path) -> dict:
         return {**result, "kind": "unavailable"}
 
 
-def pending_file_targets(batch, tools) -> dict:
+def pending_file_targets(batch, tools, trusted=None) -> dict:
     if batch is None:
         return {}
     import json
@@ -46,8 +46,38 @@ def pending_file_targets(batch, tools) -> dict:
         except (ValueError, TypeError, OSError):
             continue  # Never read a path outside the current authority.
         observation = file_fingerprint(path)
-        targets[call["id"]] = observation
+        expected, reason = None, "工具实现没有受支持的文件核验协议"
+        if trusted and trusted.get(function["name"]):
+            try:
+                if function["name"] == "write_file" and type(args.get("content")) is str:
+                    # Match open(..., newline=None), including Windows translation.
+                    payload = args["content"].replace("\n", os.linesep).encode("utf-8")
+                elif function["name"] == "edit_file" and observation["kind"] == "file":
+                    from core.tools.file_edits import prepare_file_edits
+                    original = path.read_bytes()
+                    if hashlib.sha256(original).hexdigest() != observation["sha256"]:
+                        raise ValueError("读取期间目标变化")
+                    content, _ = prepare_file_edits(original.decode("utf-8"), args["edits"])
+                    payload = content.encode("utf-8")
+                else:
+                    raise ValueError("参数或目标不满足文件核验协议")
+                expected, reason = hashlib.sha256(payload).hexdigest(), ""
+            except (ValueError, TypeError, KeyError, OSError, AttributeError):
+                reason = "无法可靠计算文件预期内容"
+        targets[call["id"]] = {**observation, "expected_sha256": expected, "verification_reason": reason}
     return targets
+
+
+def classify_file_observation(prepared, current):
+    """Only classify present content. Never infer execution or retry permission."""
+    before, expected = prepared["before"], prepared["expected_sha256"]
+    if expected is None or current["kind"] not in {"file", "missing"} or current["path"] != before["path"]:
+        return "UNVERIFIABLE"
+    if current.get("sha256") == expected:
+        return "POSTCONDITION_SATISFIED"
+    if current["kind"] == before["kind"] and current.get("sha256") == before.get("sha256"):
+        return "PRECONDITION_MATCH"
+    return "CONFLICT"
 
 
 def require_resumable_scope(batch) -> None:
