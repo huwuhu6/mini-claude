@@ -116,7 +116,9 @@ def test_definite_handler_failure_is_completed_not_unknown(agents):
     a, ap = agents([{"tool_calls": calls("A", "B")}, {}], pause_after=None)
     def fail(label):
         a.executions.append(label)
-        return ToolResult("definite failure", success=False, execution_success=False)
+        # A definite business failure with a declared completed effect is distinct
+        # from legacy bool-only failure, whose side effects are now uncertain.
+        return ToolResult("definite failure", success=False, execution_success=False, effect="APPLIED")
     a.tool_registry._tools["probe"].handler = fail
     a.enable_checkpoints()
     a.run("task")

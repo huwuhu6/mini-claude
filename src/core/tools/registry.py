@@ -9,6 +9,10 @@ from typing import Any, Callable, Dict, List
 class ToolArgumentBindingError(TypeError):
     """Arguments rejected before entering a registered handler."""
 
+    def __init__(self, message, *, registry=None):
+        super().__init__(message)
+        self.registry = registry
+
 
 @dataclass
 class ToolSpec:
@@ -64,7 +68,7 @@ class ToolRegistry:
     def has_handler(self, name: str) -> bool:
         return name in self._tools
 
-    def execute(self, name: str, args: dict) -> Any:
+    def execute(self, name: str, args: dict, *, on_enter: Callable[[], None] | None = None) -> Any:
         try:
             spec = self._tools[name]
         except KeyError:
@@ -79,5 +83,7 @@ class ToolRegistry:
             try:
                 handler_signature.bind(**args)
             except TypeError as exc:
-                raise ToolArgumentBindingError(str(exc)) from exc
+                raise ToolArgumentBindingError(str(exc), registry=self) from exc
+        if on_enter is not None:
+            on_enter()
         return spec.handler(**args)

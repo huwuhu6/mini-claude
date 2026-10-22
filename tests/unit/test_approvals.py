@@ -177,7 +177,10 @@ def test_existing_execution_facts_cannot_be_authorized_again(ready, state):
         elif state == "COMPLETED":
             store.save_snapshot("run-1", revision, completed(data))
     else:
-        store.save_snapshot("run-1", current(store), completed(data, "INVALID_ARGUMENTS"))
+        rejected = completed(data, "INVALID_ARGUMENTS")
+        rejected["run"]["tool_batch"]["results"]["id-0"].update(
+            result="FAILED", effect="NONE", non_execution_reason="ARGUMENTS_REJECTED")
+        store.save_snapshot("run-1", current(store), rejected)
     before = store.load("run-1")
     with pytest.raises(CheckpointError):
         approvals.create(decision, current(store))

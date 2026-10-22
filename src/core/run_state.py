@@ -41,6 +41,31 @@ class ToolCallResultState:
     call_id: str
     outcome: str
     content: str
+    result: str | None = None
+    effect: str | None = None
+    non_execution_reason: str | None = None
+
+    def __post_init__(self):
+        from core.tool_outcome import legacy_facts, validate_facts, validate_non_execution
+        if self.result is None:
+            object.__setattr__(self, "result", legacy_facts(self.outcome)[0])
+        if self.effect is None:
+            object.__setattr__(self, "effect", "UNCERTAIN")
+        validate_facts(self.result, self.effect)
+        if self.effect == "NONE":
+            validate_non_execution(self.outcome, self.non_execution_reason)
+        elif self.non_execution_reason is not None:
+            raise ValueError("未执行原因码只能用于 NONE")
+        if self.outcome in {"UNKNOWN", "CANCELLED"} and (self.effect == "NONE" or self.result == "SUCCESS"):
+            raise ValueError("未知执行事实不能降级为已成功或未启动")
+        if self.outcome in {"EXECUTED_SUCCESS", "EXECUTED_FAILURE", "RECORDED_BEFORE_TERMINAL"} and self.effect == "NONE":
+            raise ValueError("handler 已启动，不能记录 NONE")
+        if self.outcome == "EXECUTED_SUCCESS" and self.result != "SUCCESS":
+            raise ValueError("执行结果与 SUCCESS 冲突")
+        if self.outcome == "EXECUTED_FAILURE" and self.result != "FAILED":
+            raise ValueError("执行结果与 FAILED 冲突")
+        if self.outcome not in {"EXECUTED_SUCCESS", "EXECUTED_FAILURE", "RECORDED_BEFORE_TERMINAL", "UNKNOWN", "CANCELLED"} and (self.result != "FAILED" or self.effect not in {"NONE", "UNCERTAIN"}):
+            raise ValueError("未执行记录不能声明执行效果")
 
 
 @dataclass
@@ -86,6 +111,9 @@ class ToolBatchState:
         content: str,
         *,
         pause_requested: bool = False,
+        result: str | None = None,
+        effect: str | None = None,
+        non_execution_reason: str | None = None,
     ) -> ToolBatchAdvance:
         if self.status is not ToolBatchStatus.RUNNING:
             raise RuntimeError(f"工具批次当前不可推进: {self.status.value}")
@@ -101,7 +129,7 @@ class ToolBatchState:
         if call_id in self.results:
             raise RuntimeError(f"Tool Call {call_id} 已有结果，拒绝重复记录")
 
-        self.results[call_id] = ToolCallResultState(call_id, outcome, content)
+        self.results[call_id] = ToolCallResultState(call_id, outcome, content, result, effect, non_execution_reason)
         self.resolved_call_ids.add(call_id)
         self.next_call_index += 1
 
@@ -167,6 +195,8 @@ class RunState:
         call_id: str,
         outcome: str,
         content: str,
+        *, result: str | None = None, effect: str | None = None,
+        non_execution_reason: str | None = None,
     ) -> ToolBatchAdvance:
         if self.status is not RunStatus.RUNNING or self.tool_batch is None:
             raise RuntimeError("当前运行没有可推进的工具批次")
@@ -175,6 +205,7 @@ class RunState:
             outcome,
             content,
             pause_requested=self.pause_requested,
+            result=result, effect=effect, non_execution_reason=non_execution_reason,
         )
         # The first completed call consumes the import boundary. Later tool writes
         # are ordinary run effects and must not be compared to the old workspace.

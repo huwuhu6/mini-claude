@@ -158,9 +158,9 @@ class ApprovalStore:
 
     def request_wait(self, decision, revision, snapshot, *, expires_at=None):
         """One lock/transaction publishes request and its WAITING projection."""
-        from core.run_snapshot import json_copy, HITL_SNAPSHOT_VERSION
+        from core.run_snapshot import json_copy, HITL_SNAPSHOT_VERSIONS
         data = json_copy(snapshot)
-        require(data["schema_version"] == HITL_SNAPSHOT_VERSION and data["run"]["status"] == "waiting_approval", "等待投影契约错误")
+        require(data["schema_version"] in HITL_SNAPSHOT_VERSIONS and data["run"]["status"] == "waiting_approval", "等待投影契约错误")
         op = decision.operation
         def operation(connection, token):
             approval = self.create(decision, revision, expires_at=expires_at, _transaction=(connection, token))

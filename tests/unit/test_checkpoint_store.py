@@ -191,6 +191,8 @@ def test_terminal_projection_has_same_results_messages_cursor_as_journal(ready):
     store, revision, data = ready
     revision = store.mark_running("run-1", revision, 0, 0, "id-0")
     final = completed(completed(data), "NOT_EXECUTED")
+    final["run"]["tool_batch"]["results"]["id-1"].update(
+        result="FAILED", effect="NONE", non_execution_reason="BATCH_ABORTED")
     final["run"].update(status="terminated", terminal_result="stop")
     final["run"]["tool_batch"].update(status="terminated", finalized=True)
     store.finish("run-1", revision, "terminated", "stop", final)

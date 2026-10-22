@@ -72,10 +72,20 @@ class ToolResult:
     cancelled: bool = False
     segment_exit_codes: Optional[List[int]] = None
     output_visibility: Dict[str, Any] = field(default_factory=dict)
+    result: Optional[str] = None
+    effect: str = "UNCERTAIN"
 
     def __post_init__(self) -> None:
+        from core.tool_outcome import validate_facts
         if self.execution_success is None:
             self.execution_success = self.success
+        if self.timed_out or self.cancelled:
+            self.result, self.effect = "UNKNOWN", "UNCERTAIN"
+        elif self.result is None:
+            self.result = "SUCCESS" if self.execution_success else "FAILED"
+        validate_facts(self.result, self.effect)
+        if self.result != "SUCCESS":
+            self.success = self.execution_success = False
         if self.segment_exit_codes is None:
             self.segment_exit_codes = []
 
@@ -568,7 +578,7 @@ class BaseTools:
 
             logger.info(f"已写入 {len(content)} 字节到 {path}")
 
-            return ToolResult(f"成功写入 {len(content)} 字节到 {path}")
+            return ToolResult(f"成功写入 {len(content)} 字节到 {path}", effect="APPLIED")
 
         except Exception as e:
             logger.error(f"写入文件 {path} 出错: {e}")
@@ -647,7 +657,7 @@ class BaseTools:
             result = '\n'.join(summary_lines)
 
             logger.info(f"编辑成功: {path} ({len(edits)} 处修改)")
-            return ToolResult(result)
+            return ToolResult(result, effect="APPLIED")
 
         except EditPreparationError as e:
             return ToolResult(str(e), success=False)

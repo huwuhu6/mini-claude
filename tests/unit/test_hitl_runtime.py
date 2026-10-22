@@ -521,9 +521,10 @@ def test_approved_handler_cancel_and_exception_keep_execution_facts(agents, term
     b.decide_approval(a._run_state.run_id, approval.approval_id, approved=True, actor="tester")
     b.resume_checkpoint(a._run_state.run_id)
     row = b._checkpoint_store.load(a._run_state.run_id)
-    assert row["journal"][1]["state"] == ("UNKNOWN" if terminal == "cancel" else "COMPLETED")
-    assert b.executions == (["B"] if terminal == "cancel" else ["B", "C"])
-    assert len(bp.requests) == (0 if terminal == "cancel" else 1)
+    assert row["journal"][1]["state"] == "UNKNOWN"
+    assert row["journal"][2]["state"] == "NOT_EXECUTED"
+    assert b.executions == ["B"]
+    assert len(bp.requests) == 0
     assert_closed(b)
 
 

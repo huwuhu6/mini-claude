@@ -11,7 +11,10 @@ import threading
 import time
 import uuid
 
-from core.run_snapshot import SCHEMA_VERSION, CHECKPOINT_SNAPSHOT_VERSION, HITL_SNAPSHOT_VERSION, SNAPSHOT_FIELDS, decode_messages, decode_run, fields, json_copy, require, call_ids, PAUSED_RESULT_OUTCOMES
+from core.run_snapshot import (BOUND_SNAPSHOT_VERSIONS, HITL_SNAPSHOT_VERSIONS,
+    READABLE_SNAPSHOT_VERSIONS, SNAPSHOT_FIELDS, decode_messages, decode_run,
+    decode_tool_result, same_tool_result, fields, json_copy, require, call_ids, PAUSED_RESULT_OUTCOMES)
+from core.tool_outcome import validate_non_execution
 
 DB_VERSION = 4
 TERMINAL = {"completed", "terminated", "failed", "cancelled", "unknown"}
@@ -348,14 +351,14 @@ class SqliteCheckpointStore:
 
     @staticmethod
     def validate_snapshot(data, run_id, *, terminal=False, boundary="tools"):
-        linked = type(data) is dict and data.get("schema_version") in {CHECKPOINT_SNAPSHOT_VERSION, HITL_SNAPSHOT_VERSION}
+        linked = type(data) is dict and data.get("schema_version") in BOUND_SNAPSHOT_VERSIONS
         fields(data, SNAPSHOT_FIELDS | ({"checkpoint_binding"} if linked else set()), "Snapshot")
-        require(type(data["schema_version"]) is int and data["schema_version"] in {SCHEMA_VERSION, CHECKPOINT_SNAPSHOT_VERSION, HITL_SNAPSHOT_VERSION}, "快照版本不兼容")
+        require(type(data["schema_version"]) is int and data["schema_version"] in READABLE_SNAPSHOT_VERSIONS, "快照版本不兼容")
         if linked:
             fields(data["checkpoint_binding"], {"database", "run_id"}, "Checkpoint 归属")
             require(data["checkpoint_binding"]["run_id"] == run_id
                     and type(data["checkpoint_binding"]["database"]) is str, "Checkpoint 归属不一致")
-        state = decode_run(data["run"], _terminal=terminal, _pre_model=boundary == "before_model", _approval=boundary == "approval" and data["schema_version"] == HITL_SNAPSHOT_VERSION)
+        state = decode_run(data["run"], _terminal=terminal, _pre_model=boundary == "before_model", _approval=boundary == "approval" and data["schema_version"] in HITL_SNAPSHOT_VERSIONS)
         require(state.run_id == run_id, "数据库 Run ID 与快照不一致")
         decode_messages(data["messages"], state, _pre_model=boundary == "before_model")
         return state
@@ -409,7 +412,7 @@ class SqliteCheckpointStore:
                 if old is not None and batch is not None and old["model_iteration"] == batch.model_iteration:
                     require(old["tool_calls"] == batch.tool_calls, "已提交调用批次不能修改")
                     require(batch.next_call_index >= old["next_call_index"], "批次游标回退")
-                    require(all(snapshot["run"]["tool_batch"]["results"].get(k) == v
+                    require(all(k in snapshot["run"]["tool_batch"]["results"] and same_tool_result(snapshot["run"]["tool_batch"]["results"][k], v)
                                 for k, v in old["results"].items()), "已提交结果不能修改")
                 elif old is not None:
                     require(old["next_call_index"] == len(old["tool_calls"]) and old["finalized"], "旧批次未收尾")
@@ -428,11 +431,14 @@ class SqliteCheckpointStore:
                     raw = snapshot["run"]["tool_batch"]["results"][call["id"]]
                     encoded = self._json(raw)
                     if existing["state"] in {"COMPLETED", "NOT_EXECUTED"}:
-                        require(existing["result_json"] == encoded, "Journal 已提交结果冲突")
+                        require(same_tool_result(json.loads(existing["result_json"]), raw), "Journal 已提交结果冲突")
                     else:
                         require(existing["state"] in {"RUNNING", "PREPARED"}, "未知操作不能自动完成")
                         not_executed = result.outcome not in {"EXECUTED_SUCCESS", "EXECUTED_FAILURE"}
-                        require(not not_executed or existing["state"] == "PREPARED" or result.outcome == "INVALID_ARGUMENTS", "执行阶段冲突")
+                        if not_executed:
+                            require(existing["state"] == "PREPARED", "已进入执行，不能记录 NOT_EXECUTED/NONE")
+                            require(result.effect == "NONE", "未执行记录缺少正向证明")
+                            validate_non_execution(result.outcome, result.non_execution_reason)
                         require(not_executed or existing["state"] == "RUNNING", "执行结果缺少 RUNNING 事实")
                         connection.execute("UPDATE calls SET state=?,result_json=? WHERE run_id=? AND turn=? AND ordinal=?",
                             ("NOT_EXECUTED" if not_executed else "COMPLETED", encoded, run_id, batch.model_iteration, ordinal))
@@ -498,7 +504,7 @@ class SqliteCheckpointStore:
                         call_result = snapshot["run"]["tool_batch"]["results"].get(item["call_id"])
                         if ordinal < batch.next_call_index:
                             require(item["state"] in {"COMPLETED", "NOT_EXECUTED", "UNKNOWN"}
-                                    and json.loads(item["result_json"]) == call_result, "结果、消息和游标版本冲突")
+                                    and same_tool_result(json.loads(item["result_json"]), call_result), "结果、消息和游标版本冲突")
                         else:
                             require(item["result_json"] is None and item["state"] in {"PREPARED", "RUNNING", "UNKNOWN"}, "待执行状态冲突")
                             if item["state"] in {"RUNNING", "UNKNOWN"}:
@@ -508,7 +514,7 @@ class SqliteCheckpointStore:
                 require(snapshot["run"]["terminal_result"] == result["final_result"]
                         and snapshot["run"]["status"] == result["status"], "终结元数据与快照冲突")
             if result["boundary"] == "approval":
-                require(snapshot["schema_version"] == HITL_SNAPSHOT_VERSION and state.status.value == "waiting_approval", "审批边界 / 快照状态冲突")
+                require(snapshot["schema_version"] in HITL_SNAPSHOT_VERSIONS and state.status.value == "waiting_approval", "审批边界 / 快照状态冲突")
                 opcall = batch.tool_calls[batch.next_call_index]
                 approval_row = approval_rows.get(state.approval_id)
                 from core.approvals import ApprovalRecord
@@ -537,7 +543,7 @@ class SqliteCheckpointStore:
                 require(item["state"] in {"PREPARED", "RUNNING", "COMPLETED", "UNKNOWN", "NOT_EXECUTED"}, "Journal 状态损坏")
                 if item["result_json"] is not None:
                     fact = json.loads(item["result_json"])
-                    fields(fact, {"call_id", "outcome", "content"}, "Journal 结果")
+                    decode_tool_result(fact)
                     require(fact["call_id"] == item["call_id"] and type(fact["content"]) is str, "Journal 结果关联损坏")
                     expected = ("COMPLETED" if fact["outcome"] in {"EXECUTED_SUCCESS", "EXECUTED_FAILURE", "RECORDED_BEFORE_TERMINAL"}
                                 else "UNKNOWN" if fact["outcome"] in {"UNKNOWN", "CANCELLED"} else "NOT_EXECUTED")
@@ -588,12 +594,17 @@ class SqliteCheckpointStore:
                     encoded = self._json(raw)
                     outcome = raw["outcome"]
                     if row["state"] in {"COMPLETED", "NOT_EXECUTED"}:
-                        require(row["result_json"] == encoded, "终结修改了已提交结果")
+                        require(same_tool_result(json.loads(row["result_json"]), raw), "终结修改了已提交结果")
                         continue
                     known_execution = outcome in {"EXECUTED_SUCCESS", "EXECUTED_FAILURE", "RECORDED_BEFORE_TERMINAL"}
                     unknown = outcome in {"UNKNOWN", "CANCELLED"}
                     require(not known_execution or row["state"] == "RUNNING", "终结执行结果缺少 RUNNING")
                     require(not unknown or row["state"] == "RUNNING", "终结 UNKNOWN 缺少 RUNNING")
+                    if not known_execution and not unknown:
+                        fact = batch.results[call["id"]]
+                        require(row["state"] == "PREPARED", "已进入执行，不能终结为 NOT_EXECUTED/NONE")
+                        require(fact.effect == "NONE", "终结未执行记录缺少正向证明")
+                        validate_non_execution(fact.outcome, fact.non_execution_reason)
                     connection.execute("UPDATE calls SET state=?,result_json=? WHERE run_id=? AND turn=? AND ordinal=?",
                         ("UNKNOWN" if unknown else "COMPLETED" if known_execution else "NOT_EXECUTED",
                          encoded, run_id, batch.model_iteration, ordinal))

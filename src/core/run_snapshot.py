@@ -9,12 +9,13 @@ from typing import Any
 from core.run_state import RunState, RunStatus, ToolBatchState, ToolBatchStatus, ToolCallResultState
 from providers.base import Message
 
-SCHEMA_VERSION = 1
-CHECKPOINT_SNAPSHOT_VERSION = 2  # Bound projections cannot use standalone JSON resume.
-HITL_SNAPSHOT_VERSION = 3  # Approval-bound projections require the SQLite authority.
-STANDALONE_SNAPSHOT_VERSIONS = {SCHEMA_VERSION}
-BOUND_SNAPSHOT_VERSIONS = {CHECKPOINT_SNAPSHOT_VERSION, HITL_SNAPSHOT_VERSION}
-HITL_SNAPSHOT_VERSIONS = {HITL_SNAPSHOT_VERSION}
+SCHEMA_VERSION = 4
+CHECKPOINT_SNAPSHOT_VERSION = 5  # Bound projections cannot use standalone JSON resume.
+HITL_SNAPSHOT_VERSION = 6  # Result/effect facts; earlier v1/v2/v3 remain readable.
+STANDALONE_SNAPSHOT_VERSIONS = {1, SCHEMA_VERSION}
+BOUND_SNAPSHOT_VERSIONS = {2, 3, CHECKPOINT_SNAPSHOT_VERSION, HITL_SNAPSHOT_VERSION}
+HITL_SNAPSHOT_VERSIONS = {3, HITL_SNAPSHOT_VERSION}
+READABLE_SNAPSHOT_VERSIONS = STANDALONE_SNAPSHOT_VERSIONS | BOUND_SNAPSHOT_VERSIONS
 SNAPSHOT_FIELDS = {"schema_version", "workspace", "compatibility", "run", "messages",
                    "history", "todo", "agent_note", "memory", "context", "diagnostics"}
 # UNKNOWN/cancellation/not-executed terminal closures are never resumable pauses.
@@ -38,6 +39,26 @@ def integer(value: Any, name: str, minimum: int = 0) -> None:
 
 def text(value: Any, name: str, *, nonempty: bool = False) -> None:
     require(type(value) is str and (not nonempty or bool(value.strip())), f"{name} 必须为文本")
+
+
+def decode_tool_result(raw):
+    legacy = {"call_id", "outcome", "content"}
+    require(type(raw) is dict and set(raw) in (legacy, legacy | {"result", "effect"},
+            legacy | {"result", "effect", "non_execution_reason"}), "工具结果字段不完整或不兼容")
+    if "result" in raw:
+        require(type(raw["result"]) is str and type(raw["effect"]) is str, "结果事实类型无效")
+        # Prior unproven NONE labels cannot authorize a new execution. Keep the
+        # original journal bytes; only the detached interpretation is conservative.
+        if "non_execution_reason" not in raw and raw["effect"] == "NONE" and raw["result"] == "FAILED" and raw["outcome"] not in {"UNKNOWN", "CANCELLED", "EXECUTED_SUCCESS", "EXECUTED_FAILURE", "RECORDED_BEFORE_TERMINAL"}:
+            raw = {**raw, "effect": "UNCERTAIN"}
+    if "non_execution_reason" in raw:
+        require(raw["non_execution_reason"] is None or type(raw["non_execution_reason"]) is str,
+                "未执行原因码类型无效")
+    return ToolCallResultState(**raw)
+
+
+def same_tool_result(left, right):
+    return decode_tool_result(left) == decode_tool_result(right)
 
 
 def json_copy(value: Any) -> Any:
@@ -151,13 +172,13 @@ def decode_run(data: Any, *, _terminal: bool = False, _pre_model: bool = False, 
     require(type(results) is dict and set(results) == set(prefix), "结果集合与游标不一致")
     decoded_results = {}
     for call_id, result in results.items():
-        fields(result, {"call_id", "outcome", "content"}, "工具结果")
+        decoded_result = decode_tool_result(result)
         require(result["call_id"] == call_id, "结果关联了错误 ID")
         require(type(result["outcome"]) is str and result["outcome"] in (PAUSED_RESULT_OUTCOMES | {"UNKNOWN", "NOT_EXECUTED", "CANCELLED", "RECORDED_BEFORE_TERMINAL"}
                     if _terminal else PAUSED_RESULT_OUTCOMES),
                 "结果不是可继续边界的已知执行事实")
         text(result["content"], "结果内容")
-        decoded_results[call_id] = ToolCallResultState(**result)
+        decoded_results[call_id] = decoded_result
     resolved = raw["resolved_call_ids"]
     require(type(resolved) is list and all(type(i) is str for i in resolved)
             and len(resolved) == len(prefix) and set(resolved) == set(prefix), "已处理 ID 不一致")

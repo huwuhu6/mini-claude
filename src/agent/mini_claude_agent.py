@@ -37,6 +37,7 @@ from providers.manager import ProviderManager
 
 from core.tools.base_tools import BaseTools, ToolResult
 from core.tools.registry import ToolArgumentBindingError, ToolRegistry, ToolSpec
+from core.tool_outcome import NonExecutionReason, non_execution_facts
 from core.tools.definitions import (
     bash_spec,
     edit_file_spec,
@@ -71,7 +72,7 @@ from core.checkpoint_store import CheckpointError, SqliteCheckpointStore, TERMIN
 from core.run_snapshot import (
     SCHEMA_VERSION, CHECKPOINT_SNAPSHOT_VERSION, HITL_SNAPSHOT_VERSION, SNAPSHOT_FIELDS, PAUSED_RESULT_OUTCOMES, decode_messages, decode_run, encode_run,
     BOUND_SNAPSHOT_VERSIONS, HITL_SNAPSHOT_VERSIONS, STANDALONE_SNAPSHOT_VERSIONS,
-    fields as snapshot_fields, json_copy, require as snapshot_require, text as snapshot_text,
+    decode_tool_result, fields as snapshot_fields, json_copy, require as snapshot_require, text as snapshot_text,
 )
 from core.approvals import ApprovalStore, ApprovalStatus
 from core.permissions import DefaultPermissionPolicy, PermissionKind, digest as permission_digest
@@ -444,7 +445,7 @@ class MiniClaudeAgent:
         runtime_root = Path(__file__).resolve().parents[1]
         # Fail closed after relevant implementation changes, including delegated helpers.
         sources = ["agent/mini_claude_agent.py", "core/run_state.py", "core/run_snapshot.py", "core/checkpoint_store.py",
-                   "core/loop_controller.py", "core/tools/base_tools.py", "core/tools/file_edits.py", "core/tools/registry.py", "core/permissions.py", "core/permission_grants.py", "core/approvals.py",
+                   "core/loop_controller.py", "core/tool_outcome.py", "core/tools/base_tools.py", "core/tools/file_edits.py", "core/tools/registry.py", "core/permissions.py", "core/permission_grants.py", "core/approvals.py",
                    "core/runtime_context/shell_session.py", "core/runtime_context/command_policy.py",
                    "core/runtime_context/workspace_authority.py", "core/runtime_context/path_resolver.py",
                    "core/features/manager.py", "core/compression.py",
@@ -906,8 +907,15 @@ class MiniClaudeAgent:
             except json.JSONDecodeError:
                 # Journal preserves malformed original input for inspection too.
                 arguments = function["arguments"]
+            execution = None
+            if call["result_json"] is not None:
+                fact = decode_tool_result(json.loads(call["result_json"]))
+                execution = {"result": fact.result, "effect": fact.effect}
+            elif call["state"] == "UNKNOWN":
+                execution = {"result": "UNKNOWN", "effect": "UNCERTAIN"}
             calls.append({"call_id": call["call_id"], "state": call["state"],
-                          "tool_name": function["name"], "arguments": arguments})
+                          "tool_name": function["name"], "arguments": arguments,
+                          "execution": execution})
         return {"run_id": run_id, "status": record["status"], "checked_at": self._approval_store.clock(),
             "conversation_id": self._checkpoint_store.conversation_for_run(run_id),
             "archive": self._checkpoint_store.archive_info(run_id),
@@ -918,6 +926,7 @@ class MiniClaudeAgent:
             "calls": calls,
             "approval_id": snapshot["run"].get("approval_id") if snapshot else None,
             "approvals": self._approval_store.list_for_run(run_id)}
+
 
     def list_checkpoint_runs(self):
         if not getattr(self, "_hitl_enabled", False):
@@ -2020,13 +2029,19 @@ class MiniClaudeAgent:
         mode_error = self._mode_capability_error(name, args)
         if mode_error:
             return ToolDispatchResult(ToolDispatchStatus.FEATURE_DISABLED, mode_error)
-        self._checkpoint_dispatch(name, args)
-        self._emit_ui_event("tool_execution_started", name=name,
-                            summary=self._tool_event_summary(name, args),
-                            command=args.get("command", "") if name in {"bash", "run_background"} else "",
-                            cwd=str(getattr(getattr(self, "runtime_context", None), "cwd", "")))
+        entered_execution = False
+
+        def enter_execution():
+            nonlocal entered_execution
+            self._checkpoint_dispatch(name, args)
+            entered_execution = True
+            self._emit_ui_event("tool_execution_started", name=name,
+                                summary=self._tool_event_summary(name, args),
+                                command=args.get("command", "") if name in {"bash", "run_background"} else "",
+                                cwd=str(getattr(getattr(self, "runtime_context", None), "cwd", "")))
+
         try:
-            value = self.tool_registry.execute(name, args)
+            value = self.tool_registry.execute(name, args, on_enter=enter_execution)
             return ToolDispatchResult(ToolDispatchStatus.DISPATCHED, value)
         except CheckpointError:
             self._checkpoint_faulted = True
@@ -2035,12 +2050,19 @@ class MiniClaudeAgent:
             # Runtime control signals must reach the loop's control handler.
             raise
         except ToolArgumentBindingError as e:
+            if getattr(self, "_checkpoint_faulted", False):
+                raise
+            if entered_execution or e.registry is not self.tool_registry:
+                logger.error("工具 '%s' 进入执行后发生参数异常: %s", name, e)
+                return ToolDispatchResult(ToolDispatchStatus.EXECUTION_FAILED, f"错误: {e}")
             logger.error(f"工具 '{name}' 参数错误: {e}")
             return ToolDispatchResult(
                 ToolDispatchStatus.INVALID_ARGUMENTS,
                 f"错误: 工具 '{name}' 参数无效。详情: {str(e)}",
             )
         except Exception as e:
+            if getattr(self, "_checkpoint_faulted", False):
+                raise
             logger.error(f"执行工具 '{name}' 出错: {e}")
             return ToolDispatchResult(
                 ToolDispatchStatus.EXECUTION_FAILED,
@@ -2888,6 +2910,7 @@ class MiniClaudeAgent:
                     active_batch_assistant_index = batch.assistant_message_index
                 active_tool_calls = batch.tool_calls
                 resolved_tool_call_ids = batch.resolved_call_ids
+                current_result_facts = {}
 
                 def append_tool_result(tool_call: Dict[str, Any], result_text: str) -> None:
                     call_id = tool_call.get("id", "")
@@ -2975,6 +2998,8 @@ class MiniClaudeAgent:
                             outcome = "RECORDED_BEFORE_TERMINAL"
                         batch.results[message.tool_call_id] = ToolCallResultState(
                             message.tool_call_id, outcome, message.content,
+                            **(non_execution_facts(NonExecutionReason.BATCH_ABORTED) if outcome == "NOT_EXECUTED"
+                               else current_result_facts if message.tool_call_id == current_tool_call_id else {}),
                         )
                     ordered_call_ids = [
                         str(call.get("id", "")) for call in batch.tool_calls
@@ -3005,6 +3030,8 @@ class MiniClaudeAgent:
                         "outcome": outcome,
                         "result": result_text,
                     }
+                    if current_result_facts:
+                        event["execution"] = dict(current_result_facts)
                     if cancelled:
                         event["cancelled"] = True
                     if output_visibility:
@@ -3016,6 +3043,7 @@ class MiniClaudeAgent:
                         current_tool_call_id,
                         outcome,
                         result_text,
+                        **current_result_facts,
                     )
                     self._checkpoint_save("tools")
                     if advance is ToolBatchAdvance.PAUSED or state.status is RunStatus.PAUSED:
@@ -3038,6 +3066,7 @@ class MiniClaudeAgent:
                     call_index = batch.next_call_index
                     tc = batch.tool_calls[call_index]
                     current_tool_call_id = tc["id"]
+                    current_result_facts = {}
                     current_tool_execution_started = False
                     current_tool_result_received = False
                     current_tool_result_available = False
@@ -3067,6 +3096,7 @@ class MiniClaudeAgent:
                             "本次未重复执行。"
                         )
                         tool_call_outcome = "SKIPPED_DUPLICATE"
+                        current_result_facts = non_execution_facts(NonExecutionReason.DUPLICATE_SKIPPED)
                         current_tool_result_available = True
                         self.session_recorder.record(
                             "tool_call", call_id=tc["id"], tool=tname,
@@ -3097,6 +3127,7 @@ class MiniClaudeAgent:
                         # not terminate the entire agent task.
                         result_text = f"工具参数 JSON 无效，请重新生成合法 JSON: {exc}"
                         tool_call_outcome = "INVALID_ARGUMENTS"
+                        current_result_facts = non_execution_facts(NonExecutionReason.ARGUMENTS_REJECTED)
                         current_tool_result_available = True
                         args_hash = canonicalize_args({"raw_arguments": str(args_raw)})
                         intent = CommandNormalizer.normalize(
@@ -3210,6 +3241,7 @@ class MiniClaudeAgent:
                                 changed_paths=list(decision.event.changed_paths),
                             )
                             tool_call_outcome = "BLOCKED_PRECHECK"
+                            current_result_facts = non_execution_facts(NonExecutionReason.PRECHECK_REJECTED)
                             current_tool_result_available = True
                             append_tool_result(tc, result_text)
                             current_tool_result_received = True
@@ -3217,6 +3249,7 @@ class MiniClaudeAgent:
                                 state.pause_requested = False
                                 state.record_tool_result(
                                     tc["id"], "BLOCKED_PRECHECK", result_text,
+                                    **current_result_facts,
                                 )
                                 finish_tool_batch("Runtime Policy HARD_STOP")
                                 self.trace.end_task("CIRCUIT_BROKEN", decision.reason)
@@ -3245,6 +3278,7 @@ class MiniClaudeAgent:
                             result_text = v3_block_msg
                             observation_text = result_text
                             tool_call_outcome = "BLOCKED_NOT_EXECUTED"
+                            current_result_facts = non_execution_facts(NonExecutionReason.PRECHECK_REJECTED)
                             current_tool_result_available = True
                             tool_result = ToolResult(
                                 content=result_text, success=False,
@@ -3281,6 +3315,9 @@ class MiniClaudeAgent:
                             if dispatch_status in {ToolDispatchStatus.PERMISSION_DENIED, ToolDispatchStatus.APPROVAL_REJECTED}:
                                 current_tool_execution_started = False
                                 tool_call_outcome = "BLOCKED_PERMISSION_DENIED"
+                                current_result_facts = non_execution_facts(
+                                    NonExecutionReason.APPROVAL_REJECTED if dispatch_status is ToolDispatchStatus.APPROVAL_REJECTED
+                                    else NonExecutionReason.PERMISSION_DENIED)
                                 result_text = str(result)
                                 current_tool_result_available = True
                                 append_tool_result(tc, result_text)
@@ -3291,13 +3328,14 @@ class MiniClaudeAgent:
                                     feedback = self._checkpoint_store.approval_feedback(state.approval_id)
                                     # Close the suffix as a single known, non-execution projection.
                                     state.pause_requested = False
-                                    state.record_tool_result(tc["id"], tool_call_outcome, result_text)
+                                    state.record_tool_result(tc["id"], tool_call_outcome, result_text, **current_result_facts)
                                     while batch.has_pending_calls:
                                         remaining = batch.tool_calls[batch.next_call_index]
                                         batch.seen_signatures.add((remaining["function"]["name"], remaining["function"]["arguments"]))
                                         text = "[NOT_EXECUTED] 前置操作被用户拒绝，剩余依赖操作未执行；请重新规划。"
                                         append_tool_result(remaining, text)
-                                        state.record_tool_result(remaining["id"], "BLOCKED_NOT_EXECUTED", text)
+                                        state.record_tool_result(remaining["id"], "BLOCKED_NOT_EXECUTED", text,
+                                                                 **non_execution_facts(NonExecutionReason.BATCH_ABORTED))
                                     defer_replan("用户拒绝了原操作，剩余工具均未执行。用户意见：" + feedback["note"])
                                     self._checkpoint_save("tools")
                                     if feedback["mode"] == "stop":
@@ -3311,6 +3349,10 @@ class MiniClaudeAgent:
                             tool_result = result if isinstance(result, ToolResult) else ToolResult(
                                 content=str(result), success=not self._is_tool_error(str(result), tname)
                             )
+                            # NONE is a Runtime pre-handler fact, never a handler's
+                            # claim that an already-started call did not start.
+                            if tool_result.effect == "NONE":
+                                tool_result.effect = "UNCERTAIN"
                             result_text = tool_result.content
                             not_dispatched = dispatch_status in {
                                 ToolDispatchStatus.FEATURE_DISABLED,
@@ -3320,6 +3362,11 @@ class MiniClaudeAgent:
                             cancelled = False
                             if not_dispatched:
                                 current_tool_execution_started = False
+                                current_result_facts = non_execution_facts({
+                                    ToolDispatchStatus.FEATURE_DISABLED: NonExecutionReason.FEATURE_DISABLED,
+                                    ToolDispatchStatus.UNKNOWN_TOOL: NonExecutionReason.UNKNOWN_TOOL,
+                                    ToolDispatchStatus.INVALID_ARGUMENTS: NonExecutionReason.ARGUMENTS_REJECTED,
+                                }[dispatch_status])
                                 v3_block_msg = result_text
                                 tool_call_outcome = (
                                     "INVALID_ARGUMENTS"
@@ -3327,6 +3374,7 @@ class MiniClaudeAgent:
                                     else f"BLOCKED_{dispatch_status.value.upper()}"
                                 )
                             else:
+                                current_result_facts = {"result": tool_result.result, "effect": tool_result.effect}
                                 cancelled = (
                                     tool_result.cancelled
                                     or result_text.startswith("[用户中断]")
@@ -3342,6 +3390,24 @@ class MiniClaudeAgent:
                                         if tool_result.execution_success
                                         else "EXECUTED_FAILURE"
                                     )
+
+                            uncertain_effect = (not not_dispatched and not cancelled and
+                                (tool_result.result == "UNKNOWN" or
+                                 (tool_result.result == "FAILED" and tool_result.effect in {"UNCERTAIN", "PARTIAL"})))
+                            if uncertain_effect and getattr(self, "_checkpoint_store", None) is not None:
+                                tool_call_outcome = "UNKNOWN"
+                                result_text = "[UNKNOWN] 工具已启动，副作用无法确认；禁止自动重试。\n" + result_text
+                                current_tool_result_available = True
+                                append_tool_result(tc, result_text)
+                                current_tool_result_received = True
+                                record_tool_result_event(tname, result_text, success=False, blocked=False, outcome="UNKNOWN")
+                                state.pause_requested = False
+                                state.record_tool_result(tc["id"], "UNKNOWN", result_text, **current_result_facts)
+                                finish_tool_batch("工具副作用不确定")
+                                self._emit_ui_event("tool_result", name=tname, call_id=tc["id"], success=False,
+                                                    blocked=False, outcome="UNKNOWN", **current_result_facts)
+                                self.trace.end_task("FAILED")
+                                return self._finish_run(RunStatus.FAILED, "UNKNOWN：工具副作用无法确认；请核验或归档，禁止自动重试。")
 
                             current_tool_result_available = True
                             append_tool_result(tc, result_text)
@@ -3406,6 +3472,7 @@ class MiniClaudeAgent:
                                     state.pause_requested = False
                                     state.record_tool_result(
                                         tc["id"], "CANCELLED", result_text,
+                                        **current_result_facts,
                                     )
                                     finish_tool_batch("用户取消当前工具")
                                     t_end = time.time()
@@ -3614,6 +3681,7 @@ class MiniClaudeAgent:
                         state.pause_requested = False
                         state.record_tool_result(
                             tc["id"], tool_call_outcome, result_text,
+                            **current_result_facts,
                         )
                         finish_tool_batch(
                             "Runtime Policy HARD_STOP",
