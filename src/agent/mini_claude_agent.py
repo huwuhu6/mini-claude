@@ -70,6 +70,7 @@ from core.run_state import (
 from core.checkpoint_store import CheckpointError, SqliteCheckpointStore, TERMINAL as CHECKPOINT_TERMINAL
 from core.run_snapshot import (
     SCHEMA_VERSION, CHECKPOINT_SNAPSHOT_VERSION, HITL_SNAPSHOT_VERSION, SNAPSHOT_FIELDS, PAUSED_RESULT_OUTCOMES, decode_messages, decode_run, encode_run,
+    BOUND_SNAPSHOT_VERSIONS, HITL_SNAPSHOT_VERSIONS, STANDALONE_SNAPSHOT_VERSIONS,
     fields as snapshot_fields, json_copy, require as snapshot_require, text as snapshot_text,
 )
 from core.approvals import ApprovalStore, ApprovalStatus
@@ -447,7 +448,7 @@ class MiniClaudeAgent:
                    "core/runtime_context/shell_session.py", "core/runtime_context/command_policy.py",
                    "core/runtime_context/workspace_authority.py", "core/runtime_context/path_resolver.py",
                    "core/features/manager.py", "core/compression.py",
-                   "core/runtime_context/workspace_state.py", "core/runtime_context/observation.py",
+                   "core/runtime_context/workspace_state.py", "core/runtime_context/file_checkpoint.py", "core/runtime_context/observation.py",
                    "core/failure_intelligence/analyzer.py", "core/failure_intelligence/signatures.py",
                    "core/failure_intelligence/models.py", "core/agent_note.py", "models/todo.py"]
         source_hash = hashlib.sha256()
@@ -471,16 +472,17 @@ class MiniClaudeAgent:
     def _validate_run_snapshot(self, raw: dict, *, _checkpoint_boundary: str | None = None):
         """Pure preparation: no live state, files, trace or authorization is overwritten."""
         snapshot = json_copy(raw)
-        linked = type(snapshot) is dict and snapshot.get("schema_version") in {CHECKPOINT_SNAPSHOT_VERSION, HITL_SNAPSHOT_VERSION}
+        linked = type(snapshot) is dict and snapshot.get("schema_version") in BOUND_SNAPSHOT_VERSIONS
         snapshot_fields(snapshot, SNAPSHOT_FIELDS | ({"checkpoint_binding"} if linked else set()), "Snapshot")
         store = getattr(self, "_checkpoint_store", None)
         snapshot_require(type(snapshot["schema_version"]) is int
-                         and (snapshot["schema_version"] == SCHEMA_VERSION or (linked and store is not None)), "快照版本不兼容；持久化投影要求 Checkpoint Store")
-        snapshot_require(snapshot["schema_version"] != HITL_SNAPSHOT_VERSION or getattr(self, "_hitl_enabled", False), "审批快照必须启用持久化 HITL")
+                         and (snapshot["schema_version"] in STANDALONE_SNAPSHOT_VERSIONS or (linked and store is not None)), "快照版本不兼容；持久化投影要求 Checkpoint Store")
+        snapshot_require(snapshot["schema_version"] not in HITL_SNAPSHOT_VERSIONS or getattr(self, "_hitl_enabled", False), "审批快照必须启用持久化 HITL")
         snapshot_require(snapshot["compatibility"] == self._snapshot_compatibility(),
                          "工具实现、Schema 或关键运行配置不兼容")
         workspace = snapshot["workspace"]
-        snapshot_fields(workspace, {"root", "cwd", "content_digest"}, "Workspace")
+        snapshot_fields(workspace, {"root", "cwd", "content_digest"} |
+                        ({"file_targets"} if "file_targets" in workspace else set()), "Workspace")
         for key in ("root", "cwd"):
             snapshot_text(workspace[key], key, nonempty=True)
             path = Path(workspace[key])
@@ -496,7 +498,11 @@ class MiniClaudeAgent:
         snapshot_require(workspace["content_digest"] == self.workspace_state_guard.content_digest(),
                          "工作区内容在导出后发生变化，无法安全继续原调用")
         state = decode_run(snapshot["run"], _pre_model=_checkpoint_boundary == "before_model",
-                           _approval=_checkpoint_boundary == "approval" and snapshot["schema_version"] == HITL_SNAPSHOT_VERSION)
+                           _approval=_checkpoint_boundary == "approval" and snapshot["schema_version"] in HITL_SNAPSHOT_VERSIONS)
+        current_targets = self._pending_file_targets(state.tool_batch)
+        snapshot_require(workspace.get("file_targets", {}) == current_targets
+                         and all(value["kind"] not in {"unavailable", "other"} for value in current_targets.values()),
+                         "文件目标前置状态已变化或无法核验，不能继续原调用")
         if linked:
             snapshot_fields(snapshot["checkpoint_binding"], {"database", "run_id"}, "Checkpoint 归属")
             snapshot_require(snapshot["checkpoint_binding"] == {"database": str(store.path), "run_id": state.run_id},
@@ -554,7 +560,8 @@ class MiniClaudeAgent:
             "schema_version": SCHEMA_VERSION,
             "workspace": {"root": str(self.runtime_context.workspace_root),
                           "cwd": str(self.runtime_context.cwd.resolve()),
-                          "content_digest": self.workspace_state_guard.content_digest()},
+                          "content_digest": self.workspace_state_guard.content_digest(),
+                          "file_targets": self._pending_file_targets(state.tool_batch)},
             "compatibility": self._snapshot_compatibility(),
             "run": encode_run(state),
             "messages": [asdict(message) for message in self.messages],
@@ -575,6 +582,10 @@ class MiniClaudeAgent:
             snapshot["checkpoint_binding"] = {"database": str(store.path), "run_id": state.run_id}
         return snapshot
 
+    def _pending_file_targets(self, batch):
+        from core.runtime_context.file_checkpoint import pending_file_targets
+        return pending_file_targets(batch, self.tools)
+
     def restore_run_snapshot(self, snapshot: dict, *, _checkpoint_boundary: str | None = None, _refresh_waiting: bool = False) -> None:
         """Install validated detached state; caller explicitly continues the paused Run."""
         refreshing = (_refresh_waiting and _checkpoint_boundary == "approval"
@@ -583,7 +594,12 @@ class MiniClaudeAgent:
         snapshot_require(not self.has_active_run or refreshing, "已有未完成 Run，不能被快照覆盖")
         snapshot_require(not self.background.list(), "恢复目标有独立后台任务")
         data, state, messages, todo, history, cwd = self._validate_run_snapshot(snapshot, _checkpoint_boundary=_checkpoint_boundary)
-        if data["schema_version"] in {CHECKPOINT_SNAPSHOT_VERSION, HITL_SNAPSHOT_VERSION}:
+        from core.runtime_context.file_checkpoint import require_resumable_scope
+        if _checkpoint_boundary != "approval":
+            # Preserve the existing PREPARED + explicit approval protocol.
+            # UNKNOWN calls are rejected by recover() before this installation.
+            require_resumable_scope(state.tool_batch)
+        if data["schema_version"] in BOUND_SNAPSHOT_VERSIONS:
             store = getattr(self, "_checkpoint_store", None)
             snapshot_require(_checkpoint_boundary is not None and store.holds_lock(state.run_id),
                              "持久化快照必须通过 Checkpoint 恢复入口并持有执行锁")
@@ -730,8 +746,13 @@ class MiniClaudeAgent:
             store.acquire(run_id)
             try:
                 record = store.recover(run_id)
-                snapshot_require(record["snapshot"] is not None and
-                    record["snapshot"]["workspace"]["root"] == str(self.workdir.resolve()), "归档工作区不一致")
+                if record["snapshot"] is None:
+                    conversation = store.get_conversation(identity) if identity else None
+                    snapshot_require(conversation is not None and
+                        conversation["workspace"] == str(self.workdir.resolve()) and
+                        record["status"] == "started" and not record["journal"], "归档工作区不一致")
+                else:
+                    snapshot_require(record["snapshot"]["workspace"]["root"] == str(self.workdir.resolve()), "归档工作区不一致")
                 store.archive_run(run_id, reason)
             finally:
                 store.release(run_id)
@@ -786,6 +807,12 @@ class MiniClaudeAgent:
             function = call["function"]
             if function["name"] != name or json.dumps(json.loads(function["arguments"]), sort_keys=True) != json.dumps(args, sort_keys=True):
                 raise CheckpointError("实际 handler 参数与原 Tool Call 不一致")
+            if name in {"write_file", "edit_file"}:
+                record = store.load(state.run_id)
+                expected = record["snapshot"]["workspace"].get("file_targets", {}).get(call["id"])
+                current = self._pending_file_targets(batch).get(call["id"])
+                if expected != current:
+                    raise CheckpointError("文件目标前置状态在 dispatch 前变化，禁止执行原调用")
             if state.approval_id is not None:
                 decision = self._hitl_decision(call)
                 self._checkpoint_revision = self._approval_store.consume_and_mark_running(
@@ -927,17 +954,32 @@ class MiniClaudeAgent:
             return self.resume_checkpoint(run_id)
         if store is None or self.has_active_run:
             raise CheckpointError('已有活动 Run 或未启用 Checkpoint，不能切换会话')
-        store.acquire(run_id)
+        identity = store.conversation_for_run(run_id)
+        acquired_conversation = bool(identity and not store.holds_lock("conversation:" + identity))
+        if acquired_conversation:
+            store.acquire("conversation:" + identity)
         try:
-            record = store.load(run_id)
-            if record['status'] not in {'completed', 'terminated', 'failed', 'cancelled'}:
-                # 先释放查询锁；resume_checkpoint 自己获取执行独占。
-                completed = False
-            else:
-                completed = True
-                result = self._load_terminal_history(record)
+            store.acquire(run_id)
+            try:
+                conversation = store.get_conversation(identity) if identity else None
+                if conversation:
+                    snapshot_require(conversation["workspace"] == str(self.workdir.resolve())
+                        and conversation["archived_at"] is None and conversation["head_run_id"] == run_id,
+                        "Workspace / 会话归属已变化、已归档或 Run 不是当前 head")
+                record = store.load(run_id)
+                if record['status'] not in {'completed', 'terminated', 'failed', 'cancelled'}:
+                    completed = False
+                else:
+                    completed = True
+                    result = self._load_terminal_history(record)
+                    self._run_state = None
+                    self._conversation_id = identity
+                    self._conversation_head_run_id = run_id
+            finally:
+                store.release(run_id)
         finally:
-            store.release(run_id)
+            if acquired_conversation:
+                store.release("conversation:" + identity)
         if not completed:
             return self.resume_checkpoint(run_id)
         return result
@@ -1099,6 +1141,13 @@ class MiniClaudeAgent:
 
         self._checkpoint_claim()
         try:
+            store = getattr(self, "_checkpoint_store", None)
+            if store is not None:
+                record = store.load(state.run_id)
+                self._validate_run_snapshot(record["snapshot"], _checkpoint_boundary=record["boundary"])
+                if record["boundary"] != "approval":
+                    from core.runtime_context.file_checkpoint import require_resumable_scope
+                    require_resumable_scope(state.tool_batch)
             # Grants and directories can change after snapshot validation or a pause.
             cwd = self.workspace_authority.check(str(self.runtime_context.cwd.resolve()))
             if not cwd.is_dir():

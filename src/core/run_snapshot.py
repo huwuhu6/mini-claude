@@ -12,6 +12,9 @@ from providers.base import Message
 SCHEMA_VERSION = 1
 CHECKPOINT_SNAPSHOT_VERSION = 2  # Bound projections cannot use standalone JSON resume.
 HITL_SNAPSHOT_VERSION = 3  # Approval-bound projections require the SQLite authority.
+STANDALONE_SNAPSHOT_VERSIONS = {SCHEMA_VERSION}
+BOUND_SNAPSHOT_VERSIONS = {CHECKPOINT_SNAPSHOT_VERSION, HITL_SNAPSHOT_VERSION}
+HITL_SNAPSHOT_VERSIONS = {HITL_SNAPSHOT_VERSION}
 SNAPSHOT_FIELDS = {"schema_version", "workspace", "compatibility", "run", "messages",
                    "history", "todo", "agent_note", "memory", "context", "diagnostics"}
 # UNKNOWN/cancellation/not-executed terminal closures are never resumable pauses.

@@ -349,15 +349,14 @@ def test_current_command_policy_and_authority_are_used_at_dispatch(agents, tmp_p
     b, _ = agents([{}, {}], pause_after=None)
     # Foreground BaseTools and background routing have separate policy instances.
     monkeypatch.setattr(module.CommandPolicy, "HIGH_RISK_EXECUTORS", [re.compile("echo")])
-    b.restore_run_snapshot(a.export_run_snapshot())
-    b._continue_run()
+    # Recovery now rejects an unobservable/revoked file target before installing
+    # the old batch; it must not regain authority through a serialized snapshot.
+    with pytest.raises(ValueError, match="目标前置"):
+        b.restore_run_snapshot(a.export_run_snapshot())
     assert b.executions == []
-    assert "高危" in b._run_state.tool_batch.results["call-1"].content
-    assert b._run_state.tool_batch.results["call-2"].outcome == "EXECUTED_FAILURE"
+    assert b._run_state is None and b.messages == []
     assert protected.read_text(encoding="utf-8") == "outside file"
     assert b.workspace_authority.additional_roots == []
-    assert [m.tool_call_id for m in b.messages if m.role == "tool"] == [
-        "call-0", "call-1", "call-2"]
 
 
 def test_history_window_precision_and_governance_decisions_are_preserved(agents):
