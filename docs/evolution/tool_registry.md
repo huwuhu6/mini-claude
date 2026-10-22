@@ -366,8 +366,8 @@ Windows Python 3.14.3 最终冻结代码的完整 tests/unit 为 601 passed、12
 
 ## 2026-10-11：标准确认策略、独立授权规则和安全归档
 
-Commit: `PENDING`
-Commit Description: `feat: 整理会话恢复、审批交互与可撤销授权规则`
+Commit: `40638955aca983bd840313c626d94616333f5e72`
+Commit Description: `feat: 完善本地会话恢复、授权交互与终端展示`
 
 ### Description
 
@@ -390,8 +390,8 @@ SQLite v4 在同一升级事务增加 conversations、conversation_runs、run_ar
 
 ## 2026-10-11：将可复用授权与一次性操作绑定分开
 
-Commit: `PENDING`
-Commit Description: `feat: 按文件与对话保存授权并整理终端交互`
+Commit: `40638955aca983bd840313c626d94616333f5e72`
+Commit Description: `feat: 完善本地会话恢复、授权交互与终端展示`
 
 ### Description
 

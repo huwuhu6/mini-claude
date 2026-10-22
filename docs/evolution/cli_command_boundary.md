@@ -2,8 +2,8 @@
 
 ## 2026-10-12：取消会话仍可检查已保存历史
 
-Commit: `PENDING`
-Commit Description: `fix: 加载取消会话只读历史并明确未知执行保护`
+Commit: `40638955aca983bd840313c626d94616333f5e72`
+Commit Description: `feat: 完善本地会话恢复、授权交互与终端展示`
 
 ### Description
 
@@ -23,8 +23,8 @@ Commit Description: `fix: 加载取消会话只读历史并明确未知执行保
 
 ## 2026-10-12：收拢运行态与统一 Rich 渲染
 
-Commit: `PENDING`
-Commit Description: `refactor: 使用 Rich 收拢终端运行态并优化视觉层级`
+Commit: `40638955aca983bd840313c626d94616333f5e72`
+Commit Description: `feat: 完善本地会话恢复、授权交互与终端展示`
 
 ### Description
 
@@ -44,8 +44,8 @@ CLI、审批、资源授权、Markdown 与输入集成组合 123 passed（122.02
 
 ## 2026-10-12：在 Shell handler 前保留实际命令
 
-Commit: `PENDING`
-Commit Description: `fix: 执行前展示完整 Shell 命令与执行目录`
+Commit: `40638955aca983bd840313c626d94616333f5e72`
+Commit Description: `feat: 完善本地会话恢复、授权交互与终端展示`
 
 ### Description
 
@@ -63,8 +63,8 @@ Commit Description: `fix: 执行前展示完整 Shell 命令与执行目录`
 
 ## 2026-10-12：模型回答的 Markdown 渲染
 
-Commit: `PENDING`
-Commit Description: `feat: 为终端模型回答加入 Markdown 渲染`
+Commit: `40638955aca983bd840313c626d94616333f5e72`
+Commit Description: `feat: 完善本地会话恢复、授权交互与终端展示`
 
 ### Description
 
@@ -142,8 +142,8 @@ Windows Python 3.14.3 最终冻结代码完整 tests/unit：646 passed、12 skip
 
 ## 2026-10-11：交互终端单次审批菜单
 
-Commit: `PENDING`
-Commit Description: `feat: 增加终端审批卡片并自动继续原调用`
+Commit: `40638955aca983bd840313c626d94616333f5e72`
+Commit Description: `feat: 完善本地会话恢复、授权交互与终端展示`
 
 ### Description
 
@@ -159,8 +159,8 @@ Commit Description: `feat: 增加终端审批卡片并自动继续原调用`
 
 ## 2026-10-11：默认审批与日常会话入口
 
-Commit: `PENDING`
-Commit Description: `feat: 默认启用审批并提供会话继续与选择入口`
+Commit: `40638955aca983bd840313c626d94616333f5e72`
+Commit Description: `feat: 完善本地会话恢复、授权交互与终端展示`
 
 ### Description
 
@@ -178,8 +178,8 @@ Runtime 增加 open_checkpoint_conversation：已完成 Run 在独占锁下校�
 
 ## 2026-10-11：从调试命令转为日常会话与审批体验
 
-Commit: `PENDING`
-Commit Description: `feat: 整理会话恢复、审批交互与可撤销授权规则`
+Commit: `40638955aca983bd840313c626d94616333f5e72`
+Commit Description: `feat: 完善本地会话恢复、授权交互与终端展示`
 
 ### Description
 
