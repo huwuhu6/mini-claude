@@ -175,7 +175,7 @@ mini-claude path/to/project --resume CONVERSATION_ID
 
 默认策略自动允许核实过的内置文件查询、TodoWrite 和 Agent Note，以及极小范围的字面量 Shell 查询（Windows `cd`、POSIX `pwd`、不含展开或复合语法的 `echo`）。文件写入、测试、构建、git、网络和未知工具仍要求审批；不要把 Shell 名称或“测试”标签视为无副作用。持久化模式不会向模型提供不支持恢复的 SubAgent / 后台启动工具，实际执行入口也拒绝它们。
 
-Windows 数据默认位于 `%LOCALAPPDATA%/mini-claude`，Linux 位于 `$XDG_DATA_HOME/mini-claude`（未设置时为 `~/.local/share/mini-claude`），按工作区分目录；可设置 `MINI_CLAUDE_DATA_DIR`。旧的硬编码 D 盘数据不会自动迁移，使用 `--checkpoint-db <旧数据库>` 定位。SQLite v1–v3 自动事务升级为 v4，保留原 runs/calls/approvals；没有记录会话身份的旧 Run 仍通过 `/runs` 查看，不猜测如何分组。
+Windows 数据默认位于 `%LOCALAPPDATA%/mini-claude`，Linux 位于 `$XDG_DATA_HOME/mini-claude`（未设置时为 `~/.local/share/mini-claude`），按工作区分目录；可设置 `MINI_CLAUDE_DATA_DIR`。旧的硬编码 D 盘数据不会自动迁移，使用 `--checkpoint-db <旧数据库>` 定位。SQLite v1–v4 自动事务升级为 v5，保留原 runs/calls/approvals；没有记录会话身份的旧 Run 仍通过 `/runs` 查看，不猜测如何分组。
 
 敏感字段及常见命令凭据仅在展示和诊断中脱敏，授权仍绑定原参数；审批详情不写入命令历史或命令结果日志。脱敏不能识别任意秘密，SQLite、Snapshot 和执行 Trace 仍是可信本地数据。源码指纹及整体工作区摘要的严格恢复校验仍保留，编辑无关文件也可能使旧审批失效；细化到操作前置条件属于后续独立改造。HITL 不提供 Shell 沙箱或多用户认证。
 
@@ -368,7 +368,13 @@ agent.resume_checkpoint(run_id)  # 重查上下文；不会重新生成待执行
 
 可以设置 `MINI_CLAUDE_DATA_DIR` 使用其他数据根目录。
 
-SQLite 模式同时提供上述 CLI 和 Python API：创建 Agent 时传入 `checkpoint_enabled=True`，或在新 Run 前调用 `agent.enable_checkpoints()`（自定义数据库必须在工作区外）。新实例使用相同工作区、数据库及兼容配置，然后调用 `agent.resume_checkpoint(run_id)`；该入口持锁读取、校验并继续执行。完成 Run 的重复恢复只返回已保存结果。持久化投影使用绑定数据库的 schema v2，不能走普通 `restore_run_snapshot()`；默认模式的独立 JSON 快照仍是 schema v1。
+SQLite 模式同时提供上述 CLI 和 Python API：创建 Agent 时传入 `checkpoint_enabled=True`，或在新 Run 前调用 `agent.enable_checkpoints()`（自定义数据库必须在工作区外）。新实例使用相同工作区、数据库及兼容配置，然后调用 `agent.resume_checkpoint(run_id)`；该入口持锁读取、校验并继续执行。完成 Run 的重复恢复只返回已保存结果。新独立 JSON 快照使用 schema v4，持久化投影使用绑定数据库的 v5（Checkpoint-only）或 v6（HITL），不能走普通 `restore_run_snapshot()`；旧 v1/v2/v3 格式仍可读取，执行恢复仍须通过源码、配置和当前权限校验。
+
+同进程继续也校验已提交的暂停边界。待执行文件调用另存实际目标指纹，覆盖工作区摘要忽略的目录及额外授权目录；文件检查不是文件系统锁，不能消除检查后外部进程修改文件的竞态。没有审批绑定的待执行 Shell 缺少通用作用域证明，暂停续跑或导入快照会阻断。现有 PREPARED 调用的显式审批流程保留；审批不证明全部外部环境未变化，也不能放行 UNKNOWN。
+
+工具结果分别保存 `result`（SUCCESS / FAILED / UNKNOWN）与 `effect`（NONE / APPLIED / PARTIAL / UNCERTAIN）。NONE 仅用于能证明 handler 未启动的调用，必须携带匹配的白名单原因码。Runtime 在参数绑定通过后、handler 调用前记录进入执行；此后的嵌套调用异常也不能变成 NONE。Store 再次检查原因码和 PREPARED 阶段；缺少明确效果声明时默认 UNCERTAIN。工具启动后的超时以及副作用不确定的失败，在持久化模式中保留 UNKNOWN 并停止后续执行。
+
+内置文件写入/编辑在 PREPARED 阶段保存执行前指纹与预期内容哈希；`/approval <Run ID>` 展示 UNKNOWN 的文件证据，Python API 为 `get_file_recovery_evidence(run_id, call_id, turn=...)`。证据只区分当前满足预期、与执行前相同、冲突、无法判断，不推断原调用成功或未执行，不解除阻断。旧记录没有证据时显示无法判断。
 
 数据库保存失败时立即停止，该实例不能继续 dispatch 或开始新任务。即使重新核验发现 COMMIT 已成功，也须由新实例从权威数据库恢复。UNKNOWN 没有自动解除或补偿接口；Shell / 文件系统副作用与 SQLite 不是同一个事务，父进程退出也不证明它启动的外部子进程已经结束。运行数据可能含任务文本、Note 和工具输出，应按敏感项目数据保护；不保存 Provider 凭据或完整环境。详细提交边界和限制见 [工具与 Runtime 演进](docs/evolution/tool_registry.md)。
 

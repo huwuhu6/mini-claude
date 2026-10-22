@@ -408,3 +408,109 @@ Conversation 范围在原 permission_grants 表的版本化 JSON 中保存，匹
 ### Decision / Limitation
 
 文件规则授权的是对选定文件的后续编辑/覆盖，不承诺代码内容安全，也不授予 Shell 或新路径授权。规则与执行日志不是同一个事实来源；旧批准不能因有资源规则而复活。整体源码和 Workspace 摘要仍是恢复门槛。更宽 Shell 查询、命令前缀、操作级前置条件和沙箱应作为独立任务；本轮没有扩大默认 Shell ALLOW。
+
+## 2026-10-22：恢复入口收紧、结果事实与文件核验证据
+
+Commit: `750390d`、`96a976c`、`8cb4138`
+Commit Description: `fix: 统一 Checkpoint 恢复入口与目标校验`；`fix: 保守记录工具效果并校验未执行证明`；`feat: 展示 UNKNOWN 文件调用的只读核验证据`
+
+本阶段按依赖拆成三个实现提交，文档另行提交。第一项只有入口、目标守卫及测试；第二项加入结果语义、执行标记、原因码和 Store 二次校验；第三项才加入准备证据及只读展示。第一、第二项分别在独立源码副本验证，避免提交只在最终合并状态可运行。
+
+### Description
+
+审查发现，使用 Run ID 加载历史时可能把 A 的消息留在 B 的会话身份下；含 UNKNOWN 的历史因此可能失去新执行阻断。同进程继续没有始终检查已提交的暂停基线，而整体工作区摘要又跳过 `.git`、`build` 和额外授权目录。首次快照前留下的 started Run 也因缺少快照而无法归档。这些入口问题必须先修，不能依靠后续核验按钮弥补。
+
+现在 Run ID 历史入口持会话锁和 Run 锁检查工作区、当前 head 与归档状态，加载成功后统一切换身份。原进程继续与重启恢复共用快照校验。待执行文件另外记录规范目标、内容哈希和文件身份/元数据，不改变循环治理原来的目录过滤规则；dispatch 前再次检查当前文件目标。没有审批绑定的待执行 Shell 缺少通用作用域证明，持久化暂停续跑或导入快照时阻断；保留普通内存模式的暂停及既有 PREPARED + 显式审批流程，不把正常首次审批执行变成不可用，也不允许审批绕过 UNKNOWN。审批仍不证明所有外部资源未变化，跨重启刷新 Shell 授权属于后续设计。空快照只允许依据已有 Conversation 的工作区归属归档，保留 started 状态和空日志，不伪造消息或未执行结果。
+
+超时和 handler 内部异常可能发生在副作用之后，不能仅凭布尔失败让模型重做。结果增加 result（成功、失败、未知）与 effect（未启动、完整效果、部分效果、不确定）两项分类，原 outcome 继续表达执行/阻断原因。NONE 只由 Runtime 在能证明 handler 未启动时记录；已进入 handler 的 NONE 声明被收紧为 UNCERTAIN。在 SQLite 模式，超时和效果不确定的失败关闭原批次：当前调用保留 UNKNOWN，后缀记为未执行，停止后续模型请求。明确失败但已声明效果完成的记录仍可保存为业务失败，不把 Journal 的 COMPLETED 解释为业务成功。
+
+新 JSON / Checkpoint-only / HITL 投影分别使用 v4/v5/v6，解析器仍读取旧 v1/v2/v3。旧结果不凭失败推断无副作用；读入时适配，不重写原 Journal。比较新旧投影结果时按适配后的语义检查，防止仅因新增字段破坏不可变历史。源码和配置兼容性检查继续保留，格式可读不意味着旧实现生成的 Run 可直接跨版本执行。
+
+文件核验只提供证据。PREPARED 阶段为受支持的内置 write_file/edit_file 记录执行前指纹和预期内容哈希，复用真实编辑算法并遵守 UTF-8、Windows 写入换行与编辑保留换行的规则。还未启动的后续调用可在前项完成后刷新准备证据；一旦进入 RUNNING，其证据不再刷新。数据库升级到 v5，增加独立的调用证据表；证据与 PREPARED 快照同一事务提交，关联原调用及工具契约，不重建旧证据或改写旧 calls。读取检查证据摘要与调用归属。
+
+Runtime API 与 `/approval` 只展示“当前后置条件满足、当前与执行前相同、冲突、无法判断”。文件现在的内容不证明原调用当时做了什么；A→B→A 也不能改成 NONE。证据查询不写数据库，不改 effect、UNKNOWN 或执行资格；当前权限撤销、没有准备证据、实现不受支持或不能观察时保持无法判断。
+
+### Result / Evidence
+
+先写正式回归测试再修改实现：入口阶段首次 8 项失败，修复及权限拒绝边界更新后定向 9 项通过；结果阶段首次 6 项失败、1 项通过，修复及 handler 效果后异常的旧预期更新后定向 9 项通过。文件证据阶段首次 7 项失败，随后验证真实文件内容、调用次数、数据库前后不变、证据提交失败、A→B→A、冲突、旧 v4 数据库升级，以及同一路径后续调用根据前项实际效果准备证据。三个新增回归文件最终共 29 项。
+
+本轮实际解释器为从 PATH 发现并验证的 Python 3.12.1，pytest 8.1.1；py 启动器没有注册 Runtime。使用真实 Agent / SQLite / 文件、确定性 MockProvider，未调用真实模型、未运行 Evaluation。
+
+| 验证组 | 范围 | 最终结果 |
+| --- | --- | --- |
+| 恢复主回归 | Checkpoint Store/Runtime、Snapshot、HITL、Approval、Conversation、CLI Sessions 和新增回归 | 292 passed |
+| 相邻行为 | RunState、消息闭环、Registry、Observation、HITL CLI/Menu；先排除键盘模拟 | 174 passed、10 skipped、5 deselected |
+| 补充边界 | 新增回归、权限、Workspace、ShellSession、文件授权 UI；先排除键盘模拟与真实 Git Bash 对照 | 113 passed、2 skipped、9 deselected |
+| Windows 环境复核 | 上述被排除的 10 项键盘模拟与 4 项 Git Bash 对照，20 秒上限、正常权限运行 | 14 passed |
+
+收集器确认上述 21 个文件共 577 项；分组间重叠 28 项，去重后为 565 passed、12 项既有平台条件 skipped。Git diff --check 通过。未声称整个仓库完整测试集通过。
+
+最初沙箱内 Git Bash 初始化命名对象报 0xC0000022，4 项外部对照在进入 Runtime 前失败；键盘管道用例也挂起，有界复核 20 秒停止。正常权限下同样 14 项在 5.27 秒全部通过，说明该组初次结果属于环境限制。另一次子进程错误输出遇到 GBK/UTF-8 不一致，统一本轮父子测试进程编码后通过。没有为这些现象改动 Shell、UI 键盘实现或原测试 oracle。旧测试中涉及“效果后异常仍算普通失败”和“权限撤销后仍导入”的预期，随新安全边界更新为 UNKNOWN 或更早拒绝；明确业务失败的用例补充了效果声明。
+
+### 变更文件清单
+
+| 文件 | 变化 |
+| --- | --- |
+| `src/agent/mini_claude_agent.py` | 恢复入口、目标检查、结果传播与 UNKNOWN 停止、只读证据 API |
+| `src/cli/hitl_commands.py` | 展示文件核验证据，保留 UNKNOWN 提示 |
+| `src/core/checkpoint_store.py` | v5 证据表、准备阶段原子保存、证据校验、旧结果语义比较 |
+| `src/core/approvals.py` | 兼容新旧 HITL 投影版本 |
+| `src/core/run_snapshot.py` | 新旧投影版本及结果解码适配 |
+| `src/core/run_state.py` | 持久化结果/效果事实与一致性约束 |
+| `src/core/tools/base_tools.py` | ToolResult 分类及文件成功效果声明 |
+| `src/core/tools/registry.py` | 参数绑定通过后调用执行标记，绑定异常携带来源 Registry |
+| `src/core/tool_outcome.py`（新增） | 共用分类词表及旧结果的保守解释 |
+| `src/core/runtime_context/file_checkpoint.py`（新增） | 文件指纹、预期哈希与四类证据 |
+| `tests/unit/test_checkpoint_recovery_guards.py`（新增） | 入口、目标、空快照归档及工作区边界回归 |
+| `tests/unit/test_checkpoint_result_semantics.py`（新增） | 结果分类、超时/异常阻断与旧事实不重写 |
+| `tests/unit/test_checkpoint_execution_proof.py`（新增） | 嵌套异常、执行标记后故障、NONE 原因码和 Store 阶段校验 |
+| `tests/unit/test_checkpoint_file_evidence.py`（新增） | 文件故障注入、证据只读、编码、升级及依赖写入 |
+| `tests/unit/test_checkpoint_runtime.py` | 明确业务失败的工具补充效果声明 |
+| `tests/unit/test_checkpoint_store.py`、`tests/unit/test_approvals.py` | 未执行夹具携带明确的准备阶段原因码，保留原断言 |
+| `tests/unit/test_hitl_runtime.py` | 效果后异常必须 UNKNOWN，后续调用不执行 |
+| `tests/unit/test_run_snapshot.py` | 授权撤销后在导入前拒绝，保留文件保护断言 |
+| `README.md` | 当前版本、恢复边界和证据查询用法 |
+| `docs/checkpoint_review_findings.md` | 保留审查基线并链接当前实施进展 |
+| `docs/HANDOFF.md` | 当前现场与验证记录 |
+| `docs/evolution/tool_registry.md` | 本阶段原因、证据、取舍和后续设计 |
+
+### Decision / Limitation
+
+未实现自动解除阻断、Shell 核验/重新授权出口、服务端幂等键、哈希链、清理策略或完整原始历史归档。当前保守默认可能让缺少效果声明的普通失败也停止 SQLite 执行；未来要通过明确工具契约缩小这一范围，不能凭错误文本推断没有效果。文件指纹不是跨进程资源锁，仍有检查到写入之间的竞态；证据哈希用于检查损坏，不是来源真实性签名。
+
+自动解除的后续设计必须在一个持锁、带版本校验的数据库事务中追加核验证据及处理决定，关联原调用、资源版本和策略，不改写原 UNKNOWN；执行资格与后续批次转换一起提交。提交失败沿现有隔离规则停止，重启只接受已提交的决定。还需处理原执行是否仍在进行、核验后资源再次变化，以及核验成功但提交前/后再次崩溃。本轮不提供该转换接口。
+
+Shell 后续出口要区分：能证明未启动的调用，刷新环境后重新审批；已启动且效果未知的调用，保留原 UNKNOWN，由用户显式授权一个关联原操作的新尝试，记录操作者、风险说明与新批准，不能复用旧批准或把原事实变成 NONE。父进程结束不证明其外部子进程结束。本轮只保留既有归档与新任务路径，不新增确认即执行的按钮。
+
+### 提交前独立审计：嵌套异常造成 NONE 误判
+
+独立探针发现：外层工具先追加文件，再调用嵌套 Registry；嵌套调用因缺少参数抛出绑定异常，外层 dispatcher 只按异常类型把整个外层调用标为 INVALID_ARGUMENTS。SQLite 的普通保存又允许这个标签从 RUNNING 转成 NOT_EXECUTED，终结保存也缺少阶段检查。实际写入已发生，却记录为 NONE；普通模式会继续执行后续工具并请求模型，HITL 模式也留下错误的未执行事实。此前相关测试全部通过，仍没有证明这个实现符合“NONE 必须证明未启动”的原则。
+
+现在 Registry 在外层参数绑定成功后、调用 handler 前执行 Runtime 回调：先提交 RUNNING，再设置本次调用的内存进入标记，随后发送开始事件并调用 handler。进入标记之后，嵌套绑定异常按执行失败处理，效果保持 UNCERTAIN，持久化模式终结为 UNKNOWN 并关闭未启动后缀。真正的外层参数绑定拒绝发生在 RUNNING 之前；异常还必须带当前 Registry 来源，不能仅靠异常类型推断未执行。存储故障继续直接传播，不能变成工具错误反馈。
+
+NONE 的唯一构造函数为 `non_execution_facts()`，要求传入 `NonExecutionReason` 枚举。八处 Runtime 调用分别位于以下明确的未启动分支；没有按 outcome 自动生成 NONE 的兜底路径。
+
+| 调用位置（`mini_claude_agent.py`） | 原因码 | 为什么能证明未启动 |
+| --- | --- | --- |
+| `finish_tool_batch` 的未执行闭合 | BATCH_ABORTED | 只给未派发的当前项或后缀补齐结果；已启动项保留 UNKNOWN |
+| 同一响应重复调用跳过 | DUPLICATE_SKIPPED | 当前重复项不进入 dispatcher；不否认前一项可能已有副作用 |
+| 模型参数 JSON 解析拒绝 | ARGUMENTS_REJECTED | JSON 无效时尚未进入 dispatcher |
+| 环境预检阻断分支 | PRECHECK_REJECTED | 发生在 handler 派发前；当前启动 OFFLINE 只作证据，不触发该阻断 |
+| 写入停滞或循环策略预阻断 | PRECHECK_REJECTED | 当前项在 `_execute_tool` 前被拒绝 |
+| 权限拒绝或用户拒绝审批 | PERMISSION_DENIED / APPROVAL_REJECTED | 审批门控直接返回，尚未参数绑定和进入执行 |
+| 用户拒绝后的依赖后缀闭合 | BATCH_ABORTED | 串行循环没有派发这些后缀项 |
+| dispatcher 明确拒绝 | FEATURE_DISABLED / UNKNOWN_TOOL / ARGUMENTS_REJECTED | 前两种在 Registry 前返回；参数拒绝需来源验证且进入标记尚未设置 |
+
+Store 的 `save_snapshot` 和 `finish` 独立检查：新 NOT_EXECUTED 结果必须仍处于 PREPARED，effect 为 NONE，原因码合法且匹配 outcome。合法原因码也不能把 RUNNING 改成未执行。原因码和结果在同一事务保存。未显式声明 effect 的新状态默认 UNCERTAIN；旧三字段结果以及没有原因码的旧五字段 NONE 只在读取解释时保守适配，不修改原 Journal 字节；原 UNKNOWN 不能降级。旧格式可读仍不代表能够跨实现版本恢复执行。
+
+本次先将两项探针和异常注入等 20 项测试加入工作区，普通 Windows 权限下修复前 12 failed、8 passed；随后补充四项 Store 正向/阶段测试。将最终 24 项放到完整保留的 P1 修复前代码副本重跑，结果为 16 failed、8 passed、0 error。八项原本通过的安全边界不计为旧缺陷。另将原三文件的 29 项回归放到 `59e99c5` 基线（其 src/tests 与 `4063895` 相同），结果仍为 26 failed、3 passed，不能称为 29 个先红后绿的旧缺陷。
+
+标记后参数化注入覆盖 handler 内异常、嵌套 Registry 绑定异常、开始事件异常、结果转字符串异常、快照序列化异常；每项检查执行事实、实际调用次数和后续模型请求。原两项独立探针与十种入口 × 两种 UNKNOWN 来源的审计用例重跑共 22 passed。真实写入后、结果事务提交前强杀 worker，两次新进程恢复均 UNKNOWN/PREPARED，证据为 POSTCONDITION_SATISFIED、恢复后的模型请求均为零，后缀文件不存在，查询前后 Journal 不变。
+
+### 最终提交前验证
+
+Windows 使用本轮动态发现并确认的 Python 3.12.1，最终执行完整 `tests/unit` 及 CI 指定的 `tests/integration/test_cli_input.py`、`tests/integration/test_loop_controller.py`：871 passed、13 skipped、0 failed。13 项跳过由 10 项 POSIX Shell、2 项符号链接权限、1 个缺少可选 Harbor 依赖的模块收集组成，没有跳过进程崩溃测试。首轮全量唯一失败是审批夹具直接创建未执行记录却没有原因码；补齐夹具、保留原断言后，审批/P1 定向 65 passed，并完整重跑得到上述结果。
+
+本机 WSL 仅有 Docker Desktop 发行版，没有 Python；利用已有 `python:3.12-slim` 镜像运行 Linux Python 3.12.15，测试阶段禁网且不传入 Provider 密钥。临时容器第一次使用较早源码副本且子进程覆盖 PYTHONPATH 导致缺依赖，修正后 Windows 挂载目录版本仍到达 600 秒上限，均不计为通过。最终把同一源码和依赖放入原生 Linux 容器文件系统，六个相关测试文件结果为 190 passed、3 skipped；三个跳过均为 Windows CMD 专属语义。原 Windows 跳过的 10 项 POSIX 与 2 项符号链接用例全部通过，Checkpoint/HITL 的真实进程崩溃、竞争执行者与强杀恢复测试也在 Linux 通过。未将挂载目录超时归因为 Runtime 代码缺陷，也没有为此修改生产代码。
+
+第一个提交的独立副本入口/快照测试 63 passed；第二个提交的独立副本结果/证明/Store/Registry/入口/快照测试 145 passed，补充审批组 41 passed。最后状态的原三个新增回归文件 29 项和本次执行证明文件 24 项均在 Windows 全量中通过。不同验证组有重叠，不累加为测试总数。使用桩 Provider，未调用真实 API、运行正式 Evaluation 或改变外部项目状态。

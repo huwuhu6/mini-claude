@@ -1,3 +1,13 @@
+## 2026-10-22：Checkpoint 修复、独立审计与跨平台验证完成
+
+当前分支 `checkpoint_review`，未推送。实现按用户授权拆为 `750390d`（恢复入口与目标校验）、`96a976c`（result/effect、P1 执行证明与二次守卫）、`8cb4138`（只读文件证据），本条随独立文档提交保存。已修复 Run ID 历史会话绑定与 UNKNOWN 阻断、原进程继续的快照校验、文件目标前置指纹，以及首次快照前 started Run 的归档。
+
+提交前独立探针发现外层写入后，嵌套 Registry 参数异常被误判为 NOT_EXECUTED/NONE。现由参数绑定后的进入标记、枚举原因码和 Store 的 PREPARED 阶段检查共同收口；默认 effect 为 UNCERTAIN。原 29 项在原始基线为 26 红、3 绿；本次最终 24 项在 P1 修复前副本为 16 红、8 绿，均不能当作同数量旧缺陷。全部新用例在最终版本通过。
+
+最终 Windows Python 3.12.1 完整单元及 CI 两组集成测试 871 passed、13 skipped；Linux 原生容器六文件 190 passed、3 个 Windows 专属 skipped。Windows 的跳过为 10 项 POSIX、2 项符号链接、1 个可选 Harbor 模块；前 12 项在 Linux 全部通过。原审计探针及入口核查 22 passed；强杀真实文件写入进程后两次恢复均 UNKNOWN、显示证据且后续模型/工具不执行。第一、第二个提交分别做了独立副本验证。没有真实 API 或 Evaluation 开销。
+
+数据库 schema v5 与快照 v4/v5/v6 保守兼容旧格式，旧 Journal 不重写；文件证据不改 effect、不解除 UNKNOWN。现有 PREPARED + 显式 Shell 审批保留，没有审批绑定的持久化暂停 Shell 和导入快照仍阻断。自动解除、Shell 新尝试出口、哈希链与清理未实现；TOCTOU 仍是边界。完整 23 个变更文件、逐项 NONE 证明及测试环境问题见 [工具与 Runtime 演进](evolution/tool_registry.md) 的 2026-10-22 阶段；[审查报告](checkpoint_review_findings.md) 保留旧基线，后续按未处理项继续讨论。
+
 ## 2026-10-22：main 已整合推送，进入 Checkpoint 审查阶段
 
 功能提交 `4063895` 及文档收尾提交 `a227f0b` 已从 `codex/fix-provider-config-discovery` 快进整合到 `main` 并推送至 `origin/main`。当前工作区从该 main 创建并切换到 `checkpoint_review`，不使用分支前缀。
