@@ -2,7 +2,7 @@
 
 ## 2026-10-28
 
-Commit: `PENDING`
+Commit: `2124f03`
 Commit Description: `fix: 实现模型输出截断的有界恢复与任务内降档`
 
 ### Description
@@ -130,7 +130,7 @@ Commit Description: `fix: 实现模型输出截断的有界恢复与任务内降
 
 ### Result / Evidence
 
-最终代码在 Windows / Python 3.12.1 上完成以下验证：
+最终代码在 Windows / Python 3.12.1 上完成以下验证；提交前再次复测输出恢复、效果对照和请求记录三个专项，87 项全部通过（约 62 秒）：
 
 | 验证范围 | 结果 |
 |---|---|

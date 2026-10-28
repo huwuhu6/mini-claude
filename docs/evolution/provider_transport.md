@@ -4,8 +4,8 @@
 
 ## 2026-10-28：按输出截断恢复能力验收，独立于编程任务得分
 
-Commit: `PENDING`
-Commit Description: `test: 验证有恢复机会时输出截断不会立即终止运行`
+Commit: `2124f03`
+Commit Description: `fix: 实现模型输出截断的有界恢复与任务内降档`
 
 ### Description
 
@@ -37,8 +37,8 @@ Commit Description: `test: 验证有恢复机会时输出截断不会立即终�
 
 ## 2026-10-28：任务内保留降档的首题实测与超时记录缺口
 
-Commit: `PENDING`
-Commit Description: `test: 记录跨轮降档首题超时及最终 Trace 缺失`
+Commit: `2124f03`
+Commit Description: `fix: 实现模型输出截断的有界恢复与任务内降档`
 
 ### Description
 
@@ -64,8 +64,8 @@ Session 记录进入第 39 轮，63 次工具调用和对应结果，其中一�
 
 ## 2026-10-28：按部署声明降档，并在同一任务保留已采用的强度
 
-Commit: `PENDING`
-Commit Description: `fix: 支持按部署声明降档并在任务内保留恢复强度`
+Commit: `2124f03`
+Commit Description: `fix: 实现模型输出截断的有界恢复与任务内降档`
 
 ### Description
 
@@ -95,8 +95,8 @@ Windows Python 3.12.1 的完整 `tests/unit` 回归为 928 项通过、13 项跳
 
 ## 2026-10-28：小输出额度下的首题真实验证
 
-Commit: `PENDING`
-Commit Description: `test: 记录小额度输出恢复的 Terminal-Bench 首题表现`
+Commit: `2124f03`
+Commit Description: `fix: 实现模型输出截断的有界恢复与任务内降档`
 
 ### Description
 
@@ -126,8 +126,8 @@ Trace 记录输入 1327658 tokens，其中 1189888 命中缓存；输出 109682�
 
 ## 2026-10-28：输出截断后安全重新生成
 
-Commit: `PENDING`
-Commit Description: `fix: 支持输出超限的有限恢复并保留审批与预算边界`
+Commit: `2124f03`
+Commit Description: `fix: 实现模型输出截断的有界恢复与任务内降档`
 
 ### Description
 

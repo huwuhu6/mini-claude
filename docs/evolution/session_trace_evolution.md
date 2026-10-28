@@ -2,8 +2,8 @@
 
 ## 2026-10-28：外部超时后保留逐请求证据
 
-Commit: `PENDING`
-Commit Description: `fix: 将主循环和摘要请求的参数与用量逐次写入会话记录`
+Commit: `2124f03`
+Commit Description: `fix: 实现模型输出截断的有界恢复与任务内降档`
 
 ### Description
 
