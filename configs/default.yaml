@@ -7,10 +7,22 @@ agent:
 llm:
   provider: "dashscope"  # Alibaba Cloud Bailian / DashScope
   model: "deepseek-v4-flash-0731"
-  max_tokens: 32768
+  max_tokens: 8192
   temperature: 0.7
   timeout_ms: 60000
   stream: true
+  # Effective choices from lowest to highest; only for this deployment.
+  reasoning_effort: high
+  supported_reasoning_efforts: [low, high, max]
+  output_limit_recovery:
+    enabled: true
+    persist_effort_for_run: true
+    max_retries_per_turn: 2
+    max_retries_per_run: 4
+    max_output_tokens: 32768
+    # Conservative reservation: estimated input + full output for extra requests.
+    max_retry_tokens_per_run: 262144
+    context_safety_margin_tokens: 2048
 
   # Deepseek configuration
   deepseek:

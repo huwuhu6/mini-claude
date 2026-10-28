@@ -124,6 +124,24 @@ python -m cli.entrypoint . --yes
 
 百炼上的 DeepSeek 应配置 `llm.provider: dashscope` 并使用 `DASHSCOPE_API_KEY`，模型名称与百炼控制台一致。`deepseek` Provider 默认连接 DeepSeek 官方服务，与百炼账户余额不互通。启动会显示实际 Provider / 模型，不显示密钥。
 
+### 模型输出超限后的恢复
+
+OpenAI-compatible 主链路遇到 `finish_reason=length`（或 `max_tokens`、`limit`）时，会丢弃该响应的正文和全部工具调用，使用截断前的消息重新请求当前这一轮。已经完成的工具不会重放，恢复成功后的工具仍经过原来的权限检查和人工审批。恢复耗尽后以 `PROVIDER_OUTPUT_LIMIT` 失败结束。
+
+仓库默认配置的正常输出上限为 8,192 tokens，`llm.output_limit_recovery` 已启用：每轮最多额外请求 2 次，整个 Run 最多 4 次，恢复请求的输出上限为 32,768 tokens。额外请求按“估算输入 + 完整输出额度”预留预算，整个 Run 最多预留 262,144 tokens；实际报告超过预留时补记差额，不因少用、缺少 usage 或重启退还额度。该预算用于限制重试，不是精确费用预测。设 `enabled: false` 可恢复为截断后直接失败，便于对照实验。未使用仓库 YAML 的自定义配置应显式填写这些上限；配置类型的缺省值保持恢复实现时的较宽设置。
+
+`llm.reasoning_effort` 指定初始强度，`llm.supported_reasoning_efforts` 按**从低到高**声明当前部署实际不同、且允许在任务中切换的选择。名称不限制为 low/medium/high/max；不支持强度控制时将初始值设为 null、列表设为空，只调整输出长度。没有思考能力与没有强度参数不是同一件事，应以实际接口为准。恢复每次降低一档，到最低后才在额度内提高输出上限；不会自动升档、切换模型或关闭思考。旧配置的列表曾只用于成员判断，升级时必须检查排列顺序。默认配置针对百炼 `deepseek-v4-flash-0731`，顺序为 `[low, high, max]`。Anthropic 暂不接入自动恢复。
+
+`llm.output_limit_recovery.persist_effort_for_run` 控制是否在同一用户任务中保留已采用的较低强度：仓库 YAML 显式开启，配置类型默认关闭以兼容原有临时调整。只有恢复请求收到完整的正常完成或工具调用响应才记住配置；网络失败、再次截断或未发出的请求不会提交记忆。工具参数仍独立校验、审批，不能因为降档而绕过检查。下一轮只继承强度，不继承扩大后的输出上限；新用户任务从初始配置开始。次数与 Token 预算不因降档重置。
+
+Provider 负责接口合法值及别名。仅 DeepSeek 官方 endpoint 按其文档合并等效名称，例如 medium/xhigh 与 high；其他兼容服务必须声明自己的有效选择，不能据模型名称推断。更换模型或服务时需重新核对声明、顺序及切换限制；接口返回成功也不能证明一个未声明参数实际生效。
+
+每次请求前还会根据完整请求估算、`compression.context_window_tokens` 和默认 2,048 tokens 的安全余量限制输出空间。确实不足时最多尝试一次现有压缩，之后重新估算；usage 缺失不会单独触发压缩。摘要自身被截断时保留原历史。Trace 的每轮 `provider_attempts` 保存各次请求参数、停止原因和 usage，任务总消耗包含失败尝试。持久化模式在额外请求前保存预算；若进程此时退出，恢复会保守跳过已预留的尝试，避免反复重启获得无限重试。
+
+完整 Trace 仍在任务结束时写盘；主循环与压缩摘要的每次 Provider 调用另外立即写入 Session 的 `provider_request_started` / `provider_request_finished`，通过 `request_id` 关联，包含 Run、轮次、尝试序号、请求参数、返回原因及已取得的用量。仅有 started、没有 finished 的请求尚无完成记录，用量未知；不能补成零或凭日志重放请求。恢复事件另保存已用次数和已预留 Token，预算仍以 RunState / Checkpoint 为准。
+
+DeepSeek 兼容 Provider 的 Session 记录只保留服务实际提供的有效用量字段，缺失字段保持未知；`usage_origin=normalized` 表示其他适配器提供的归一化统计，不能冒充原始完整报告。新增请求事件不包含提示正文、响应正文或私有思考内容，错误只记类型。外部超时可能仍没有最终 Trace 或 headless 结果文件，但在正常文件写入条件下，已完成请求的 Session 记录可保留；已知用量的部分合计不能冒充整个任务的总消耗。
+
 ### 本地 HITL 审批与恢复
 
 CLI 默认启用审批与 SQLite 会话保存。首次启动自动初始化工作区对应的数据目录，无需了解数据库参数：
@@ -368,7 +386,7 @@ agent.resume_checkpoint(run_id)  # 重查上下文；不会重新生成待执行
 
 可以设置 `MINI_CLAUDE_DATA_DIR` 使用其他数据根目录。
 
-SQLite 模式同时提供上述 CLI 和 Python API：创建 Agent 时传入 `checkpoint_enabled=True`，或在新 Run 前调用 `agent.enable_checkpoints()`（自定义数据库必须在工作区外）。新实例使用相同工作区、数据库及兼容配置，然后调用 `agent.resume_checkpoint(run_id)`；该入口持锁读取、校验并继续执行。完成 Run 的重复恢复只返回已保存结果。新独立 JSON 快照使用 schema v4，持久化投影使用绑定数据库的 v5（Checkpoint-only）或 v6（HITL），不能走普通 `restore_run_snapshot()`；旧 v1/v2/v3 格式仍可读取，执行恢复仍须通过源码、配置和当前权限校验。
+SQLite 模式同时提供上述 CLI 和 Python API：创建 Agent 时传入 `checkpoint_enabled=True`，或在新 Run 前调用 `agent.enable_checkpoints()`（自定义数据库必须在工作区外）。新实例使用相同工作区、数据库及兼容配置，然后调用 `agent.resume_checkpoint(run_id)`；该入口持锁读取、校验并继续执行。完成 Run 的重复恢复只返回已保存结果。新独立 JSON 快照使用 schema v10，持久化投影使用绑定数据库的 v11（Checkpoint-only）或 v12（HITL），保存输出恢复预算与任务内强度记忆，不能走普通 `restore_run_snapshot()`；旧 v1–v9 格式仍可读取，缺少的旧版强度记忆默认为空，不退还已有恢复预算。执行恢复仍须通过源码、配置、实际 Provider 部署及当前权限校验，能读取旧格式不代表能跨代码升级继续旧审批。
 
 同进程继续也校验已提交的暂停边界。待执行文件调用另存实际目标指纹，覆盖工作区摘要忽略的目录及额外授权目录；文件检查不是文件系统锁，不能消除检查后外部进程修改文件的竞态。没有审批绑定的待执行 Shell 缺少通用作用域证明，暂停续跑或导入快照会阻断。现有 PREPARED 调用的显式审批流程保留；审批不证明全部外部环境未变化，也不能放行 UNKNOWN。
 

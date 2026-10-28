@@ -25,7 +25,9 @@ from core.loop_controller import (
 from core.runtime_context.observation import ObservationNormalizer
 from core.runtime_context.workspace_authority import WorkspaceAuthority
 from core.tools.base_tools import ToolResult
+from core.session_recorder import SessionRecorder
 from models.todo import TodoManager
+from models.config import LLMConfig
 from providers.base import Message
 from providers.deepseek import DeepseekProvider
 
@@ -86,9 +88,10 @@ def make_agent():
         agent._current_user_prompt = "test task"
         agent._workspace_confirmed = True
         agent.system_prompt = "test system prompt"
-        agent.config = SimpleNamespace(llm=SimpleNamespace(
+        agent.config = SimpleNamespace(llm=LLMConfig(
             provider="mock", model="test-model", max_tokens=64,
             temperature=0, stream=False,
+            output_limit_recovery={"enabled": False},
         ))
         agent.messages = [Message(role="user", content="test task")]
         agent.runtime_context = SimpleNamespace(
@@ -123,6 +126,7 @@ def make_agent():
         agent.session_recorder = SimpleNamespace(
             record=lambda event, **data: agent.recorded_events.append((event, data)),
         )
+        agent.session_recorder.provider_request = SessionRecorder.provider_request.__get__(agent.session_recorder)
         agent.environment_blocker = SimpleNamespace(
             check_command=lambda *_args: None,
             classify_result=lambda *_args, **_kwargs: None,

@@ -41,6 +41,11 @@ def configure_primary_provider(manager: ProviderManager, llm: LLMConfig) -> None
         'timeout': llm.timeout_ms / 1000.0,
         'stream': llm.stream,
     }
+    if llm.provider in {'deepseek', 'dashscope'}:
+        if llm.reasoning_effort is not None:
+            provider_config['reasoning_effort'] = llm.reasoning_effort
+        if llm.supported_reasoning_efforts:
+            provider_config['supported_reasoning_efforts'] = list(llm.supported_reasoning_efforts)
 
     if api_key:
         try:

@@ -10,6 +10,28 @@ load_dotenv()
 
 
 @dataclass
+class OutputLimitRecoveryConfig:
+    enabled: bool = True
+    persist_effort_for_run: bool = False
+    max_retries_per_turn: int = 2
+    max_retries_per_run: int = 4
+    max_output_tokens: int = 65536
+    max_retry_tokens_per_run: int = 1_000_000
+    context_safety_margin_tokens: int = 2048
+
+    def __post_init__(self):
+        if type(self.enabled) is not bool:
+            raise ValueError("output_limit_recovery.enabled 必须为布尔值")
+        if type(self.persist_effort_for_run) is not bool:
+            raise ValueError("output_limit_recovery.persist_effort_for_run 必须为布尔值")
+        for name in ("max_retries_per_turn", "max_retries_per_run", "max_output_tokens",
+                     "max_retry_tokens_per_run", "context_safety_margin_tokens"):
+            value = getattr(self, name)
+            if type(value) is not int or value < (1 if name == "max_output_tokens" else 0):
+                raise ValueError(f"output_limit_recovery.{name} 必须为有效整数")
+
+
+@dataclass
 class LLMConfig:
     provider: str = "deepseek"
     model: str = "deepseek-chat"
@@ -19,6 +41,24 @@ class LLMConfig:
     base_url: str = ""
     timeout_ms: int = 60000
     stream: bool = True
+    # Deployment declaration, ordered from lowest to highest effective effort.
+    reasoning_effort: Optional[str] = None
+    supported_reasoning_efforts: list[str] = field(default_factory=list)
+    output_limit_recovery: OutputLimitRecoveryConfig = field(default_factory=OutputLimitRecoveryConfig)
+
+    def __post_init__(self):
+        if isinstance(self.output_limit_recovery, dict):
+            self.output_limit_recovery = OutputLimitRecoveryConfig(**self.output_limit_recovery)
+        if not isinstance(self.output_limit_recovery, OutputLimitRecoveryConfig):
+            raise ValueError("llm.output_limit_recovery 必须为配置对象")
+        if (type(self.supported_reasoning_efforts) is not list
+                or any(type(v) is not str or not v.strip() or v != v.strip()
+                       for v in self.supported_reasoning_efforts)
+                or len(set(self.supported_reasoning_efforts)) != len(self.supported_reasoning_efforts)):
+            raise ValueError("llm.supported_reasoning_efforts 必须为从低到高、不重复的有效强度名称列表")
+        if self.reasoning_effort is not None and (type(self.reasoning_effort) is not str
+                or self.reasoning_effort not in self.supported_reasoning_efforts):
+            raise ValueError("llm.reasoning_effort 必须在已声明的支持列表中")
 
 
 @dataclass

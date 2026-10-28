@@ -1,4 +1,5 @@
 import json
+import hashlib
 import logging
 import os
 import re
@@ -92,6 +93,8 @@ class DeepseekProvider(LLMProvider):
                 params['tools'] = formatted_tools
 
             # Add any additional parameters
+            if self.config.get('reasoning_effort') is not None:
+                params['reasoning_effort'] = self.config['reasoning_effort']
             params.update(kwargs)
             if params['stream']:
                 params.setdefault('stream_options', {'include_usage': True})
@@ -111,6 +114,73 @@ class DeepseekProvider(LLMProvider):
                 json.dumps(self.last_error_diagnostic, ensure_ascii=False, sort_keys=True),
             )
             raise
+
+    def output_limit_recovery_contract(self) -> Dict[str, Any]:
+        """Declared deployment semantics, without credentials or mutable Run state."""
+        endpoint = urlparse(getattr(self, 'base_url', self.config.get('base_url', '')))
+        # Only the official endpoint promises these aliases. Compatible gateways
+        # must declare their own distinct effective values; never infer by model name.
+        aliases = ({'minimal': 'low', 'medium': 'high', 'xhigh': 'high', 'ultra': 'max'}
+                   if endpoint.hostname == 'api.deepseek.com' else {})
+        declared = self.config.get('supported_reasoning_efforts', [])
+        if (type(declared) is not list or any(type(v) is not str or not v.strip()
+                or v != v.strip() for v in declared) or len(set(declared)) != len(declared)):
+            raise ValueError('部署强度必须声明为从低到高、不重复的名称列表')
+        ordered = []
+        for name in declared:
+            value = aliases.get(name, name)
+            if ordered and value == ordered[-1]:
+                continue
+            if value in ordered:
+                raise ValueError('等效强度重复出现，部署声明的顺序无效')
+            ordered.append(value)
+        initial = self.config.get('reasoning_effort')
+        if initial is not None:
+            if type(initial) is not str or initial not in declared:
+                raise ValueError('初始强度不在部署声明中')
+            initial = aliases.get(initial, initial)
+        identity = (endpoint.scheme, endpoint.hostname, endpoint.port, endpoint.path.rstrip('/'))
+        return {'efforts': ordered, 'initial_effort': initial,
+                'endpoint_sha256': hashlib.sha256(json.dumps(identity).encode()).hexdigest()}
+
+    def output_limit_initial_parameters(self, max_tokens: int,
+                                        effective_effort: Optional[str] = None, *,
+                                        ceiling_effort: Optional[str] = None) -> Dict[str, Any]:
+        contract = self.output_limit_recovery_contract()
+        effort = contract['initial_effort']
+        ordered = contract['efforts']
+        if ceiling_effort is not None:
+            if (effort is None or type(ceiling_effort) is not str or ceiling_effort not in ordered
+                    or ordered.index(ceiling_effort) > ordered.index(effort)):
+                raise ValueError('恢复强度上限不属于当前部署或超过初始强度')
+            effort = ceiling_effort
+        if effective_effort is not None:
+            if (effort is None or type(effective_effort) is not str or effective_effort not in ordered
+                    or ordered.index(effective_effort) > ordered.index(effort)):
+                raise ValueError('恢复强度不属于当前部署或超过初始强度')
+            effort = effective_effort
+        parameters = {'max_tokens': max_tokens}
+        if effort is not None:
+            parameters['reasoning_effort'] = effort
+        return parameters
+
+    def output_limit_retry_parameters(self, current: Dict[str, Any], max_tokens: int) -> Optional[Dict[str, Any]]:
+        """Only send reasoning controls explicitly declared by the deployment."""
+        candidate = dict(current)
+        supported = self.output_limit_recovery_contract()['efforts']
+        effort = candidate.get('reasoning_effort')
+        # Also reject corrupted/restored choices before constructing a new request.
+        if current != self.output_limit_initial_parameters(current['max_tokens'], effort):
+            raise ValueError('输出恢复参数不是当前部署的规范参数')
+        if effort is not None and supported.index(effort) > 0:
+            candidate['reasoning_effort'] = supported[supported.index(effort) - 1]
+            candidate['max_tokens'] = min(candidate['max_tokens'], max_tokens)
+            return candidate
+        increased = min(max_tokens, current['max_tokens'] * 2)
+        if increased > current['max_tokens']:
+            candidate['max_tokens'] = increased
+            return candidate
+        return None
 
     @staticmethod
     def _collect_stream(stream: Any) -> Dict[str, Any]:
@@ -192,6 +262,10 @@ class DeepseekProvider(LLMProvider):
 
         if finish_reason is None:
             raise ValueError('流式 Provider 响应未正常结束，已丢弃不完整内容')
+        # A normally terminated but truncated stream is a recoverable output
+        # limit, even when the final tool fields were never generated.
+        if finish_reason in {'length', 'max_tokens', 'limit'}:
+            calls = {}
         ids = [call['id'] for call in calls.values()]
         if any(not isinstance(call_id, str) or not call_id for call_id in ids):
             raise ValueError('流式 Provider tool_call 缺少 id')
@@ -411,11 +485,22 @@ class DeepseekProvider(LLMProvider):
         if not isinstance(reasoning_tokens, int) or reasoning_tokens < 0:
             reasoning_tokens = 0
 
+        # Keep absent/invalid counters distinguishable from an explicitly reported
+        # zero in durable request observations; legacy aggregate metrics stay intact.
+        reported_usage = {name: value for name, value in (
+            ('prompt_tokens', field(usage, 'prompt_tokens', None)),
+            ('completion_tokens', field(usage, 'completion_tokens', None)),
+            ('total_tokens', field(usage, 'total_tokens', None)),
+            ('cached_tokens', field(prompt_details, 'cached_tokens', None)),
+            ('reasoning_tokens', field(completion_details, 'reasoning_tokens', None)),
+        ) if type(value) is int and value >= 0}
+
         return {
             'content': content,
             'tool_calls': tool_calls,
             'finish_reason': finish_reason,
             'reasoning_content_chars': reasoning_content_chars,
+            'reported_usage': reported_usage,
             'usage': {
                 'prompt_tokens': prompt_tokens,
                 'completion_tokens': usage_value('completion_tokens'),

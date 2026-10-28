@@ -344,6 +344,10 @@ class TraceManager:
         if self.current_turn:
             self.current_turn.provider_finish_reason = reason or ""
 
+    def record_provider_attempt(self, attempt: Dict[str, Any]) -> None:
+        if self.current_turn is not None:
+            self.current_turn.provider_attempts.append(dict(attempt))
+
     def record_provider_stream(self, enabled: bool) -> None:
         """Record the transport mode requested for the current provider call."""
         if self.current_turn:

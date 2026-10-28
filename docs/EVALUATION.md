@@ -209,6 +209,12 @@ Trace 用于回答：
 
 分析 Agent 行为问题时，应优先查看相关 Trial 的原始 Trace，而不是只看最终文本。
 
+主 Agent 的输出超限恢复可能在同一模型轮次内产生多个请求。`turns[].provider_attempts` 记录每次请求的参数、停止原因、usage 或传输异常；`status=not_requested` 是未发出请求的停止说明，不计为模型调用。Token 总量包含所有已收到 usage 的尝试，不能只取最后成功响应；usage 缺失不代表该次请求免费。轮次数仍按 Agent Loop 计数，不能用它替代请求次数。Trace 的 `request_config` 保存恢复开关、次数和预留预算配置；做版本比较时应核对这些配置。恢复预算的使用方式见 README“模型输出超限后的恢复”。
+
+Session 另保存逐次 Provider 调用的 `provider_request_started` / `provider_request_finished`，用 `request_id` 配对；`source=main` 和 `source=summary` 区分主循环与摘要。这里测量的是 Runtime 调用 Provider 的次数，不是 SDK 内部 HTTP 重试次数。finished 的 `status=received` 只表示取得响应，不代表工具参数合法或任务正确；`status=error` 记录错误类型，未取得的用量为 null。只有 started 的请求属于未确认完成，不得伪造结束原因或用量。DeepSeek 的 `usage_origin=reported` 只包含服务实际报告的有效字段，缺失字段不能填零；`normalized` 不能当作完整原始用量。汇总已知部分时必须同时报告未知请求数及缺失字段，禁止冒充完整费用。恢复事件的 retries_used / reserved_tokens 为当时的观测值，不作为恢复执行或返还预算的依据。
+
+输出截断恢复应单独验证：在有合法调整且预算允许时，可信 length 响应应进入有界恢复，截断正文和工具不能执行；完整恢复响应应回到原循环，跨轮降档开关应决定后续初始强度；没有可行调整、上下文不足或预算耗尽时应按规则停止。任务得分、是否开始写代码和恢复是否按规则工作分别报告。受控假模型测试可证明这些机制的因果关系，不能替代真实模型效果验证，也不能把模拟 usage 宣称为真实成本节省。
+
 ### Trial Result
 
 Trial Result 保存单次尝试的 Outcome、Verifier、Trace 状态以及 Evaluation 分类。

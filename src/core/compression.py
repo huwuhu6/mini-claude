@@ -2,6 +2,7 @@
 Context Compression System - Automatic and manual conversation compression.
 """
 from __future__ import annotations
+from contextlib import nullcontext
 import copy
 import logging
 import json
@@ -75,6 +76,7 @@ class Compressor:
         self._transcript_dir: Optional[Path] = None
         self._provider: Any = None  # LLMProvider for real summarization
         self._last_summary_usage: Optional[Dict[str, int]] = None
+        self._request_observer = None
 
         transcript_dir = cfg.get('transcript_dir', '')
         if transcript_dir:
@@ -91,6 +93,10 @@ class Compressor:
         """
         self._provider = provider
         logger.info("Compressor: LLM provider injected for real summarization")
+
+    def set_request_observer(self, observer) -> None:
+        """Optional request observation, independent of persistence and budgets."""
+        self._request_observer = observer
 
     # ── Token Estimation ──────────────────────────────────────
 
@@ -603,15 +609,20 @@ class Compressor:
                 "Full Compression preserved the original history"
             )
 
-        response = self._provider.create_message(
-            summary_msgs,
-            max_tokens=SUMMARY_MAX_OUTPUT_TOKENS,
-            temperature=0.3,
-        )
-        parsed = self._provider.parse_response(response)
+        parameters = {'max_tokens': SUMMARY_MAX_OUTPUT_TOKENS, 'temperature': 0.3}
+        observation = (self._request_observer(source='summary', parameters=parameters,
+                         estimated_prompt_tokens=summary_estimate)
+                       if self._request_observer is not None else nullcontext({}))
+        with observation as observed:
+            response = self._provider.create_message(summary_msgs, **parameters)
+            parsed = self._provider.parse_response(response)
+            if isinstance(parsed, dict):
+                observed.update(parsed)
         summary = parsed.get("content", "") if isinstance(parsed, dict) else ""
         raw_usage = parsed.get("usage", {}) if isinstance(parsed, dict) else {}
         self._last_summary_usage = self._normalize_usage(raw_usage)
+        if isinstance(parsed, dict) and parsed.get("finish_reason") in {"length", "max_tokens", "limit"}:
+            raise ValueError("模型摘要达到输出上限，保留原始历史")
         if not isinstance(summary, str) or not summary.strip():
             raise ValueError("LLM summary response has no usable content")
 

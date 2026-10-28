@@ -162,6 +162,7 @@ class TurnTrace:
     provider_finish_reason: str = ""
     provider_stream: bool = False
     reasoning_content_chars: Optional[int] = None
+    provider_attempts: List[Dict[str, Any]] = field(default_factory=list)
     compression_triggered: bool = False
     reflection_triggered: bool = False
     completion_guard_triggered: bool = False
@@ -198,6 +199,7 @@ class TurnTrace:
             'assistant_content': self.assistant_content,
             'provider_finish_reason': self.provider_finish_reason,
             'provider_stream': self.provider_stream,
+            'provider_attempts': self.provider_attempts,
             'compression_triggered': self.compression_triggered,
             'reflection_triggered': self.reflection_triggered,
             'completion_guard_triggered': self.completion_guard_triggered,

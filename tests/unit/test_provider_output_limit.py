@@ -44,6 +44,7 @@ def test_length_response_fails_without_committing_or_executing(tmp_path, content
         workspace_confirmed=True,
         runtime_data_root=runtime,
     )
+    agent.config.llm.output_limit_recovery.enabled = False
     provider = DeepseekProvider({"model": "test", "api_key": "local-test"})
     provider.create_message = lambda *args, **kwargs: _response(content, "length", tool_calls)
     agent.provider_manager = SimpleNamespace(get_primary_provider=lambda: provider)

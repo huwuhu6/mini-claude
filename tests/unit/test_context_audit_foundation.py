@@ -195,8 +195,10 @@ def test_provider_parse_failure_enters_agent_failed_path_before_append():
     agent._emit_ui_event = lambda *args, **kwargs: None
     agent._current_user_prompt = "task"
     agent._workspace_confirmed = False
+    from models.config import LLMConfig
     agent.config = types.SimpleNamespace(
-        llm=types.SimpleNamespace(provider="mock", model="mock", max_tokens=10, temperature=0, stream=False),
+        llm=LLMConfig(provider="mock", model="mock", max_tokens=10, temperature=0, stream=False,
+                      output_limit_recovery={"enabled": False}),
     )
     agent.messages = [Message(role="user", content="task")]
     agent.runtime_context = types.SimpleNamespace(
@@ -210,6 +212,8 @@ def test_provider_parse_failure_enters_agent_failed_path_before_append():
     agent.completion_guard = types.SimpleNamespace(reset=lambda: None)
     agent.trace = trace
     agent.session_recorder = types.SimpleNamespace(record=lambda *args, **kwargs: None)
+    from core.session_recorder import SessionRecorder
+    agent.session_recorder.provider_request = SessionRecorder.provider_request.__get__(agent.session_recorder)
 
     result = agent._llm_tool_cycle(max_iterations=1)
 

@@ -270,6 +270,7 @@ class MiniClaudeAgent:
             'transcript_dir': str(self.data_paths.root / 'transcripts'),
         }
         self.compressor = Compressor(compression_config)
+        self.compressor.set_request_observer(self._observe_provider_request)
 
         # Inject LLM provider for real AI-powered summarization
         primary = self.provider_manager.get_primary_provider()
@@ -445,7 +446,7 @@ class MiniClaudeAgent:
         runtime_root = Path(__file__).resolve().parents[1]
         # Fail closed after relevant implementation changes, including delegated helpers.
         sources = ["agent/mini_claude_agent.py", "core/run_state.py", "core/run_snapshot.py", "core/checkpoint_store.py",
-                   "core/loop_controller.py", "core/tool_outcome.py", "core/tools/base_tools.py", "core/tools/file_edits.py", "core/tools/registry.py", "core/permissions.py", "core/permission_grants.py", "core/approvals.py",
+                   "core/loop_controller.py", "core/output_limit_recovery.py", "providers/deepseek.py", "core/tool_outcome.py", "core/tools/base_tools.py", "core/tools/file_edits.py", "core/tools/registry.py", "core/permissions.py", "core/permission_grants.py", "core/approvals.py",
                    "core/runtime_context/shell_session.py", "core/runtime_context/command_policy.py",
                    "core/runtime_context/workspace_authority.py", "core/runtime_context/path_resolver.py",
                    "core/features/manager.py", "core/compression.py",
@@ -456,8 +457,11 @@ class MiniClaudeAgent:
         for relative in sources:
             source_hash.update(relative.encode("utf-8"))
             source_hash.update((runtime_root / relative).read_text(encoding="utf-8").encode("utf-8"))
+        provider = self.provider_manager.get_primary_provider()
+        recovery_contract = getattr(provider, 'output_limit_recovery_contract', None)
         return {
             "runtime_source_hash": source_hash.hexdigest(),
+            "provider_recovery_contract": recovery_contract() if callable(recovery_contract) else None,
             "hitl_enabled": getattr(self, "_hitl_enabled", False),
             "platform": sys.platform,
             "python_version": list(sys.version_info[:2]),
@@ -465,6 +469,9 @@ class MiniClaudeAgent:
             "llm": {key: getattr(self.config.llm, key) for key in
                     ("provider", "model", "max_tokens", "temperature", "stream")},
             "compression": asdict(self.config.compression),
+            "output_limit_recovery": asdict(self.config.llm.output_limit_recovery),
+            "reasoning_effort": self.config.llm.reasoning_effort,
+            "supported_reasoning_efforts": list(self.config.llm.supported_reasoning_efforts),
             "history_maxlen": self.attempt_history.maxlen,
             "loop_horizon": self.runtime_policy.loop_detector.intent_horizon,
             "failure_horizon": self.runtime_policy.failure_detector.horizon,
@@ -498,8 +505,11 @@ class MiniClaudeAgent:
         snapshot_text(workspace["content_digest"], "工作区内容摘要")
         snapshot_require(workspace["content_digest"] == self.workspace_state_guard.content_digest(),
                          "工作区内容在导出后发生变化，无法安全继续原调用")
-        state = decode_run(snapshot["run"], _pre_model=_checkpoint_boundary == "before_model",
+        state = decode_run(snapshot["run"], _legacy=snapshot["schema_version"] < 7,
+                           _legacy_effort=snapshot["schema_version"] < 10,
+                           _pre_model=_checkpoint_boundary == "before_model",
                            _approval=_checkpoint_boundary == "approval" and snapshot["schema_version"] in HITL_SNAPSHOT_VERSIONS)
+        self._validate_output_limit_state(state)
         current_targets = self._pending_file_targets(state.tool_batch)
         snapshot_require(workspace.get("file_targets", {}) == current_targets
                          and all(value["kind"] not in {"unavailable", "other"} for value in current_targets.values()),
@@ -991,7 +1001,8 @@ class MiniClaudeAgent:
             raise CheckpointError('该任务没有完整对话快照；只能检查记录或归档后重新规划')
         snapshot_require(snapshot['workspace']['root'] == str(self.workdir.resolve())
             and self.workspace_authority.primary_root == self.workdir.resolve(), '会话不属于当前 Workspace')
-        state = decode_run(snapshot['run'], _terminal=True)
+        state = decode_run(snapshot['run'], _terminal=True, _legacy=snapshot['schema_version'] < 7,
+                           _legacy_effort=snapshot['schema_version'] < 10)
         messages = decode_messages(snapshot['messages'], state)
         note = snapshot['agent_note']
         snapshot_text(note, 'Agent Note')
@@ -1144,6 +1155,10 @@ class MiniClaudeAgent:
         """Create a diagnostic segment without resetting execution/governance state."""
         request_config = {key: getattr(self.config.llm, key) for key in
                           ("provider", "model", "max_tokens", "temperature", "stream")}
+        from dataclasses import asdict
+        request_config["output_limit_recovery"] = asdict(self.config.llm.output_limit_recovery)
+        request_config["reasoning_effort"] = self.config.llm.reasoning_effort
+        request_config["supported_reasoning_efforts"] = list(self.config.llm.supported_reasoning_efforts)
         request_config["run_id"] = state.run_id
         if resumed_from is not None:
             request_config["resumed_from_trace_task_id"] = resumed_from
@@ -2467,6 +2482,141 @@ class MiniClaudeAgent:
             msgs_for_llm.append(Message(role='user', content=hot_text))
         return msgs_for_llm
 
+    def _observe_provider_request(self, *, source, parameters, attempt=0, estimated_prompt_tokens=None):
+        state = getattr(self, '_run_state', None)
+        active = state is not None and state.status is RunStatus.RUNNING
+        return self.session_recorder.provider_request(
+            source=source, parameters=parameters, attempt=attempt,
+            run_id=state.run_id if active else None,
+            turn=state.model_turns_used + 1 if active else None,
+            estimated_prompt_tokens=estimated_prompt_tokens)
+
+    def _validate_output_limit_state(self, state):
+        """Check deployment semantics on the detached snapshot, before restoring it."""
+        policy = self.config.llm.output_limit_recovery
+        initial = getattr(self.provider_manager.get_primary_provider(), 'output_limit_initial_parameters', None)
+        effort = state.output_limit_effective_effort
+        if effort is not None:
+            snapshot_require(policy.enabled and policy.persist_effort_for_run and callable(initial),
+                             '当前配置不允许保留恢复强度')
+            initial(self.config.llm.max_tokens, effective_effort=effort)
+        request = state.output_limit_last_request
+        if request:
+            snapshot_require(callable(initial) and request['max_tokens'] <= policy.max_output_tokens,
+                             '输出恢复参数不受当前部署支持或超过上限')
+            snapshot_require(initial(request['max_tokens'], effective_effort=request.get('reasoning_effort'),
+                                     ceiling_effort=effort) == request,
+                             '输出恢复参数不属于当前部署的规范选择')
+
+    def _request_with_output_limit_recovery(self, provider, messages, tool_defs, tools, estimate):
+        """Regenerate only this model response; tool dispatch stays outside."""
+        from core.output_limit_recovery import OUTPUT_LIMIT_REASONS, reserve_retry, charge_retry_usage
+
+        state = self._run_state
+        policy = self.config.llm.output_limit_recovery
+        initial = getattr(provider, "output_limit_initial_parameters", None)
+        next_parameters = getattr(provider, "output_limit_retry_parameters", None)
+        parameters = (initial(self.config.llm.max_tokens) if callable(initial)
+                      else {"max_tokens": self.config.llm.max_tokens})
+        if policy.enabled and policy.persist_effort_for_run and state.output_limit_effective_effort is not None:
+            parameters = initial(self.config.llm.max_tokens, effective_effort=state.output_limit_effective_effort)
+        recovering = bool(state.output_limit_attempt)
+        previous = dict(state.output_limit_last_request)
+        compression_attempted = False
+
+        def stopped(reason):
+            self.trace.record_provider_attempt({"status": "not_requested", "reason": reason})
+            self.session_recorder.record("output_limit_recovery_stopped", run_id=state.run_id,
+                turn=state.model_turns_used + 1, reason=reason,
+                retries_used=state.output_limit_retries, reserved_tokens=state.output_limit_reserved_tokens)
+            return {"content": "", "tool_calls": [], "usage": {}, "finish_reason": "length"}, estimate
+
+        while True:
+            context_changed = False
+            if recovering:
+                if not policy.enabled or not callable(next_parameters):
+                    return stopped("恢复未启用或 Provider 不支持参数调整")
+                if (state.output_limit_attempt >= policy.max_retries_per_turn
+                        or state.output_limit_retries >= policy.max_retries_per_run):
+                    return stopped("输出恢复次数已用完")
+                parameters = next_parameters(previous, policy.max_output_tokens)
+                if parameters is None:
+                    return stopped("没有可用的参数调整")
+
+            if policy.enabled:
+                available = self.config.compression.context_window_tokens - estimate - policy.context_safety_margin_tokens
+                # Only the measured request size can trigger forced compression;
+                # missing/partial provider usage is never evidence of overflow.
+                if available < parameters["max_tokens"] and not compression_attempted:
+                    compression_attempted = True
+                    if self.feature_manager.is_enabled('compression'):
+                        before = self.messages
+                        try:
+                            candidate = self.compressor.compress(before)
+                            self.messages = candidate
+                            if candidate != before:
+                                context_changed = True
+                                self.trace.record_compression()
+                        except Exception as error:
+                            logger.warning("输出空间不足且压缩失败，保留原历史: %s", error)
+                        finally:
+                            summary_usage = self.compressor.consume_last_summary_usage()
+                            if summary_usage is not None:
+                                self._record_provider_usage(summary_usage, source="summary")
+                        messages = self._build_request_messages(self._get_dynamic_hot_context(
+                            iteration=state.model_turns_used, max_iterations=state.max_iterations))
+                        estimate = self.compressor.estimate_prompt_tokens(messages, system_prompt=self.system_prompt, tools=tools)
+                        available = self.config.compression.context_window_tokens - estimate - policy.context_safety_margin_tokens
+                if available <= 0:
+                    return stopped("上下文没有可用输出空间")
+                parameters["max_tokens"] = min(parameters["max_tokens"], available)
+
+            if recovering:
+                if parameters == previous and not context_changed:
+                    return stopped("上下文限制下参数未改变")
+                if not reserve_retry(state, policy, parameters, estimate):
+                    return stopped("输出恢复次数或预留 Token 预算已用完")
+                self.session_recorder.record("output_limit_recovery_started", run_id=state.run_id,
+                    turn=state.model_turns_used + 1, attempt=state.output_limit_attempt,
+                    parameters=dict(parameters), retries_used=state.output_limit_retries,
+                    reserved_tokens=state.output_limit_reserved_tokens)
+                self._emit_ui_event("assistant_note", text="模型输出达到上限，正在调整参数重试。")
+
+            # A retry reservation is durable before any extra billable request.
+            # After a crash, advance from the reserved attempt instead of replaying it.
+            self._checkpoint_save("before_model")
+            attempt = {"attempt": state.output_limit_attempt, "parameters": dict(parameters),
+                       "estimated_prompt_tokens": estimate}
+            try:
+                with self._observe_provider_request(source='main',
+                        parameters={**parameters, 'temperature': self.config.llm.temperature},
+                        attempt=state.output_limit_attempt, estimated_prompt_tokens=estimate) as observed:
+                    response = provider.create_message(messages, tool_defs, system=self.system_prompt,
+                                                       temperature=self.config.llm.temperature, **parameters)
+                    parsed = self._parse_response(provider, response)
+                    observed.update(parsed)
+            except BaseException as error:
+                self.trace.record_provider_attempt({**attempt, "status": "error", "error_type": type(error).__name__})
+                raise
+            self.trace.record_provider_attempt({**attempt, "status": "received",
+                "finish_reason": parsed.get("finish_reason"), "usage": parsed.get("usage", {})})
+            if recovering:
+                charge_retry_usage(state, parameters, estimate, parsed.get("usage") or {})
+            self._record_provider_usage(parsed.get("usage", {}), estimated_prompt_tokens=estimate, source="main")
+            self.trace.record_reasoning_content_chars(parsed.get('reasoning_content_chars'))
+            if parsed.get("finish_reason") not in OUTPUT_LIMIT_REASONS:
+                # The candidate is not a cross-turn preference until a complete,
+                # normal response arrives. Tool validity/approval is independent.
+                if (recovering and policy.persist_effort_for_run
+                        and parsed.get('finish_reason') in {'stop', 'tool_calls'}
+                        and parameters.get('reasoning_effort') is not None):
+                    state.output_limit_effective_effort = parameters['reasoning_effort']
+                state.output_limit_attempt = 0
+                state.output_limit_last_request = {}
+                return parsed, estimate
+            previous = dict(parameters)
+            recovering = True
+
     def _check_auto_compress(
         self,
         estimated_prompt_tokens: Optional[int] = None,
@@ -2803,15 +2953,8 @@ class MiniClaudeAgent:
                     )
                     self.trace.set_message_count(len(self.messages))
                     self.trace.record_provider_stream(getattr(provider, 'stream', False))
-                    self._checkpoint_save("before_model")
-                    response = provider.create_message(
-                        msgs_for_llm,
-                        tool_defs,
-                        system=self.system_prompt,
-                        max_tokens=self.config.llm.max_tokens,
-                        temperature=self.config.llm.temperature,
-                    )
-                    parsed = self._parse_response(provider, response)
+                    parsed, estimated_prompt_tokens = self._request_with_output_limit_recovery(
+                        provider, msgs_for_llm, tool_defs, tools, estimated_prompt_tokens)
                     self.trace.record_reasoning_content_chars(
                         parsed.get('reasoning_content_chars')
                     )
@@ -2825,11 +2968,6 @@ class MiniClaudeAgent:
                 # A truncated response may contain incomplete text or tool
                 # calls. Never publish or execute either as a complete turn.
                 if not resuming_batch and finish_reason in {'length', 'max_tokens', 'limit'}:
-                    self._record_provider_usage(
-                        parsed.get('usage', {}),
-                        estimated_prompt_tokens=estimated_prompt_tokens,
-                        source="main",
-                    )
                     self.trace.record_provider_finish_reason(finish_reason)
                     self.trace.end_task("FAILED", "PROVIDER_OUTPUT_LIMIT")
                     return self._finish_run(
@@ -2855,12 +2993,6 @@ class MiniClaudeAgent:
                     self.trace.record_assistant_content(content)
 
                 # ── Accumulate benchmark metrics ──
-                if not resuming_batch:
-                    self._record_provider_usage(
-                        usage,
-                        estimated_prompt_tokens=estimated_prompt_tokens,
-                        source="main",
-                    )
                 if not tool_calls and not content.strip():
                     self.trace.end_task("FAILED", "EMPTY_PROVIDER_RESPONSE")
                     return self._finish_run(

@@ -164,6 +164,12 @@ class RunState:
     # Imported workspace precondition, retained through preparation failures.
     workspace_checkpoint_digest: str | None = None
     approval_id: str | None = None
+    output_limit_retries: int = 0
+    output_limit_reserved_tokens: int = 0
+    output_limit_attempt: int = 0
+    output_limit_last_request: dict[str, Any] = field(default_factory=dict)
+    # Confirmed choice for later model turns; pending reservations stay separate.
+    output_limit_effective_effort: str | None = None
 
     @property
     def has_pending_tool_batch(self) -> bool:

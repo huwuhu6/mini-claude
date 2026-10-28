@@ -4,6 +4,8 @@ Harbor 负责下载公开任务、创建隔离容器、执行 verifier 和保存
 
 ## 准备
 
+Harbor 使用 `mini-claude-headless`，默认不启用人工审批或 SQLite Checkpoint，不会等待终端审批。输出超限恢复与交互入口共用主 Agent Loop，参数随上传的 `configs/default.yaml` 生效；它不代表 Benchmark 测试了人工审批流程。Headless 当前有 Trace 即返回进程退出码 0，任务仍可能失败；应检查结果的 `final_status`、Trace 和 Harbor verifier 的 reward，不能只看退出码。恢复开关及预算说明见 [README](../../README.md#模型输出超限后的恢复)。
+
 在包含 Harbor 适配器的 `main` checkout 中安装 Python 3.12+、Docker Desktop（Linux containers）和 Harbor：
 
 ```powershell

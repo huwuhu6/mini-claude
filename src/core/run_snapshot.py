@@ -9,12 +9,12 @@ from typing import Any
 from core.run_state import RunState, RunStatus, ToolBatchState, ToolBatchStatus, ToolCallResultState
 from providers.base import Message
 
-SCHEMA_VERSION = 4
-CHECKPOINT_SNAPSHOT_VERSION = 5  # Bound projections cannot use standalone JSON resume.
-HITL_SNAPSHOT_VERSION = 6  # Result/effect facts; earlier v1/v2/v3 remain readable.
-STANDALONE_SNAPSHOT_VERSIONS = {1, SCHEMA_VERSION}
-BOUND_SNAPSHOT_VERSIONS = {2, 3, CHECKPOINT_SNAPSHOT_VERSION, HITL_SNAPSHOT_VERSION}
-HITL_SNAPSHOT_VERSIONS = {3, HITL_SNAPSHOT_VERSION}
+SCHEMA_VERSION = 10
+CHECKPOINT_SNAPSHOT_VERSION = 11
+HITL_SNAPSHOT_VERSION = 12
+STANDALONE_SNAPSHOT_VERSIONS = {1, 4, 7, SCHEMA_VERSION}
+BOUND_SNAPSHOT_VERSIONS = {2, 3, 5, 6, 8, 9, CHECKPOINT_SNAPSHOT_VERSION, HITL_SNAPSHOT_VERSION}
+HITL_SNAPSHOT_VERSIONS = {3, 6, 9, HITL_SNAPSHOT_VERSION}
 READABLE_SNAPSHOT_VERSIONS = STANDALONE_SNAPSHOT_VERSIONS | BOUND_SNAPSHOT_VERSIONS
 SNAPSHOT_FIELDS = {"schema_version", "workspace", "compatibility", "run", "messages",
                    "history", "todo", "agent_note", "memory", "context", "diagnostics"}
@@ -110,7 +110,16 @@ def call_ids(calls: Any) -> list[str]:
     return ids
 
 
-def decode_run(data: Any, *, _terminal: bool = False, _pre_model: bool = False, _approval: bool = False) -> RunState:
+def decode_run(data: Any, *, _terminal: bool = False, _pre_model: bool = False, _approval: bool = False,
+               _legacy: bool = False, _legacy_effort: bool = False) -> RunState:
+    if (_legacy or _legacy_effort) and type(data) is dict and 'output_limit_effective_effort' not in data:
+        data = {**data, 'output_limit_effective_effort': None}
+    recovery_fields = {"output_limit_retries", "output_limit_reserved_tokens", "output_limit_attempt", "output_limit_last_request"}
+    if _legacy and type(data) is dict and set(data) in (
+            set(RunState.__dataclass_fields__) - recovery_fields,
+            set(RunState.__dataclass_fields__) - recovery_fields - {"approval_id"}):
+        data = {"approval_id": None, **data, "output_limit_retries": 0,
+                "output_limit_reserved_tokens": 0, "output_limit_attempt": 0, "output_limit_last_request": {}}
     # v1/v2 snapshots produced before HITL have no approval field.
     if type(data) is dict and set(data) == set(RunState.__dataclass_fields__) - {"approval_id"}:
         data = {**data, "approval_id": None}
@@ -129,6 +138,20 @@ def decode_run(data: Any, *, _terminal: bool = False, _pre_model: bool = False, 
     integer(data["max_iterations"], "模型预算", 1)
     integer(data["model_turns_used"], "已用模型轮次", 0 if _terminal or _pre_model else 1)
     integer(data["no_tool_retry_count"], "无工具重试")
+    for key in ("output_limit_retries", "output_limit_reserved_tokens", "output_limit_attempt"):
+        integer(data[key], key)
+    require(data["output_limit_attempt"] <= data["output_limit_retries"], "输出恢复次数不一致")
+    request = data["output_limit_last_request"]
+    require(type(request) is dict and set(request) <= {"max_tokens", "reasoning_effort"}, "输出恢复参数无效")
+    require(bool(request) == bool(data["output_limit_attempt"]), "输出恢复参数与次数不一致")
+    if request:
+        integer(request.get("max_tokens"), "输出恢复上限", 1)
+        if 'reasoning_effort' in request:
+            text(request['reasoning_effort'], '输出恢复强度', nonempty=True)
+    effort = data['output_limit_effective_effort']
+    if effort is not None:
+        text(effort, '任务内保留强度', nonempty=True)
+        require(data['output_limit_retries'] > 0, '保留强度缺少恢复记录')
     require(data["no_tool_retry_count"] <= 1, "无工具重试超过现有运行契约")
     require(data["model_turns_used"] <= data["max_iterations"], "已用轮次超过预算")
     for key in ("require_tool_call", "tool_call_seen", "pause_requested", "trace_started"):

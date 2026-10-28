@@ -20,6 +20,21 @@ class RecordingProviderManager:
             raise self.error
 
 
+@pytest.mark.parametrize('provider', ['deepseek', 'dashscope', 'anthropic'])
+def test_reasoning_controls_are_forwarded_only_when_declared_and_compatible(provider):
+    manager = RecordingProviderManager()
+    configure_primary_provider(manager, LLMConfig(
+        provider=provider, api_key='local-test', reasoning_effort='high',
+        supported_reasoning_efforts=['low', 'high', 'max'],
+    ))
+    config = manager.calls[0][1]
+    if provider == 'anthropic':
+        assert 'reasoning_effort' not in config and 'supported_reasoning_efforts' not in config
+    else:
+        assert config['reasoning_effort'] == 'high'
+        assert config['supported_reasoning_efforts'] == ['low', 'high', 'max']
+
+
 @pytest.fixture(autouse=True)
 def clear_provider_environment(monkeypatch):
     for name in (

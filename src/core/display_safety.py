@@ -6,7 +6,8 @@ import unicodedata
 
 _SECRET = r"[\w-]*(?:api[_-]?key|token|password|passwd|secret|credential|authorization|private[_-]?key)[\w-]*"
 _KEY = re.compile(_SECRET, re.I)
-_METRICS = {"prompt_tokens", "completion_tokens", "total_tokens", "max_tokens", "cached_tokens", "reasoning_tokens"}
+_METRICS = {"prompt_tokens", "completion_tokens", "total_tokens", "max_tokens", "cached_tokens",
+            "reasoning_tokens", "estimated_prompt_tokens", "reserved_tokens", "input_tokens", "output_tokens"}
 _VALUE = r"""(?:(?:"[^"\n]*"|'[^'\n]*')|[^\s,;}\]]+)"""
 _ASSIGN = re.compile(r"([\"']?" + _SECRET + r"[\"']?\s*[=:]\s*)" + _VALUE, re.I)
 _OPTION = re.compile(r"(--" + _SECRET + r"\s+)" + _VALUE, re.I)

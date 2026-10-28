@@ -1,3 +1,83 @@
+## 2026-10-28：输出截断恢复收尾
+
+输出截断恢复已完成两轮修复、两次真实首题试跑和最终模拟对照。完整过程统一见 [模型输出截断恢复](evolution/output_limit_recovery.md)，包括初次恢复、发现每轮重回 high、任务内保留降档、超时后逐请求记录及最终验证。下方记录保留各阶段现场，不再作为当前待办。
+
+最终 Windows Python 3.12.1 完整单测 951 项通过、13 项跳过；CLI 输入与 LoopController 集成另有 37 项通过，Harbor 离线适配器另有 4 项通过。用户已授权提交本次修复、合并 main 并推送。此前 Checkpoint 文件工具包装层修复与多场景测试的未提交修改单独保留，不混入本次提交。模型持续调查却不实施、自动查询模型能力等工作留待后续任务。
+
+## 2026-10-28：当前验收聚焦输出截断恢复与证据保留
+
+用户明确本阶段的“有效”是有合法参数和预算时，输出 length 不再直接错误结束；不要求本机制推动模型开始实现目标程序。当前工作是补逐请求证据并用受控 SDK 对照验证恢复，不调整任务推进策略，不扩大额度，也不追加付费 Trial。
+
+主循环和压缩摘要现通过现有 Session 写 started / finished 请求事件，含 request_id、Run、轮次、尝试序号、参数、结束原因、已取得用量；没有 finished 的请求保持未确认完成。DeepSeek 的 reported_usage 区分未知、明确零和部分字段，其他适配器标注 normalized；恢复事件保存当时已用次数与预留量。记录不驱动重试或预算恢复。交互脱敏保留明确计数字段。实际子进程强杀测试确认没有最终 Trace 时，已完成的两次请求记录仍在，第三次用量未知。
+
+受控服务固定 high 截断、low 返回六轮完整工具调用后结束，同样的参数和额度下：关闭恢复首次 length 后结束；仅本轮降档用了四次恢复后按上限停止；同 Run 保留降档只用一次恢复，六轮工具全部执行并正常结束。真实 SDK 的流式/非流式均验证。此处是可重复的机制证明，模拟 usage 不能当成真实费用，也不等于编程任务成功。
+
+Windows Python 3.12.1 最终完整单测 951 项通过、13 项跳过、无失败（约 933 秒），含 13 项请求记录和 10 项恢复效果专项；CLI 输入与 LoopController 集成另有 37 项通过，Harbor 离线适配器单独 4 项通过。13 项跳过为 10 项 POSIX Shell、2 项 Windows 符号链接权限，以及未安装全局 Harbor 依赖而整组未收集的模块，后者四项已复用临时依赖单独补测。结果见 `sandbox/output-limit-tests/evidence-complete.xml`、`evidence-integration-final.xml`、`evidence-harbor.xml`。
+
+早期回归发现旧测试替身只有 record，现绑定真实 provider_request 方法，未删除工具闭合、执行分类或上下文业务断言；相关 124 项定向复测通过，也已包含在最终完整回归。沙箱键盘模拟停顿的那轮已停止，本机环境复测通过。结构化证明、六个 SDK 对照、强杀观察、历史真实片段与源码指纹在 `sandbox/output-limit-tests/recovery-proof-20261028/`，先读 summary.md。当前分支仍为 `fix/output-limit-recovery`，保留已有修改，未提交或推送。下一次若需真实 Provider 验收，应以 length 后有界恢复、同轮完整响应及参数/预算记录为判据；编程任务得分单独报告。本阶段没有追加付费 Trial。
+
+## 2026-10-28：跨轮降档首题实测结束，仍未完成且超时缺少最终 Trace
+
+按用户授权，`output-limit-sticky-first-20261028` 于 16:36 启动、17:08 结束，只跑与上次相同版本的 `terminal-bench/make-mips-interpreter`，1 task / 1 attempt / 0 Harbor retry。正常输出 8192、恢复上限 32768、预留总额 262144 均未扩大，开启任务内记忆。实际容器 Python 3.13.7，宿主 Python 3.12.1；沿用此前同版本任务已通过的 Oracle。主循环和配置的安装指纹匹配，运行前后生产源码及配置哈希一致。
+
+Reward 0.0、三项 verifier 检查失败，Harbor 报告一个 AgentTimeoutError：Agent 到达 1800 秒时间上限，总耗时约 32 分 25 秒。Session 记录进入第 39 轮、63 次工具调用。第 27 轮以 low/8192 恢复后进入第 28 轮；第 38 轮以 low/16384 恢复后进入第 39 轮；第 39 轮再次启动 low/16384 恢复，随后超时。后两次直接增大长度的路径支持任务内保留 low，而非重新从 high 降档；但没有最终 Trace，不能声称逐一核对过所有正常请求参数或比较完整 Token 用量。
+
+目标 `/app/vm.js` 在最后观察时仍不存在，verifier 确认 `/tmp/frame.bmp` 缺失。最后几次 Bash 仍在检索源码和反汇编。归档仅有 Session，没有最终 Trace 或 headless 结果文件；Harbor Token 字段也为空。不能把缺失值当零，不能据此宣布成本降低。当前完整 Trace 在任务结束时写盘，外部超时暴露了记录缺口。
+
+Trial 为 `make-mips-interpreter__kBDXyjY`。原始结果在 `benchmark/harbor/jobs/output-limit-sticky-first-20261028/`；摘要、指纹、安装核对、超时前观察与结构化比较在 `sandbox/terminal_bench_runs/output-limit-sticky-first-20261028/`，先读该目录 `summary.md`。下一步先补齐超时后仍可读取的已完成请求参数和 usage，再查持续调查却未实现目标的行为；暂不增加预算、自动升档或再跑付费 trial。本轮没有修改 Runtime、配置、任务或 verifier，未提交或推送。
+
+## 2026-10-28：按部署顺序降档与任务内记忆（未提交）
+
+当前仍在 `fix/output-limit-recovery`，保留此前文件工具、多场景验证和输出截断恢复的未提交修改。新增任务内强度记忆：成功恢复后的正常轮次可沿用较低强度，新用户任务重置，扩大的输出上限不继承。配置类型默认关闭 `persist_effort_for_run`，仓库 YAML 显式开启；8192/32768/262144 的输出与预留额度、每轮两次及 Run 四次均保持。
+
+`supported_reasoning_efforts` 现明确为从低到高的有效选择，Provider 每次降一项；公共配置和快照不再限制五个名称。只有 DeepSeek 官方 endpoint 归一化其公开别名，其他服务按部署声明处理。完整正常回复后才提交记忆，网络失败、再次截断及未请求状态不提交；工具参数检查和审批独立保留。没有增加自动升档、冷却、稳定性评分或工具校验框架。
+
+新增值进入 v10/v11/v12 快照；旧格式读取补空记忆而不重置预算。执行恢复还检查当前 Provider 的规范参数、初始上限和实际 endpoint 摘要，未放松源码身份检查。旧待审批任务不能因此承诺跨升级恢复。README 与 `docs/evolution/provider_transport.md` 同阶段记录说明当前行为和取舍。
+
+Windows Python 3.12.1 完整单测 928 项通过、13 项跳过、无失败（约 445 秒），包含输出恢复专项 64 项。跳过包括 10 项 POSIX Shell、2 项 Windows 符号链接权限及缺少全局 Harbor 依赖的整组模块；复用原临时依赖单独补跑 Harbor 适配器 4 项通过。CLI 输入与 LoopController 集成另有 37 项通过。这是完整回归加两组单独验证，不是重新完整运行全部依赖组合。XML 为 `sandbox/output-limit-tests/sticky-full-local.xml`、`sticky-harbor.xml`、`sticky-integration.xml`。
+
+最初沙箱回归遇到本机模拟 HTTP 服务的 WinError 10013，已停止；上述完整结果来自允许回环网络的环境。未调用真实模型，未启动新的 Benchmark，未提交或推送。实现尚未验证真实任务完成率、费用或耗时的改善；下一步若需实测，应固定当前配置另行批准对照运行，不把旧首题 Trace 当作新策略结果。
+
+## 2026-10-28：小额度首题真实试跑完成，恢复生效但任务未完成
+
+按用户明确授权，只运行 Terminal-Bench 第一题 `terminal-bench/make-mips-interpreter` 一次，固定 1 task / 1 attempt / 0 Harbor retry。仓库 YAML 已降低为正常输出 8192、恢复上限 32768、额外请求预留总额 262144；配置类型缺省值和 Runtime 机制未改。Oracle 先通过（reward 1.0、0 exception、约 41 秒），真实 MiniClaude 得分 0.0、Harbor 0 exception。整个 job 约 31 分 5 秒，Agent 执行约 29 分 24 秒，没有触发 30 分钟 Agent 超时。
+
+实际 44 轮、48 次模型请求、70 次工具调用。第 36/37/40/42 轮截断后改为 low，仍用 8192，获得非 length 响应并继续循环；第 44 轮第五次截断，因四次恢复额度用完，以 FAILED / PROVIDER_OUTPUT_LIMIT 停止。48 次请求的上限全部为 8192，没有扩大过输出预算。第一次恢复响应的工具参数 JSON 非法，被校验拒绝且未执行；后面三次恢复产生可执行工具调用。
+
+Trace 报告输入 1327658（缓存 1189888）、输出 109682（思考 101504），总计 1437340 tokens，等于全部 48 个响应 usage 之和；四次恢复额外请求合计 197761 tokens。69 个工具记录包含工作区观测，变化事件为 0；无 write_file/edit_file，无压缩，vm.js/frame.bmp 未生成，verifier 三项均失败。此样本验证了真实恢复、用量累计和次数上限，没有证明任务成功率改善。
+
+详细结果与版本/源码指纹见 `sandbox/terminal_bench_runs/output-limit-8192-first-20261028/summary.md`、`summary.json`、`manifest.json`。实际 job 为 `benchmark/harbor/jobs/output-limit-8192-first-20261028/`，trial `make-mips-interpreter__n3K7RpP`，Trace 为其 `agent/mini-claude/traces/task_725c548c.json`；Oracle job 为 `output-limit-oracle-first-20261028`。完整 Harbor CLI 依赖只装在原临时目录，未改全局 Python。没有第二次付费 trial，未提交或推送。后续讨论应先看这份 Trace，区分“能继续循环”与“真正实现任务”。
+
+## 2026-10-28：输出超限恢复实现与离线验证完成
+
+当前分支 `fix/output-limit-recovery`，从本地 `checkpoint_review` / `52440ca` 创建，完整保留原有文件工具结果与多场景验证的未提交修改。已实现 OpenAI-compatible 输出截断后的有限重新生成、Provider 显式推理强度能力、按请求预留的 Run 预算、跨 Checkpoint 保存与防回退、逐请求 Trace、流式缺失工具 ID 的截断识别，以及截断摘要保留原历史。新快照为 v7/v8/v9，旧版本读取与严格源码/配置校验保留。默认每轮最多 2 次额外请求、Run 最多 4 次、恢复输出上限 65536、预留总额 1000000 tokens。
+
+Windows Python 3.12.1：最新恢复专项 32 项通过；完整单测为 895 passed、2 failed、12 skipped，两个失败均为未声明能力时 Provider 初始化多出空字段。保留旧参数形状、仅向显式声明的兼容 Provider 传递能力后，Provider/恢复/流式/截断组合 72 项复测通过，其中 Bootstrap 14 项包含 3 项新增能力转发测试。按测试身份取最新结果为 900 项通过、12 项跳过，不是修复后再次完整重跑；12 项跳过为 10 项 POSIX 和 2 项 Windows 符号链接权限限制。Harbor 四项离线适配器测试包含在完整单测中；CI 的 CLI 输入与 LoopController 两组集成另有 37 项通过。最终 wheel 已离线构建并检查模块和入口。原始 XML 与去重结果见 `sandbox/output-limit-tests/`。
+
+沙箱内的文件替换拒绝和异步测试停顿已用仓库临时目录及沙箱外执行区分，不据此修改 Runtime。两处旧测试手写配置缺新增字段，改为真实配置类型，原断言未删除，相关 156 项复测通过。Harbor 依赖仅安装到 `sandbox/output-limit-tests/harbor-deps`，未改全局环境。未运行付费 Provider 或真实 Harbor trial。
+
+长期原因、实现取舍与限制见 [Provider 传输可靠性](evolution/provider_transport.md#2026-10-28输出截断后安全重新生成)，当前配置和操作说明见 README。未提交或推送；Commit 为 PENDING。下面保留前阶段记录。
+
+## 2026-10-22：多场景强杀验证完成，暂时停止扩展
+
+按用户要求先设计多场景测试，再验证，不继续修改 Runtime。新增测试覆盖连续两次强杀、第二次中断转 UNKNOWN、保留用户修改、真实 Shell 部分执行及父进程死亡后子进程继续写入。Windows Python 3.12.1：11 项通过，包含 20 次父进程强杀。真实 DashScope / `deepseek-v4-flash-0731` 的库存汇总任务验证两个连续强杀场景，再强杀 4 次：安全分支完成，危险分支重复恢复仍 UNKNOWN，后续模型请求为零。成功写入也实测保留 SUCCESS/APPLIED。正式场景 4 次 HTTP 200、5,677 tokens；另有准备试验 1 次 200、1,516 tokens，以及一次连接失败。测试脚本适配错误和模型内容转义问题保留记录，没有算作 Runtime 通过或失败。
+
+未观察到重复执行、UNKNOWN 错误放行或覆盖用户修改，因此按用户决定停手。Shell 子进程仍可在 Agent 死亡后继续运行，当前只保证阻断恢复执行，不负责终止或回滚子进程。设计、完整结果、原始证据入口见 [多场景验证](checkpoint_multiscenario_validation.md)。本轮新增两份测试文件及验证文档，原有未提交实现修改保持原样；未提交或推送。下面保留前阶段记录。
+
+## 2026-10-22：文件工具保留底层执行结果
+
+`write_file`、`edit_file` 的主 Agent 包装函数现直接返回底层 `ToolResult`，不再只拿文字；成功写入的 `effect=APPLIED` 能保存到 SQLite。先新增 10 项回归并在原实现确认全部失败，再修改两个函数；Windows Python 3.12.1 的 7 个相关测试文件共 264 项通过，覆盖文件结果、文件证据、工具注册、消息配对、Checkpoint/HITL 和快照。无需真实模型请求。实现未提交，保留上一阶段的真实 API 验证记录。
+
+检查仍发现技能加载和 SubAgent 会只取文字，丢掉结构化结果；本次未修改这两处。具体代码位置、保留原因与测试记录见 [工具与 Runtime 演进](evolution/tool_registry.md) 的“文件工具原样返回底层结果”阶段。下面的真实 API 阶段记录的是修复前现象。
+
+## 2026-10-22：真实模型 API 强杀与恢复验证完成
+
+受测 HEAD 为 `52440ca`，仍在 `checkpoint_review`；本次未修改生产代码、未提交或推送，只补充验证记录。沿用现有百炼 DashScope / `deepseek-v4-flash-0731` 流式配置，在隔离目录完成生成 `slugify.py` 的真实编码任务。父进程使用 Windows 强杀，覆盖两个窗口：结果已提交时，新进程带原 Tool Call ID 的结果继续请求真实模型、读回文件并完成任务，原写入不重放；文件已写但结果未提交时，两次新进程恢复均 UNKNOWN，展示后置条件满足的证据，继续执行被阻断，新增模型请求为零。两个分支各通过 6 项独立功能检查，文件哈希、身份和修改时间在恢复前后保持不变。
+
+实际 5 次 HTTP 请求均为 200，API 报告总计 9,790 tokens。危险分支首个响应参数 JSON 不完整，执行前被拒绝为 FAILED/NONE、ARGUMENTS_REJECTED；模型收到真实反馈后生成合法的新调用，再进入强杀窗口。没有伪造模型响应、替换内置文件 handler 或绕过 UNKNOWN。脚本初始化适配问题均发生在首个请求前，修正仅在外部验证脚本。
+
+同时发现待修复缺口：`_handle_write_file` 只返回 `ToolResult.content`，丢失底层 APPLIED，真实主链最终记录 SUCCESS/UNCERTAIN；edit_file 有同样包装代码，本次未实测。两条恢复路径通过不代表效果元数据已经完整贯通。详情、证据目录和验证范围见 [工具与 Runtime 演进](evolution/tool_registry.md) 的“真实 Provider 的强杀与恢复验证”阶段。下一步可先为真实内置 handler 的结果传播补回归，再讨论修复；本次未顺手修改。
+
 ## 2026-10-22：Checkpoint 修复、独立审计与跨平台验证完成
 
 当前分支 `checkpoint_review`，未推送。实现按用户授权拆为 `750390d`（恢复入口与目标校验）、`96a976c`（result/effect、P1 执行证明与二次守卫）、`8cb4138`（只读文件证据），本条随独立文档提交保存。已修复 Run ID 历史会话绑定与 UNKNOWN 阻断、原进程继续的快照校验、文件目标前置指纹，以及首次快照前 started Run 的归档。

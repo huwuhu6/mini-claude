@@ -367,7 +367,9 @@ class SqliteCheckpointStore:
             fields(data["checkpoint_binding"], {"database", "run_id"}, "Checkpoint 归属")
             require(data["checkpoint_binding"]["run_id"] == run_id
                     and type(data["checkpoint_binding"]["database"]) is str, "Checkpoint 归属不一致")
-        state = decode_run(data["run"], _terminal=terminal, _pre_model=boundary == "before_model", _approval=boundary == "approval" and data["schema_version"] in HITL_SNAPSHOT_VERSIONS)
+        state = decode_run(data["run"], _legacy=data["schema_version"] < 7,
+                           _legacy_effort=data["schema_version"] < 10, _terminal=terminal,
+                           _pre_model=boundary == "before_model", _approval=boundary == "approval" and data["schema_version"] in HITL_SNAPSHOT_VERSIONS)
         require(state.run_id == run_id, "数据库 Run ID 与快照不一致")
         decode_messages(data["messages"], state, _pre_model=boundary == "before_model")
         return state
@@ -418,6 +420,8 @@ class SqliteCheckpointStore:
             if prior:
                 old = prior["run"]["tool_batch"]
                 require(state.model_turns_used >= prior["run"]["model_turns_used"], "模型轮次回退")
+                for key in ("output_limit_retries", "output_limit_reserved_tokens"):
+                    require(getattr(state, key) >= prior["run"].get(key, 0), "输出恢复预算回退")
                 if old is not None and batch is not None and old["model_iteration"] == batch.model_iteration:
                     require(old["tool_calls"] == batch.tool_calls, "已提交调用批次不能修改")
                     require(batch.next_call_index >= old["next_call_index"], "批次游标回退")

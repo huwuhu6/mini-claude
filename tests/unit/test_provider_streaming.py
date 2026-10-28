@@ -198,6 +198,19 @@ def test_incomplete_tool_call_never_returns_a_usable_response(chunks):
             provider.create_message([Message(role="user", content="hi")])
 
 
+@pytest.mark.parametrize('reason', ['length', 'max_tokens', 'limit'])
+def test_truncated_stream_with_missing_tool_id_preserves_stop_reason_and_usage(reason):
+    provider, _ = _provider([
+        _chunk({'tool_calls': [{'index': 0, 'function': {
+            'name': 'bash', 'arguments': '{"command":"rm'}}]}, finish_reason=reason),
+        _chunk(usage={'prompt_tokens': 100, 'completion_tokens': 8000, 'total_tokens': 8100}),
+    ])
+    parsed = provider.parse_response(provider.create_message([Message('user', 'task')]))
+    assert parsed['finish_reason'] == reason
+    assert parsed['tool_calls'] == []
+    assert parsed['usage']['completion_tokens'] == 8000
+
+
 def test_transport_error_mid_stream_is_not_returned_as_partial_success():
     def interrupted():
         yield _chunk({"content": "partial", "tool_calls": [{"index": 0,

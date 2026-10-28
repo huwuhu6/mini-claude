@@ -52,6 +52,19 @@ def test_full_compression_commits_only_after_provider_summary_succeeds():
     assert len(compressor.get_transcripts()) == 1
 
 
+@pytest.mark.parametrize('reason', ['length', 'max_tokens', 'limit'])
+def test_truncated_summary_preserves_history_and_reports_its_usage(reason):
+    compressor = Compressor()
+    compressor.set_provider(_SummaryProvider(response={
+        'content': 'plausible but incomplete summary', 'finish_reason': reason,
+        'usage': {'prompt_tokens': 20, 'completion_tokens': 8000, 'total_tokens': 8020},
+    }))
+    original = _long_history()
+    assert compressor.compress(original) == original
+    assert compressor.get_transcripts() == []
+    assert compressor.consume_last_summary_usage()['completion_tokens'] == 8000
+
+
 @pytest.mark.parametrize(
     "provider",
     [
