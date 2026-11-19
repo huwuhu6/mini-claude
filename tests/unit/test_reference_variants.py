@@ -3,6 +3,8 @@ import json
 import os, shutil, subprocess, sys, tempfile
 from pathlib import Path
 
+import pytest
+
 ROOT = Path(__file__).parents[2]
 TASKS = ROOT / 'sandbox' / 'tasks'
 
@@ -229,6 +231,8 @@ def test_node_visible_case_hardcode_fails_dynamic_hidden_verifier():
 
 
 def _run_java_verifier_variant(source_text):
+    if os.name != 'nt':
+        pytest.skip('该验证器需要 Windows cmd')
     case = next(TASKS.glob('task_031_*'))
     with tempfile.TemporaryDirectory() as temp:
         work = Path(temp)
