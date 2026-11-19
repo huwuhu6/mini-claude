@@ -1,5 +1,8 @@
 -r requirements.txt
 pytest>=7.0.0
+# Provider 测试直接使用 httpx 客户端；OpenAI 3.x 使用不同的客户端类型。
+httpx>=0.23,<1
+openai>=1.0.0,<3
 pytest-asyncio>=0.21.0
 black>=23.0.0
 flake8>=6.0.0
